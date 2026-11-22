@@ -4,7 +4,11 @@
 pub mod analytical;
 pub mod geometric;
 
-pub use analytical::{SuperquadricSource, VectorFieldKind, VectorFieldSource, WaveletSource};
+pub use analytical::{
+    GyroidSource, PointCloudSource, SuperquadricSource, VectorFieldKind, VectorFieldSource,
+    WaveletSource,
+};
 pub use geometric::{
-    ArrowSource, ConeSource, CubeSource, CylinderSource, LineSource, PlaneSource, SphereSource,
+    ArrowSource, ConeSource, CubeSource, CylinderSource, DiskSource, LineSource, PlaneSource,
+    SphereSource, TorusSource,
 };

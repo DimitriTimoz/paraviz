@@ -331,3 +331,132 @@ impl Source for SuperquadricSource {
         Ok(DataSet::PolyData(self.build()))
     }
 }
+
+/// Procedural 3D gyroid triply-periodic minimal surface volume (`ImageData`),
+/// ideal for Marching Cubes isosurface extraction and volume raymarching.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GyroidSource {
+    pub dimensions: [usize; 3],
+    pub bounds_min: [f64; 3],
+    pub bounds_max: [f64; 3],
+    pub frequency: f64,
+}
+
+impl Default for GyroidSource {
+    fn default() -> Self {
+        Self {
+            dimensions: [32, 32, 32],
+            bounds_min: [-std::f64::consts::PI, -std::f64::consts::PI, -std::f64::consts::PI],
+            bounds_max: [std::f64::consts::PI, std::f64::consts::PI, std::f64::consts::PI],
+            frequency: 1.5,
+        }
+    }
+}
+
+impl GyroidSource {
+    pub fn build(&self, time: f64) -> ImageData {
+        let [nx, ny, nz] = self.dimensions;
+        let nx = nx.max(2);
+        let ny = ny.max(2);
+        let nz = nz.max(2);
+        let sx = (self.bounds_max[0] - self.bounds_min[0]) / (nx - 1) as f64;
+        let sy = (self.bounds_max[1] - self.bounds_min[1]) / (ny - 1) as f64;
+        let sz = (self.bounds_max[2] - self.bounds_min[2]) / (nz - 1) as f64;
+        let phase = time * std::f64::consts::TAU;
+        let freq = self.frequency;
+
+        let total = nx * ny * nz;
+        let values: Vec<f32> = (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                let k = idx / (nx * ny);
+                let rem = idx % (nx * ny);
+                let j = rem / nx;
+                let i = rem % nx;
+                let x = (self.bounds_min[0] + i as f64 * sx) * freq + phase;
+                let y = (self.bounds_min[1] + j as f64 * sy) * freq;
+                let z = (self.bounds_min[2] + k as f64 * sz) * freq;
+                (x.sin() * y.cos() + y.sin() * z.cos() + z.sin() * x.cos()) as f32
+            })
+            .collect();
+
+        let mut img = ImageData::new([nx, ny, nz], self.bounds_min, [sx, sy, sz]);
+        img.point_data
+            .set_scalars(DataArray::scalars_f32("Gyroid", values));
+        img
+    }
+}
+
+impl Source for GyroidSource {
+    fn name(&self) -> &str {
+        "GyroidSource"
+    }
+
+    fn execute(&self, time: f64) -> Result<DataSet, PipelineError> {
+        Ok(DataSet::ImageData(self.build(time)))
+    }
+}
+
+/// Procedural 3D point cloud source (equivalent to `vtkPointSource`), generating
+/// a Fibonacci-sphere or volumetric spiral point distribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PointCloudSource {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub num_points: usize,
+    pub volumetric: bool,
+}
+
+impl Default for PointCloudSource {
+    fn default() -> Self {
+        Self {
+            center: [0.0, 0.0, 0.0],
+            radius: 1.0,
+            num_points: 1000,
+            volumetric: true,
+        }
+    }
+}
+
+impl PointCloudSource {
+    pub fn build(&self) -> PolyData {
+        let n = self.num_points.max(1);
+        let golden_angle = PI * (3.0 - 5.0_f32.sqrt());
+        let mut points = Vec::with_capacity(n);
+        let mut verts = Vec::with_capacity(n);
+        let mut radial = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let t = (i as f32 + 0.5) / n as f32;
+            let y = 1.0 - 2.0 * t;
+            let r_xy = (1.0 - y * y).max(0.0).sqrt();
+            let theta = golden_angle * i as f32;
+            let shell = if self.volumetric { t.cbrt() } else { 1.0 } * self.radius;
+            let px = self.center[0] + r_xy * theta.cos() * shell;
+            let py = self.center[1] + y * shell;
+            let pz = self.center[2] + r_xy * theta.sin() * shell;
+            points.push([px, py, pz]);
+            verts.push(i as u32);
+            radial.push(shell);
+        }
+
+        let mut pd = PolyData {
+            points,
+            verts,
+            ..Default::default()
+        };
+        pd.point_data
+            .set_scalars(DataArray::scalars_f32("Radius", radial));
+        pd
+    }
+}
+
+impl Source for PointCloudSource {
+    fn name(&self) -> &str {
+        "PointCloudSource"
+    }
+
+    fn execute(&self, _time: f64) -> Result<DataSet, PipelineError> {
+        Ok(DataSet::PolyData(self.build()))
+    }
+}

@@ -561,3 +561,170 @@ impl Source for ArrowSource {
         Ok(DataSet::PolyData(self.build()))
     }
 }
+
+/// Procedural annular disk source in the XY plane (equivalent to `vtkDiskSource`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskSource {
+    pub inner_radius: f32,
+    pub outer_radius: f32,
+    pub radial_resolution: usize,
+    pub circum_resolution: usize,
+}
+
+impl Default for DiskSource {
+    fn default() -> Self {
+        Self {
+            inner_radius: 0.25,
+            outer_radius: 0.75,
+            radial_resolution: 4,
+            circum_resolution: 32,
+        }
+    }
+}
+
+impl DiskSource {
+    pub fn build(&self) -> PolyData {
+        let nr = self.radial_resolution.max(1);
+        let nc = self.circum_resolution.max(3);
+        let r0 = self.inner_radius.max(0.0);
+        let r1 = self.outer_radius.max(r0 + 1e-4);
+
+        let mut points = Vec::with_capacity((nr + 1) * nc);
+        let mut normals = Vec::with_capacity((nr + 1) * nc);
+        let mut radial = Vec::with_capacity((nr + 1) * nc);
+        let mut polys = Vec::with_capacity(nr * nc * 2);
+
+        for ir in 0..=nr {
+            let t = ir as f32 / nr as f32;
+            let r = r0 + (r1 - r0) * t;
+            for ic in 0..nc {
+                let ang = (ic as f32 / nc as f32) * TAU;
+                points.push([r * ang.cos(), r * ang.sin(), 0.0]);
+                normals.push([0.0, 0.0, 1.0]);
+                radial.push(r);
+            }
+        }
+
+        for ir in 0..nr {
+            for ic in 0..nc {
+                let next = (ic + 1) % nc;
+                let a = (ir * nc + ic) as u32;
+                let b = (ir * nc + next) as u32;
+                let c = ((ir + 1) * nc + next) as u32;
+                let d = ((ir + 1) * nc + ic) as u32;
+                polys.push(vec![a, b, c]);
+                polys.push(vec![a, c, d]);
+            }
+        }
+
+        let mut pd = PolyData {
+            points,
+            polys,
+            ..Default::default()
+        };
+        pd.point_data
+            .set_normals(DataArray::vectors_f32("Normals", normals));
+        pd.point_data
+            .set_scalars(DataArray::scalars_f32("Radius", radial));
+        pd
+    }
+}
+
+impl Source for DiskSource {
+    fn name(&self) -> &str {
+        "DiskSource"
+    }
+
+    fn execute(&self, _time: f64) -> Result<DataSet, PipelineError> {
+        Ok(DataSet::PolyData(self.build()))
+    }
+}
+
+/// Procedural parametric torus source with smooth analytical normals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TorusSource {
+    pub center: [f32; 3],
+    pub major_radius: f32,
+    pub minor_radius: f32,
+    pub major_resolution: usize,
+    pub minor_resolution: usize,
+}
+
+impl Default for TorusSource {
+    fn default() -> Self {
+        Self {
+            center: [0.0, 0.0, 0.0],
+            major_radius: 0.7,
+            minor_radius: 0.25,
+            major_resolution: 48,
+            minor_resolution: 24,
+        }
+    }
+}
+
+impl TorusSource {
+    pub fn build(&self) -> PolyData {
+        let nu = self.major_resolution.max(6);
+        let nv = self.minor_resolution.max(6);
+        let c = Vec3::from_array(self.center);
+
+        let mut points = Vec::with_capacity(nu * nv);
+        let mut normals = Vec::with_capacity(nu * nv);
+        let mut scalars = Vec::with_capacity(nu * nv);
+        let mut polys = Vec::with_capacity(nu * nv * 2);
+
+        for iu in 0..nu {
+            let u = (iu as f32 / nu as f32) * TAU;
+            let cu = u.cos();
+            let su = u.sin();
+            for iv in 0..nv {
+                let v = (iv as f32 / nv as f32) * TAU;
+                let cv = v.cos();
+                let sv = v.sin();
+                let n = Vec3::new(cu * cv, su * cv, sv);
+                let p = c + Vec3::new(
+                    (self.major_radius + self.minor_radius * cv) * cu,
+                    (self.major_radius + self.minor_radius * cv) * su,
+                    self.minor_radius * sv,
+                );
+                points.push(p.to_array());
+                normals.push(n.to_array());
+                scalars.push((u * 2.0).sin() * 0.5 + sv * 0.5);
+            }
+        }
+
+        for iu in 0..nu {
+            let iu_next = (iu + 1) % nu;
+            for iv in 0..nv {
+                let iv_next = (iv + 1) % nv;
+                let a = (iu * nv + iv) as u32;
+                let b = (iu_next * nv + iv) as u32;
+                let c_idx = (iu_next * nv + iv_next) as u32;
+                let d = (iu * nv + iv_next) as u32;
+                polys.push(vec![a, b, c_idx]);
+                polys.push(vec![a, c_idx, d]);
+            }
+        }
+
+        let mut pd = PolyData {
+            points,
+            polys,
+            ..Default::default()
+        };
+        pd.point_data
+            .set_normals(DataArray::vectors_f32("Normals", normals));
+        pd.point_data
+            .set_scalars(DataArray::scalars_f32("Harmonic", scalars));
+        pd
+    }
+}
+
+impl Source for TorusSource {
+    fn name(&self) -> &str {
+        "TorusSource"
+    }
+
+    fn execute(&self, _time: f64) -> Result<DataSet, PipelineError> {
+        Ok(DataSet::PolyData(self.build()))
+    }
+}

@@ -11,6 +11,9 @@ fn all_geometric_sources_produce_valid_polydata() {
         Box::new(PlaneSource::default()),
         Box::new(LineSource::default()),
         Box::new(ArrowSource::default()),
+        Box::new(DiskSource::default()),
+        Box::new(TorusSource::default()),
+        Box::new(PointCloudSource::default()),
         Box::new(SuperquadricSource::default()),
     ];
 
@@ -50,4 +53,12 @@ fn wavelet_and_vector_field_sources() {
         assert!(img.point_data.get("Velocity").is_some());
         assert!(img.point_data.get("Speed").is_some());
     }
+
+    let gyroid = GyroidSource::default();
+    let gds = gyroid.execute(0.0).unwrap();
+    let gimg = gds.as_image_data().unwrap();
+    assert_eq!(gimg.dimensions, [32, 32, 32]);
+    let garr = gimg.point_data.get("Gyroid").unwrap();
+    let (gmin, gmax) = garr.range(Some(0));
+    assert!(gmin < -1.0 && gmax > 1.0);
 }
