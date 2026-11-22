@@ -29,15 +29,15 @@ impl Filter for ScaleFilter {
 
     fn apply(&self, input: &DataSet) -> std::result::Result<DataSet, PipelineError> {
         let mut out = input.clone();
-        if let Some(pd) = out.point_data_mut() {
-            if let Some(arr) = pd.get("S").cloned() {
-                let scaled: Vec<f32> = arr
-                    .to_scalar_f32(Some(0))
-                    .into_iter()
-                    .map(|v| v * self.factor)
-                    .collect();
-                pd.set_scalars(DataArray::scalars_f32("S", scaled));
-            }
+        if let Some(pd) = out.point_data_mut()
+            && let Some(arr) = pd.get("S").cloned()
+        {
+            let scaled: Vec<f32> = arr
+                .to_scalar_f32(Some(0))
+                .into_iter()
+                .map(|v| v * self.factor)
+                .collect();
+            pd.set_scalars(DataArray::scalars_f32("S", scaled));
         }
         Ok(out)
     }

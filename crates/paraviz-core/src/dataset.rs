@@ -370,7 +370,7 @@ impl ImageData {
         ];
 
         let mut out = vec![0.0; nc];
-        for c in 0..nc {
+        for (c, slot) in out.iter_mut().enumerate() {
             let v000 = arr.data.get_f64(idx[0] * nc + c);
             let v100 = arr.data.get_f64(idx[1] * nc + c);
             let v010 = arr.data.get_f64(idx[2] * nc + c);
@@ -388,7 +388,7 @@ impl ImageData {
             let c0 = c00 * (1.0 - ty) + c10 * ty;
             let c1 = c01 * (1.0 - ty) + c11 * ty;
 
-            out[c] = c0 * (1.0 - tz) + c1 * tz;
+            *slot = c0 * (1.0 - tz) + c1 * tz;
         }
         Some(out)
     }

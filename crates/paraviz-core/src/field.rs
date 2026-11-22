@@ -98,20 +98,20 @@ impl FieldData {
 
     /// Returns the active scalar array, or the first 1-component array if none explicitly set.
     pub fn active_scalars_array(&self) -> Option<&DataArray> {
-        if let Some(name) = &self.active_scalars {
-            if let Some(arr) = self.get(name) {
-                return Some(arr);
-            }
+        if let Some(name) = &self.active_scalars
+            && let Some(arr) = self.get(name)
+        {
+            return Some(arr);
         }
         self.arrays.iter().find(|a| a.num_components == 1)
     }
 
     /// Returns the active vector array, or the first 3-component non-normal array if none explicitly set.
     pub fn active_vectors_array(&self) -> Option<&DataArray> {
-        if let Some(name) = &self.active_vectors {
-            if let Some(arr) = self.get(name) {
-                return Some(arr);
-            }
+        if let Some(name) = &self.active_vectors
+            && let Some(arr) = self.get(name)
+        {
+            return Some(arr);
         }
         self.arrays
             .iter()
@@ -120,10 +120,10 @@ impl FieldData {
 
     /// Returns the active normals array if present.
     pub fn active_normals_array(&self) -> Option<&DataArray> {
-        if let Some(name) = &self.active_normals {
-            if let Some(arr) = self.get(name) {
-                return Some(arr);
-            }
+        if let Some(name) = &self.active_normals
+            && let Some(arr) = self.get(name)
+        {
+            return Some(arr);
         }
         self.get("Normals").or_else(|| self.get("normals"))
     }

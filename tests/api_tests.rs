@@ -27,7 +27,7 @@ fn fluent_pipeline_render_and_state_roundtrip() {
     assert_eq!(rgba.len(), 256 * 192 * 4);
     // Ensure rendered image is not uniform solid color
     let first = &rgba[0..4];
-    let differs = rgba.chunks_exact(4).any(|px| px != first);
+    let differs = rgba.as_chunks::<4>().0.iter().any(|px| px != first);
     assert!(differs, "Rendered image should contain shaded geometry");
 
     // Save/load JSON state

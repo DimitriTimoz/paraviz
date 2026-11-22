@@ -904,14 +904,15 @@ impl WebGpuRenderer {
             }
 
             // 3. Global bounding-box overlay
-            if scene.settings.show_bounding_box && self.bbox_vertex_count > 0 {
-                if let Some(vb) = &self.bbox_vb {
-                    pass.set_pipeline(&bundle.line_pipeline);
-                    pass.set_bind_group(0, &self.bbox_bind_group, &[]);
-                    pass.set_bind_group(1, &self.bbox_lut_bind_group, &[]);
-                    pass.set_vertex_buffer(0, vb.slice(..));
-                    pass.draw(0..self.bbox_vertex_count, 0..1);
-                }
+            if scene.settings.show_bounding_box
+                && self.bbox_vertex_count > 0
+                && let Some(vb) = &self.bbox_vb
+            {
+                pass.set_pipeline(&bundle.line_pipeline);
+                pass.set_bind_group(0, &self.bbox_bind_group, &[]);
+                pass.set_bind_group(1, &self.bbox_lut_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.draw(0..self.bbox_vertex_count, 0..1);
             }
 
             // 4. Translucent surfaces
@@ -927,14 +928,13 @@ impl WebGpuRenderer {
                     vertex_count,
                     ..
                 } = &cached.geometry
+                    && *vertex_count > 0
                 {
-                    if *vertex_count > 0 {
-                        pass.set_pipeline(&bundle.surface_alpha_pipeline);
-                        pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
-                        pass.set_bind_group(1, &cached.lut_bind_group, &[]);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw(0..*vertex_count, 0..1);
-                    }
+                    pass.set_pipeline(&bundle.surface_alpha_pipeline);
+                    pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
+                    pass.set_bind_group(1, &cached.lut_bind_group, &[]);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*vertex_count, 0..1);
                 }
             }
 
@@ -946,18 +946,18 @@ impl WebGpuRenderer {
                 let Some(cached) = self.actor_cache.get(&actor.id) else {
                     continue;
                 };
-                if let CachedGeometry::Volume { .. } = &cached.geometry {
-                    if let Some(vol_bg) = &cached.volume_bind_group {
-                        pass.set_pipeline(&bundle.volume_pipeline);
-                        pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
-                        pass.set_bind_group(1, vol_bg, &[]);
-                        pass.set_vertex_buffer(0, self.volume_cube_vb.slice(..));
-                        pass.set_index_buffer(
-                            self.volume_cube_ib.slice(..),
-                            wgpu::IndexFormat::Uint16,
-                        );
-                        pass.draw_indexed(0..36, 0, 0..1);
-                    }
+                if let CachedGeometry::Volume { .. } = &cached.geometry
+                    && let Some(vol_bg) = &cached.volume_bind_group
+                {
+                    pass.set_pipeline(&bundle.volume_pipeline);
+                    pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
+                    pass.set_bind_group(1, vol_bg, &[]);
+                    pass.set_vertex_buffer(0, self.volume_cube_vb.slice(..));
+                    pass.set_index_buffer(
+                        self.volume_cube_ib.slice(..),
+                        wgpu::IndexFormat::Uint16,
+                    );
+                    pass.draw_indexed(0..36, 0, 0..1);
                 }
             }
         }

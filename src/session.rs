@@ -879,15 +879,15 @@ fn auto_select_color_by(style: &mut ActorStyle, dataset: &DataSet) {
             return;
         }
     }
-    if let Some(cd) = dataset.cell_data() {
-        if let Some(arr) = cd.active_scalars_array() {
-            style.color_by = ColorBy::CellScalar {
-                array: arr.name.clone(),
-                component: None,
-            };
-            let rng = arr.range(None);
-            style.scalar_range = rng;
-            style.volume_tf.scalar_range = rng;
-        }
+    if let Some(cd) = dataset.cell_data()
+        && let Some(arr) = cd.active_scalars_array()
+    {
+        style.color_by = ColorBy::CellScalar {
+            array: arr.name.clone(),
+            component: None,
+        };
+        let rng = arr.range(None);
+        style.scalar_range = rng;
+        style.volume_tf.scalar_range = rng;
     }
 }

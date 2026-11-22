@@ -166,7 +166,7 @@ fn append_surface_dataset(
     }
 }
 
-fn scalar_lookup<'a>(
+fn scalar_lookup(
     point_data: &FieldData,
     cell_data: &FieldData,
     color_by: &ColorBy,
@@ -324,6 +324,7 @@ fn emit_quad(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_structured_boundary<FCoord, FPointIdx>(
     dims: [usize; 3],
     point_data: &FieldData,
@@ -554,14 +555,13 @@ fn append_surface_unstructured(
     }
 
     for (key, count) in face_counts {
-        if count == 1 {
-            if let Some((face, cell_idx)) = face_map.remove(&key) {
-                if face.len() >= 3 {
-                    let v0 = face[0];
-                    for k in 1..(face.len() - 1) {
-                        surface_tris.push(([v0, face[k], face[k + 1]], cell_idx));
-                    }
-                }
+        if count == 1
+            && let Some((face, cell_idx)) = face_map.remove(&key)
+            && face.len() >= 3
+        {
+            let v0 = face[0];
+            for k in 1..(face.len() - 1) {
+                surface_tris.push(([v0, face[k], face[k + 1]], cell_idx));
             }
         }
     }
@@ -696,7 +696,7 @@ fn append_wireframe_dataset(
         DataSet::ImageData(_) | DataSet::RectilinearGrid(_) | DataSet::StructuredGrid(_) => {
             let surf = prepare_surface(dataset, color_by);
             merge_range(range, Some(surf.scalar_range));
-            for tri in surf.vertices.chunks_exact(3) {
+            for tri in surf.vertices.as_chunks::<3>().0 {
                 for (a, b) in [(0, 1), (1, 2), (2, 0)] {
                     out.push(LineVertex { position: tri[a].position, scalar: tri[a].scalar });
                     out.push(LineVertex { position: tri[b].position, scalar: tri[b].scalar });

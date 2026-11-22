@@ -63,7 +63,7 @@ fn make_sphere_imagedata(dim: usize) -> DataSet {
 
 fn count_distinct_colors(rgba: &[u8]) -> usize {
     let mut set = std::collections::HashSet::new();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         set.insert([px[0], px[1], px[2]]);
     }
     set.len()
