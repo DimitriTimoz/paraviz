@@ -1,0 +1,15 @@
+[package]
+name = "paraviz-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scientific file format readers and writers (Legacy VTK, VTK XML .vtp/.vti/.vtu/.vtr/.vts/.vtm/.pvd, STL, OBJ, PLY, CSV) for ParaViz"
+
+[dependencies]
+paraviz-core.workspace = true
+glam.workspace = true
+quick-xml.workspace = true
+base64.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+serde.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "paraviz-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebGPU (wgpu) scientific visualization rendering engine (surface, wireframe, edges, points, volume raymarching, overlays) for ParaViz"
+
+[dependencies]
+paraviz-core.workspace = true
+paraviz-filters.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+png.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+log.workspace = true

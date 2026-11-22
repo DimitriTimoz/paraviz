@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    ".",
+    "crates/paraviz-core",
+    "crates/paraviz-sources",
+    "crates/paraviz-filters",
+    "crates/paraviz-io",
+    "crates/paraviz-render",
+    "crates/paraviz-app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["ParaViz Contributors"]
+description = "ParaView rewritten in Rust using WebGPU (wgpu) for scientific visualization"
+repository = "https://github.com/DimitriTimoz/paraviz"
+
+[workspace.dependencies]
+paraviz-core = { path = "crates/paraviz-core" }
+paraviz-sources = { path = "crates/paraviz-sources" }
+paraviz-filters = { path = "crates/paraviz-filters" }
+paraviz-io = { path = "crates/paraviz-io" }
+paraviz-render = { path = "crates/paraviz-render" }
+
+glam = { version = "0.34", features = ["serde"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+wgpu = "30.0"
+pollster = "1.0"
+rayon = "1.12"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+png = "0.18"
+quick-xml = "0.42"
+base64 = "0.23"
+flate2 = "1.1"
+log = "0.4"
+env_logger = "0.11"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "clipboard", "links", "wayland", "x11"] }
+egui = "0.37"
+egui-wgpu = "0.37"
+
+[package]
+name = "paraviz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+paraviz-core.workspace = true
+paraviz-sources.workspace = true
+paraviz-filters.workspace = true
+paraviz-io.workspace = true
+paraviz-render.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

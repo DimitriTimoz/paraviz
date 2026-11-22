@@ -1,0 +1,12 @@
+[package]
+name = "paraviz-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Procedural geometric and analytical scientific dataset sources for ParaViz"
+
+[dependencies]
+paraviz-core.workspace = true
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true

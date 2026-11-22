@@ -1,0 +1,12 @@
+[package]
+name = "paraviz-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core VTK-inspired scientific data model, colormaps, transfer functions, and demand-driven pipeline for ParaViz"
+
+[dependencies]
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
