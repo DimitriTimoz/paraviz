@@ -81,3 +81,32 @@ jobs:
 
       - name: Audit Python binding dependencies
         run: cargo audit --file crates/paraviz-py/Cargo.lock
+
+  packaging-check:
+    name: Packaging Check (AppImage)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate build-appimage.sh syntax and appimagetool checksums
+        run: |
+          bash -n packaging/linux/build-appimage.sh
+          version="$(sed -n 's/^APPIMAGETOOL_VERSION="\([^"]*\)"/\1/p' packaging/linux/build-appimage.sh)"
+          test -n "${version}"
+          for arch in x86_64 aarch64; do
+            expected="$(awk -v arch="${arch}" '
+              $0 ~ "^  " arch "\\)" { found=1; next }
+              found && /APPIMAGETOOL_SHA256=/ {
+                gsub(/.*APPIMAGETOOL_SHA256="|".*/, "");
+                print;
+                exit;
+              }
+            ' packaging/linux/build-appimage.sh)"
+            test -n "${expected}"
+            url="https://github.com/AppImage/appimagetool/releases/download/${version}/appimagetool-${arch}.AppImage"
+            actual="$(curl -sfL "${url}" | sha256sum | awk '{print $1}')"
+            if [ "${actual}" != "${expected}" ]; then
+              echo "Checksum mismatch for ${arch} (${version}): expected ${expected}, got ${actual}" >&2
+              exit 1
+            fi
+          done
