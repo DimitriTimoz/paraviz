@@ -98,8 +98,8 @@ pub(crate) fn interpolate_field_data_weighted(
                     if let Some(weights) = sample {
                         for &(idx, w) in weights {
                             let base = idx * nc;
-                            for c in 0..nc {
-                                acc[c] += arr.data.get_f64(base + c) * w;
+                            for (c, slot) in acc.iter_mut().enumerate() {
+                                *slot += arr.data.get_f64(base + c) * w;
                             }
                         }
                     }
@@ -115,8 +115,8 @@ pub(crate) fn interpolate_field_data_weighted(
                     if let Some(weights) = sample {
                         for &(idx, w) in weights {
                             let base = idx * nc;
-                            for c in 0..nc {
-                                acc[c] += arr.data.get_f64(base + c) * w;
+                            for (c, slot) in acc.iter_mut().enumerate() {
+                                *slot += arr.data.get_f64(base + c) * w;
                             }
                         }
                     }
@@ -218,20 +218,20 @@ pub(crate) fn merge_polydata(parts: Vec<PolyData>) -> PolyData {
             .add_array(DataArray::new(name, nc, ArrayData::F32(buf)));
     }
     if let Some(first) = non_empty_parts.first() {
-        if let Some(ref s) = first.point_data.active_scalars {
-            if out.point_data.get(s).is_some() {
-                out.point_data.active_scalars = Some(s.clone());
-            }
+        if let Some(ref s) = first.point_data.active_scalars
+            && out.point_data.get(s).is_some()
+        {
+            out.point_data.active_scalars = Some(s.clone());
         }
-        if let Some(ref v) = first.point_data.active_vectors {
-            if out.point_data.get(v).is_some() {
-                out.point_data.active_vectors = Some(v.clone());
-            }
+        if let Some(ref v) = first.point_data.active_vectors
+            && out.point_data.get(v).is_some()
+        {
+            out.point_data.active_vectors = Some(v.clone());
         }
-        if let Some(ref n) = first.point_data.active_normals {
-            if out.point_data.get(n).is_some() {
-                out.point_data.active_normals = Some(n.clone());
-            }
+        if let Some(ref n) = first.point_data.active_normals
+            && out.point_data.get(n).is_some()
+        {
+            out.point_data.active_normals = Some(n.clone());
         }
     }
     out
@@ -747,12 +747,16 @@ fn sample_rectilinear_weights(rg: &RectilinearGrid, pos: Vec3) -> Option<Vec<(us
     Some(trilinear_weights(idx, tx, ty, tz))
 }
 
+pub(crate) type EdgeVertex = (u64, [f32; 3], (usize, usize, f64));
+pub(crate) type EdgeTri = [EdgeVertex; 3];
+pub(crate) type EdgeDedupResult = (Vec<[f32; 3]>, Vec<(usize, usize, f64)>, Vec<[u32; 3]>);
+
 /// Deduplicates vertices keyed by `u64` edge keys in deterministic order, returning
 /// `(dedup_points, dedup_edges, tris)`.
 pub(crate) fn deduplicate_edge_triangles(
-    raw_tris: Vec<[(u64, [f32; 3], (usize, usize, f64)); 3]>,
+    raw_tris: Vec<EdgeTri>,
     merge_vertices: bool,
-) -> (Vec<[f32; 3]>, Vec<(usize, usize, f64)>, Vec<[u32; 3]>) {
+) -> EdgeDedupResult {
     if !merge_vertices {
         let mut points = Vec::with_capacity(raw_tris.len() * 3);
         let mut edges = Vec::with_capacity(raw_tris.len() * 3);

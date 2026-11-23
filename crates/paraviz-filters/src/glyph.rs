@@ -125,7 +125,8 @@ impl Filter for GlyphFilter {
             (0..total).collect()
         };
 
-        let instances: Vec<(Vec<[f32; 3]>, Vec<[f32; 3]>, usize)> = sample_indices
+        type GlyphInstance = (Vec<[f32; 3]>, Vec<[f32; 3]>, usize);
+        let instances: Vec<GlyphInstance> = sample_indices
             .par_iter()
             .map(|&pt_idx| {
                 let origin = Vec3::from_array(in_points[pt_idx]);
@@ -150,9 +151,9 @@ impl Filter for GlyphFilter {
 
                 let mut g_pts = Vec::with_capacity(tpl_npts);
                 let mut g_nrms = Vec::with_capacity(tpl_npts);
-                for k in 0..tpl_npts {
+                for (k, tpl_n) in tpl_normals.iter().enumerate().take(tpl_npts) {
                     let p = Vec3::from_array(template.points[k]) * scale;
-                    let n = Vec3::from_array(tpl_normals[k]);
+                    let n = Vec3::from_array(*tpl_n);
                     g_pts.push((origin + rot * p).to_array());
                     g_nrms.push((rot * n).normalize_or(Vec3::Z).to_array());
                 }

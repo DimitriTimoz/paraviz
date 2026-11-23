@@ -528,9 +528,9 @@ fn solve_3x3_regularized(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> [f64; 3] {
     for col in 0..3 {
         let mut pivot = col;
         let mut max_val = a[col][col].abs();
-        for row in (col + 1)..3 {
-            if a[row][col].abs() > max_val {
-                max_val = a[row][col].abs();
+        for (row, a_row) in a.iter().enumerate().skip(col + 1) {
+            if a_row[col].abs() > max_val {
+                max_val = a_row[col].abs();
                 pivot = row;
             }
         }
@@ -542,10 +542,11 @@ fn solve_3x3_regularized(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> [f64; 3] {
             b.swap(col, pivot);
         }
         let inv_diag = 1.0 / a[col][col];
+        let pivot_row = a[col];
         for row in (col + 1)..3 {
             let factor = a[row][col] * inv_diag;
-            for c in col..3 {
-                a[row][c] -= factor * a[col][c];
+            for (dst, &src) in a[row].iter_mut().zip(pivot_row.iter()).skip(col) {
+                *dst -= factor * src;
             }
             b[row] -= factor * b[col];
         }

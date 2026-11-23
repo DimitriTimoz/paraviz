@@ -3,7 +3,7 @@
 use crate::contour::{contour_tetrahedron, interp_edge};
 use crate::util::{
     canonical_edge_key, compact_polydata_points, deduplicate_edge_triangles,
-    interpolate_field_data_edges, merge_polydata,
+    interpolate_field_data_edges, merge_polydata, EdgeTri,
 };
 use glam::Vec3;
 use paraviz_core::{
@@ -200,7 +200,7 @@ fn slice_structured(
     }
 
     let tets = cell_type.tetrahedra();
-    let raw_tris: Vec<[(u64, [f32; 3], (usize, usize, f64)); 3]> = (0..total_cells)
+    let raw_tris: Vec<EdgeTri> = (0..total_cells)
         .into_par_iter()
         .flat_map_iter(|cell_idx| {
             let k = cell_idx / (cx * cy);
@@ -288,7 +288,7 @@ fn slice_unstructured(ug: &UnstructuredGrid, origin: Vec3, normal: Vec3, crinkle
         return pd;
     }
 
-    let raw_tris: Vec<[(u64, [f32; 3], (usize, usize, f64)); 3]> = (0..n_cells)
+    let raw_tris: Vec<EdgeTri> = (0..n_cells)
         .into_par_iter()
         .flat_map_iter(|cell_idx| {
             let ct = ug.cell_types[cell_idx];

@@ -65,8 +65,8 @@ impl Filter for CellDataToPointDataFilter {
                     if !cells.is_empty() {
                         for &ci in cells {
                             let base = ci * nc;
-                            for c in 0..nc {
-                                acc[c] += arr.data.get_f64(base + c);
+                            for (c, slot) in acc.iter_mut().enumerate() {
+                                *slot += arr.data.get_f64(base + c);
                             }
                         }
                         let inv = 1.0 / cells.len() as f64;
@@ -137,8 +137,8 @@ impl Filter for PointDataToCellDataFilter {
                     if !pts.is_empty() {
                         for &pi in pts {
                             let base = pi * nc;
-                            for c in 0..nc {
-                                acc[c] += arr.data.get_f64(base + c);
+                            for (c, slot) in acc.iter_mut().enumerate() {
+                                *slot += arr.data.get_f64(base + c);
                             }
                         }
                         let inv = 1.0 / pts.len() as f64;

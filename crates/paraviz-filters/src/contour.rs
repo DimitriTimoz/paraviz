@@ -3,6 +3,7 @@
 
 use crate::util::{
     canonical_edge_key, deduplicate_edge_triangles, interpolate_field_data_edges, merge_polydata,
+    EdgeTri, EdgeVertex,
 };
 use glam::Vec3;
 use paraviz_core::{
@@ -190,7 +191,7 @@ fn contour_structured(
 
     let mut iso_parts = Vec::with_capacity(iso_values.len());
     for &iso in iso_values {
-        let raw_tris: Vec<[(u64, [f32; 3], (usize, usize, f64)); 3]> = (0..total_cells)
+        let raw_tris: Vec<EdgeTri> = (0..total_cells)
             .into_par_iter()
             .flat_map_iter(|cell_idx| {
                 let k = cell_idx / (cx * cy);
@@ -236,8 +237,7 @@ fn contour_structured(
                     return Vec::new();
                 }
 
-                let mut vert_list: [(u64, [f32; 3], (usize, usize, f64)); 12] =
-                    [(0, [0.0; 3], (0, 0, 0.0)); 12];
+                let mut vert_list: [EdgeVertex; 12] = [(0, [0.0; 3], (0, 0, 0.0)); 12];
                 for (e, &(c0, c1)) in CUBE_EDGE_CORNERS.iter().enumerate() {
                     if (edge_mask & (1 << e)) != 0 {
                         let ia = corners[c0];
@@ -289,7 +289,7 @@ fn contour_unstructured(
 
     let mut iso_parts = Vec::with_capacity(iso_values.len());
     for &iso in iso_values {
-        let raw_tris: Vec<[(u64, [f32; 3], (usize, usize, f64)); 3]> = (0..n_cells)
+        let raw_tris: Vec<EdgeTri> = (0..n_cells)
             .into_par_iter()
             .flat_map_iter(|cell_idx| {
                 let ct = ug.cell_types[cell_idx];
@@ -334,7 +334,7 @@ pub(crate) fn contour_tetrahedron(
     verts: [usize; 4],
     vals: [f64; 4],
     iso: f64,
-    out: &mut Vec<[(u64, [f32; 3], (usize, usize, f64)); 3]>,
+    out: &mut Vec<EdgeTri>,
 ) {
     let mut case = 0usize;
     for (b, &v) in vals.iter().enumerate() {
