@@ -59,11 +59,20 @@ pub fn encode_html_viewer(
         "indices": indices,
     });
 
-    let json_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    let raw_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+    // Escape '<', '>', '&' and JS line terminators so embedded JSON cannot break out of <script>.
+    let json_str = raw_json
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
     let escaped_title = title
         .replace('&', "&amp;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;");
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
 
     format!(
         r#"<!DOCTYPE html>

@@ -1,10 +1,9 @@
 //! NRRD (`.nrrd`, `.nhdr`) and MetaImage (`.mhd`, `.mha`) volumetric medical image readers and writers.
 
 use crate::error::{IoError, Result};
-use flate2::read::GzDecoder;
 use paraviz_core::{ArrayData, DataArray, ImageData};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 /// Reads a MetaImage `.mhd` or `.mha` volumetric file into an [`ImageData`].
@@ -88,7 +87,8 @@ pub fn read_metaimage(path: impl AsRef<Path>) -> Result<ImageData> {
     let raw_payload = if data_file.eq_ignore_ascii_case("LOCAL") {
         bytes[cursor..].to_vec()
     } else if !data_file.is_empty() {
-        fs::read(base_dir.join(&data_file))?
+        let safe_path = crate::limits::resolve_safe_path(base_dir, &data_file)?;
+        fs::read(safe_path)?
     } else {
         return Err(IoError::InvalidData(
             "MetaImage header missing ElementDataFile".into(),
@@ -96,14 +96,16 @@ pub fn read_metaimage(path: impl AsRef<Path>) -> Result<ImageData> {
     };
 
     let payload = if compressed {
-        let mut dec = flate2::read::ZlibDecoder::new(&raw_payload[..]);
-        let mut out = Vec::new();
-        if dec.read_to_end(&mut out).is_err() {
-            out.clear();
-            let mut gz = GzDecoder::new(&raw_payload[..]);
-            gz.read_to_end(&mut out)?;
+        match crate::limits::decompress_zlib_limited(
+            &raw_payload,
+            crate::limits::MAX_DECOMPRESSED_BYTES,
+        ) {
+            Ok(out) => out,
+            Err(_) => crate::limits::decompress_gzip_limited(
+                &raw_payload,
+                crate::limits::MAX_DECOMPRESSED_BYTES,
+            )?,
         }
-        out
     } else {
         raw_payload
     };
@@ -242,19 +244,18 @@ pub fn read_nrrd(path: impl AsRef<Path>) -> Result<ImageData> {
     }
 
     let raw_payload = if let Some(df) = data_file {
-        fs::read(base_dir.join(df))?
+        let safe_path = crate::limits::resolve_safe_path(base_dir, &df)?;
+        fs::read(safe_path)?
     } else {
         bytes[body_start..].to_vec()
     };
 
     let payload = match encoding.as_str() {
         "raw" => raw_payload,
-        "gzip" | "gz" => {
-            let mut dec = GzDecoder::new(&raw_payload[..]);
-            let mut out = Vec::new();
-            dec.read_to_end(&mut out)?;
-            out
-        }
+        "gzip" | "gz" => crate::limits::decompress_gzip_limited(
+            &raw_payload,
+            crate::limits::MAX_DECOMPRESSED_BYTES,
+        )?,
         other => {
             return Err(IoError::UnsupportedFormat(format!(
                 "Unsupported NRRD encoding '{other}'"

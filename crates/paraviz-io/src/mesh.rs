@@ -897,8 +897,13 @@ fn read_ply_element_ascii<'a>(
     tokens: &mut impl Iterator<Item = &'a str>,
     poly: &mut PolyData,
 ) -> Result<()> {
-    let mut rows_scalar: Vec<Vec<Option<PlyValue>>> = Vec::with_capacity(elem.count);
-    let mut rows_list: Vec<Vec<Option<Vec<PlyValue>>>> = Vec::with_capacity(elem.count);
+    let row_cap = crate::limits::safe_prealloc_capacity(
+        elem.count,
+        std::mem::size_of::<Vec<Option<PlyValue>>>(),
+        crate::limits::MAX_ALLOC_BYTES,
+    )?;
+    let mut rows_scalar: Vec<Vec<Option<PlyValue>>> = Vec::with_capacity(row_cap);
+    let mut rows_list: Vec<Vec<Option<Vec<PlyValue>>>> = Vec::with_capacity(row_cap);
 
     for _ in 0..elem.count {
         let mut s_row = vec![None; elem.properties.len()];
@@ -916,7 +921,12 @@ fn read_ply_element_ascii<'a>(
                         .next()
                         .ok_or_else(|| IoError::InvalidData("Unexpected EOF in PLY list".into()))?;
                     let n = parse_ply_ascii_value(count_tok, count)?.as_usize();
-                    let mut list = Vec::with_capacity(n);
+                    let list_cap = crate::limits::safe_prealloc_capacity(
+                        n,
+                        std::mem::size_of::<PlyValue>(),
+                        crate::limits::MAX_ALLOC_BYTES,
+                    )?;
+                    let mut list = Vec::with_capacity(list_cap);
                     for _ in 0..n {
                         let tok = tokens.next().ok_or_else(|| {
                             IoError::InvalidData("Unexpected EOF in PLY list items".into())
@@ -941,8 +951,13 @@ fn read_ply_element_binary(
     little_endian: bool,
     poly: &mut PolyData,
 ) -> Result<()> {
-    let mut rows_scalar: Vec<Vec<Option<PlyValue>>> = Vec::with_capacity(elem.count);
-    let mut rows_list: Vec<Vec<Option<Vec<PlyValue>>>> = Vec::with_capacity(elem.count);
+    let row_cap = crate::limits::safe_prealloc_capacity(
+        elem.count,
+        std::mem::size_of::<Vec<Option<PlyValue>>>(),
+        crate::limits::MAX_ALLOC_BYTES,
+    )?;
+    let mut rows_scalar: Vec<Vec<Option<PlyValue>>> = Vec::with_capacity(row_cap);
+    let mut rows_list: Vec<Vec<Option<Vec<PlyValue>>>> = Vec::with_capacity(row_cap);
 
     for _ in 0..elem.count {
         let mut s_row = vec![None; elem.properties.len()];
@@ -954,7 +969,12 @@ fn read_ply_element_binary(
                 }
                 PlyPropertyKind::List { count, elem: ety } => {
                     let n = read_ply_bin_value(body, pos, count, little_endian)?.as_usize();
-                    let mut list = Vec::with_capacity(n);
+                    let list_cap = crate::limits::safe_prealloc_capacity(
+                        n,
+                        std::mem::size_of::<PlyValue>(),
+                        crate::limits::MAX_ALLOC_BYTES,
+                    )?;
+                    let mut list = Vec::with_capacity(list_cap);
                     for _ in 0..n {
                         list.push(read_ply_bin_value(body, pos, ety, little_endian)?);
                     }

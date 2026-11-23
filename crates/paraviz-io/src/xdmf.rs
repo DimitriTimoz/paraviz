@@ -4,7 +4,10 @@
 //! topologies, and spatial/temporal grid collections.
 
 use crate::error::{IoError, Result};
-use flate2::read::ZlibDecoder;
+use crate::limits::{
+    decompress_zlib_limited, resolve_safe_path, safe_prealloc_capacity, MAX_ALLOC_BYTES,
+    MAX_DECOMPRESSED_BYTES, MAX_XML_DEPTH,
+};
 use paraviz_core::{
     ArrayData, CellType, DataArray, DataSet, FieldData, ImageData, MultiBlockDataSet,
     RectilinearGrid, StructuredGrid, UnstructuredGrid,
@@ -14,7 +17,6 @@ use quick_xml::{Reader, XmlVersion};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Reads an XDMF (`.xdmf` / `.xmf`) file into a [`DataSet`] (first time step if temporal).
@@ -155,6 +157,11 @@ fn parse_xml_tree(xml: &str, base_dir: &Path, depth: usize) -> Result<XmlNode> {
     loop {
         match reader.read_event()? {
             Event::Start(e) => {
+                if stack.len() >= MAX_XML_DEPTH {
+                    return Err(IoError::Parse(format!(
+                        "XDMF XML nesting depth exceeded limit of {MAX_XML_DEPTH}"
+                    )));
+                }
                 let name = e.name().as_ref().to_string();
                 let mut attrs = Vec::new();
                 for a in e.attributes().flatten() {
@@ -186,7 +193,7 @@ fn parse_xml_tree(xml: &str, base_dir: &Path, depth: usize) -> Result<XmlNode> {
                 if node.local_name().eq_ignore_ascii_case("include")
                     && let Some(href) = node.attr("href")
                 {
-                    let inc_path = base_dir.join(href);
+                    let inc_path = resolve_safe_path(base_dir, href)?;
                     if let Ok(inc_xml) = fs::read_to_string(&inc_path) {
                         let inc_dir = inc_path.parent().unwrap_or(base_dir);
                         let inc_root = parse_xml_tree(&inc_xml, inc_dir, depth + 1)?;
@@ -216,7 +223,7 @@ fn parse_xml_tree(xml: &str, base_dir: &Path, depth: usize) -> Result<XmlNode> {
                     if finished.local_name().eq_ignore_ascii_case("include")
                         && let Some(href) = finished.attr("href")
                     {
-                        let inc_path = base_dir.join(href);
+                        let inc_path = resolve_safe_path(base_dir, href)?;
                         if let Ok(inc_xml) = fs::read_to_string(&inc_path) {
                             let inc_dir = inc_path.parent().unwrap_or(base_dir);
                             let inc_root = parse_xml_tree(&inc_xml, inc_dir, depth + 1)?;
@@ -937,7 +944,8 @@ fn parse_num_spec(node: &XmlNode) -> (NumKind, usize, bool) {
 
 fn read_binary_payload(node: &XmlNode, base_dir: &Path) -> Result<Vec<u8>> {
     let rel = node.text.trim();
-    let mut bytes = fs::read(base_dir.join(rel))?;
+    let safe_path = resolve_safe_path(base_dir, rel)?;
+    let mut bytes = fs::read(safe_path)?;
     let seek = node
         .attr("Seek")
         .and_then(|s| s.trim().parse::<usize>().ok())
@@ -949,12 +957,8 @@ fn read_binary_payload(node: &XmlNode, base_dir: &Path) -> Result<Vec<u8>> {
         .attr("Compression")
         .is_some_and(|c| c.eq_ignore_ascii_case("ZLib"))
     {
-        let mut decoder = ZlibDecoder::new(bytes.as_slice());
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
+        bytes = decompress_zlib_limited(&bytes, MAX_DECOMPRESSED_BYTES)
             .map_err(|e| IoError::Parse(format!("XDMF ZLib decompression failed: {e}")))?;
-        bytes = out;
     }
     Ok(bytes)
 }
@@ -1164,19 +1168,43 @@ fn apply_hyperslab(src: &[f64], src_dims: &[usize], slab: &[u32]) -> Vec<f64> {
 
     let mut dim_strides = vec![1usize; ndim];
     for d in (0..ndim.saturating_sub(1)).rev() {
-        dim_strides[d] = dim_strides[d + 1] * src_dims[d + 1];
+        dim_strides[d] = dim_strides[d + 1].saturating_mul(src_dims[d + 1]);
     }
 
-    let total: usize = counts.iter().map(|&c| c as usize).product();
-    let mut out = Vec::with_capacity(total);
+    let total: usize = counts
+        .iter()
+        .try_fold(1usize, |acc, &c| acc.checked_mul(c as usize))
+        .unwrap_or(usize::MAX);
+    let cap = safe_prealloc_capacity(total, std::mem::size_of::<f64>(), MAX_ALLOC_BYTES)
+        .unwrap_or(0);
+    if cap == 0 && total > 0 && total * std::mem::size_of::<f64>() > MAX_ALLOC_BYTES {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(cap);
     let mut idx = vec![0usize; ndim];
-    for _ in 0..total {
+    for _ in 0..total.min(src.len().saturating_add(1)) {
         let mut flat = 0usize;
+        let mut overflow = false;
         for d in 0..ndim {
-            let coord = starts[d] as usize + idx[d] * (strides[d] as usize).max(1);
-            flat += coord * dim_strides[d];
+            let Some(step) = idx[d].checked_mul((strides[d] as usize).max(1)) else {
+                overflow = true;
+                break;
+            };
+            let Some(coord) = (starts[d] as usize).checked_add(step) else {
+                overflow = true;
+                break;
+            };
+            let Some(term) = coord.checked_mul(dim_strides[d]) else {
+                overflow = true;
+                break;
+            };
+            let Some(next_flat) = flat.checked_add(term) else {
+                overflow = true;
+                break;
+            };
+            flat = next_flat;
         }
-        if let Some(&v) = src.get(flat) {
+        if !overflow && let Some(&v) = src.get(flat) {
             out.push(v);
         }
         for d in (0..ndim).rev() {
@@ -1190,14 +1218,14 @@ fn apply_hyperslab(src: &[f64], src_dims: &[usize], slab: &[u32]) -> Vec<f64> {
     out
 }
 
-fn parse_hdf5_spec(spec: &str) -> Result<(PathBuf, String)> {
+fn parse_hdf5_spec(spec: &str) -> Result<(String, String)> {
     let trimmed = spec.trim();
     let (file_part, ds_part) = trimmed.rsplit_once(':').ok_or_else(|| {
         IoError::Parse(format!(
             "Invalid XDMF HDF5 DataItem '{trimmed}': expected '<file.h5>:/dataset/path'"
         ))
     })?;
-    Ok((PathBuf::from(file_part.trim()), ds_part.trim().to_string()))
+    Ok((file_part.trim().to_string(), ds_part.trim().to_string()))
 }
 
 fn with_hdf5_dataset<T>(
@@ -1206,11 +1234,7 @@ fn with_hdf5_dataset<T>(
     f: impl FnOnce(&hdf5_reader::Dataset) -> Result<T>,
 ) -> Result<T> {
     let (rel_path, ds_path) = parse_hdf5_spec(spec)?;
-    let full_path = if rel_path.is_absolute() {
-        rel_path
-    } else {
-        ctx.base_dir.join(rel_path)
-    };
+    let full_path = resolve_safe_path(ctx.base_dir, &rel_path)?;
     let mut cache = ctx.hdf5_cache.borrow_mut();
     if !cache.contains_key(&full_path) {
         let file = hdf5_reader::Hdf5File::open(&full_path).map_err(|e| {

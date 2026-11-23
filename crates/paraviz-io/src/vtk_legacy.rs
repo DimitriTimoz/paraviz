@@ -602,14 +602,38 @@ fn read_cell_lists(
                 .map(|s| VtkDataType::from_token(s))
                 .transpose()?
                 .unwrap_or(VtkDataType::Int64);
-            let conn_len = offsets_arr.data.get_f64(num_cells) as usize;
+            let raw_conn_len = offsets_arr.data.get_f64(num_cells);
+            if !raw_conn_len.is_finite() || raw_conn_len < 0.0 || raw_conn_len > (usize::MAX as f64) {
+                return Err(IoError::InvalidData("Invalid VTK OFFSETS connectivity length".into()));
+            }
+            let conn_len = raw_conn_len as usize;
             let conn_arr =
                 cur.read_typed_array("connectivity", 1, conn_len, conn_dt, format)?;
-            let mut cells = Vec::with_capacity(num_cells);
+            let cells_cap = crate::limits::safe_prealloc_capacity(
+                num_cells,
+                std::mem::size_of::<Vec<u32>>(),
+                crate::limits::MAX_ALLOC_BYTES,
+            )?;
+            let mut cells = Vec::with_capacity(cells_cap);
             for i in 0..num_cells {
-                let start = offsets_arr.data.get_f64(i) as usize;
-                let end = offsets_arr.data.get_f64(i + 1) as usize;
-                let mut cell = Vec::with_capacity(end.saturating_sub(start));
+                let start_f = offsets_arr.data.get_f64(i);
+                let end_f = offsets_arr.data.get_f64(i + 1);
+                if !start_f.is_finite() || !end_f.is_finite() || start_f < 0.0 || end_f < start_f {
+                    return Err(IoError::InvalidData("Invalid VTK OFFSETS range".into()));
+                }
+                let start = start_f as usize;
+                let end = end_f as usize;
+                if end > conn_arr.data.len() {
+                    return Err(IoError::InvalidData(
+                        "VTK OFFSETS range exceeds connectivity length".into(),
+                    ));
+                }
+                let cell_cap = crate::limits::safe_prealloc_capacity(
+                    end - start,
+                    std::mem::size_of::<u32>(),
+                    crate::limits::MAX_ALLOC_BYTES,
+                )?;
+                let mut cell = Vec::with_capacity(cell_cap);
                 for idx in start..end {
                     cell.push(conn_arr.data.get_f64(idx) as u32);
                 }
@@ -622,24 +646,41 @@ fn read_cell_lists(
 
     let raw = cur.read_typed_array("cells", 1, total_ints, VtkDataType::Int, format)?;
     let vals = raw.data;
-    let mut cells = Vec::with_capacity(num_cells);
+    let cells_cap = crate::limits::safe_prealloc_capacity(
+        num_cells,
+        std::mem::size_of::<Vec<u32>>(),
+        crate::limits::MAX_ALLOC_BYTES,
+    )?;
+    let mut cells = Vec::with_capacity(cells_cap);
     let mut i = 0usize;
     for _ in 0..num_cells {
         if i >= vals.len() {
             return Err(IoError::InvalidData("Truncated VTK cell list".into()));
         }
-        let k = vals.get_f64(i) as usize;
+        let k_f = vals.get_f64(i);
+        if !k_f.is_finite() || k_f < 0.0 {
+            return Err(IoError::InvalidData("Invalid VTK cell vertex count".into()));
+        }
+        let k = k_f as usize;
         i += 1;
-        if i + k > vals.len() {
+        let end = i.checked_add(k).ok_or_else(|| {
+            IoError::InvalidData("VTK cell vertex count overflow".into())
+        })?;
+        if end > vals.len() {
             return Err(IoError::InvalidData(
                 "Truncated VTK cell vertex indices".into(),
             ));
         }
-        let mut cell = Vec::with_capacity(k);
+        let cell_cap = crate::limits::safe_prealloc_capacity(
+            k,
+            std::mem::size_of::<u32>(),
+            crate::limits::MAX_ALLOC_BYTES,
+        )?;
+        let mut cell = Vec::with_capacity(cell_cap);
         for j in 0..k {
             cell.push(vals.get_f64(i + j) as u32);
         }
-        i += k;
+        i = end;
         cells.push(cell);
     }
     Ok(cells)
@@ -708,14 +749,20 @@ impl<'a> LegacyCursor<'a> {
     }
 
     fn consume_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.bytes.len() {
+        let end = self.pos.checked_add(n).ok_or_else(|| {
+            IoError::InvalidData(format!(
+                "Binary VTK byte count {n} overflows at offset {}",
+                self.pos
+            ))
+        })?;
+        if end > self.bytes.len() {
             return Err(IoError::InvalidData(format!(
                 "Unexpected EOF reading {n} binary VTK bytes at offset {}",
                 self.pos
             )));
         }
-        let s = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
+        let s = &self.bytes[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
 
@@ -727,7 +774,11 @@ impl<'a> LegacyCursor<'a> {
         dt: VtkDataType,
         format: VtkLegacyFormat,
     ) -> Result<DataArray> {
-        let count = num_comp.saturating_mul(num_tuples);
+        let count = num_comp.checked_mul(num_tuples).ok_or_else(|| {
+            IoError::InvalidData(format!(
+                "VTK array '{name}' element count overflow: {num_comp} * {num_tuples}"
+            ))
+        })?;
         let data = match format {
             VtkLegacyFormat::Ascii => self.read_ascii_array_data(count, dt)?,
             VtkLegacyFormat::Binary => self.read_binary_array_data(count, dt)?,
@@ -736,9 +787,29 @@ impl<'a> LegacyCursor<'a> {
     }
 
     fn read_ascii_array_data(&mut self, count: usize, dt: VtkDataType) -> Result<ArrayData> {
+        let cap = match dt {
+            VtkDataType::Bit | VtkDataType::UnsignedChar => {
+                crate::limits::safe_prealloc_capacity(count, 1, crate::limits::MAX_ALLOC_BYTES)?
+            }
+            VtkDataType::Char
+            | VtkDataType::Short
+            | VtkDataType::Int
+            | VtkDataType::UnsignedShort
+            | VtkDataType::UnsignedInt
+            | VtkDataType::Float => {
+                crate::limits::safe_prealloc_capacity(count, 4, crate::limits::MAX_ALLOC_BYTES)?
+            }
+            VtkDataType::Long
+            | VtkDataType::Int64
+            | VtkDataType::UnsignedLong
+            | VtkDataType::UInt64
+            | VtkDataType::Double => {
+                crate::limits::safe_prealloc_capacity(count, 8, crate::limits::MAX_ALLOC_BYTES)?
+            }
+        };
         match dt {
             VtkDataType::Bit | VtkDataType::UnsignedChar => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     v.push(tok.parse::<u8>().map_err(|_| {
@@ -748,7 +819,7 @@ impl<'a> LegacyCursor<'a> {
                 Ok(ArrayData::U8(v))
             }
             VtkDataType::Char | VtkDataType::Short | VtkDataType::Int => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     v.push(tok.parse::<i32>().map_err(|_| {
@@ -758,7 +829,7 @@ impl<'a> LegacyCursor<'a> {
                 Ok(ArrayData::I32(v))
             }
             VtkDataType::UnsignedShort | VtkDataType::UnsignedInt => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     v.push(tok.parse::<u32>().map_err(|_| {
@@ -768,7 +839,7 @@ impl<'a> LegacyCursor<'a> {
                 Ok(ArrayData::U32(v))
             }
             VtkDataType::Long | VtkDataType::Int64 => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     v.push(tok.parse::<i64>().map_err(|_| {
@@ -778,7 +849,7 @@ impl<'a> LegacyCursor<'a> {
                 Ok(ArrayData::I64(v))
             }
             VtkDataType::UnsignedLong | VtkDataType::UInt64 => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     let u = tok.parse::<u64>().map_err(|_| {
@@ -789,7 +860,7 @@ impl<'a> LegacyCursor<'a> {
                 Ok(ArrayData::I64(v))
             }
             VtkDataType::Float => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     v.push(tok.parse::<f32>().map_err(|_| {
@@ -799,7 +870,7 @@ impl<'a> LegacyCursor<'a> {
                 Ok(ArrayData::F32(v))
             }
             VtkDataType::Double => {
-                let mut v = Vec::with_capacity(count);
+                let mut v = Vec::with_capacity(cap);
                 for _ in 0..count {
                     let tok = self.next_ascii_token()?;
                     v.push(tok.parse::<f64>().map_err(|_| {
@@ -816,7 +887,12 @@ impl<'a> LegacyCursor<'a> {
             VtkDataType::Bit => {
                 let num_bytes = count.div_ceil(8);
                 let raw = self.consume_bytes(num_bytes)?;
-                let mut out = Vec::with_capacity(count);
+                let cap = crate::limits::safe_prealloc_capacity(
+                    count,
+                    1,
+                    crate::limits::MAX_ALLOC_BYTES,
+                )?;
+                let mut out = Vec::with_capacity(cap);
                 for i in 0..count {
                     let byte = raw[i / 8];
                     let bit = (byte >> (7 - (i % 8))) & 1;

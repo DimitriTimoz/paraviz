@@ -1,26 +1,22 @@
 //! NIfTI-1 (`.nii`, `.nii.gz`) medical volumetric image reader and writer producing [`ImageData`].
 
 use crate::error::{IoError, Result};
-use flate2::read::GzDecoder;
+use crate::limits::{decompress_gzip_limited, read_to_end_limited, MAX_DECOMPRESSED_BYTES};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use paraviz_core::{ArrayData, DataArray, ImageData};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 /// Reads a NIfTI-1 file (`.nii` or gzip-compressed `.nii.gz`) into an [`ImageData`].
 pub fn read_nifti(path: impl AsRef<Path>) -> Result<ImageData> {
     let path = path.as_ref();
-    let mut f = File::open(path)?;
-    let mut raw = Vec::new();
-    f.read_to_end(&mut raw)?;
+    let f = File::open(path)?;
+    let raw = read_to_end_limited(f, MAX_DECOMPRESSED_BYTES)?;
 
     let bytes = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        let mut dec = GzDecoder::new(&raw[..]);
-        let mut out = Vec::new();
-        dec.read_to_end(&mut out)?;
-        out
+        decompress_gzip_limited(&raw, MAX_DECOMPRESSED_BYTES)?
     } else {
         raw
     };

@@ -465,7 +465,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
         "PRectilinearGrid" | "PStructuredGrid" => {
             let mut mb = MultiBlockDataSet::new();
             for (idx, piece) in parallel_pieces.iter().enumerate() {
-                let fp = base_dir.join(&piece.source);
+                let fp = crate::limits::resolve_safe_path(base_dir, &piece.source)?;
                 if !fp.exists() {
                     return Err(IoError::MissingFile(fp));
                 }
@@ -539,7 +539,7 @@ fn parse_parallel_piece(e: &BytesStart<'_>) -> Result<Option<ParallelPiece>> {
 fn load_parallel_pieces(base_dir: &Path, pieces: &[ParallelPiece]) -> Result<Vec<DataSet>> {
     let mut out = Vec::with_capacity(pieces.len());
     for p in pieces {
-        let path = base_dir.join(&p.source);
+        let path = crate::limits::resolve_safe_path(base_dir, &p.source)?;
         if !path.exists() {
             return Err(IoError::MissingFile(path));
         }
@@ -806,7 +806,8 @@ fn scatter_image_field(
     for name in names {
         let proto = fields.iter().find_map(|f| f.get(&name))?;
         let nc = proto.num_components;
-        let mut buf = allocate_zeroed_array_data(proto.data.scalar_type(), total_tuples * nc);
+        let total_elems = total_tuples.checked_mul(nc)?;
+        let mut buf = allocate_zeroed_array_data(proto.data.scalar_type(), total_elems).ok()?;
 
         for (p_idx, f) in fields.iter().enumerate() {
             let Some(arr) = f.get(&name) else {
@@ -859,7 +860,8 @@ fn merge_field_data(
             continue;
         };
         let nc = proto.num_components;
-        let mut merged_data = allocate_zeroed_array_data(proto.data.scalar_type(), 0);
+        let mut merged_data = allocate_zeroed_array_data(proto.data.scalar_type(), 0)
+            .expect("zero-length array allocation cannot fail");
         for f in fields {
             if let Some(arr) = f.get(&name) {
                 append_array_data(&mut merged_data, &arr.data);
@@ -870,8 +872,15 @@ fn merge_field_data(
     out
 }
 
-fn allocate_zeroed_array_data(st: ScalarType, len: usize) -> ArrayData {
-    match st {
+fn allocate_zeroed_array_data(st: ScalarType, len: usize) -> Result<ArrayData> {
+    let elem_sz = match st {
+        ScalarType::F32 | ScalarType::I32 | ScalarType::U32 => 4,
+        ScalarType::F64 | ScalarType::I64 | ScalarType::U64 => 8,
+        ScalarType::I8 | ScalarType::U8 => 1,
+        ScalarType::I16 | ScalarType::U16 => 2,
+    };
+    crate::limits::check_alloc_bytes(len, elem_sz, crate::limits::MAX_ALLOC_BYTES)?;
+    Ok(match st {
         ScalarType::F32 => ArrayData::F32(vec![0.0; len]),
         ScalarType::F64 => ArrayData::F64(vec![0.0; len]),
         ScalarType::I8 => ArrayData::I8(vec![0; len]),
@@ -882,7 +891,7 @@ fn allocate_zeroed_array_data(st: ScalarType, len: usize) -> ArrayData {
         ScalarType::U16 => ArrayData::U16(vec![0; len]),
         ScalarType::U32 => ArrayData::U32(vec![0; len]),
         ScalarType::U64 => ArrayData::U64(vec![0; len]),
-    }
+    })
 }
 
 fn append_array_data(dst: &mut ArrayData, src: &ArrayData) {
@@ -958,7 +967,7 @@ fn handle_dataset_ref(
     let Some(rel_file) = file else {
         return Ok(());
     };
-    let resolved = base_dir.join(&rel_file);
+    let resolved = crate::limits::resolve_safe_path(base_dir, &rel_file)?;
 
     if file_type == "vtkMultiBlockDataSet" {
         if !resolved.exists() {
@@ -1463,14 +1472,16 @@ fn decode_vtk_binary_block(
             return Err(IoError::InvalidData("VTK binary block missing header".into()));
         }
         let payload_len = read_header_word(bytes, 0, byte_order, header_type)?;
-        if word_sz + payload_len > bytes.len() {
+        let end = word_sz.checked_add(payload_len).ok_or_else(|| {
+            IoError::InvalidData("VTK binary payload length overflow".into())
+        })?;
+        if end > bytes.len() {
             return Err(IoError::InvalidData(format!(
-                "VTK binary payload truncated: need {}, got {}",
-                word_sz + payload_len,
+                "VTK binary payload truncated: need {end}, got {}",
                 bytes.len()
             )));
         }
-        Ok(bytes[word_sz..word_sz + payload_len].to_vec())
+        Ok(bytes[word_sz..end].to_vec())
     } else {
         if bytes.len() < 3 * word_sz {
             return Err(IoError::InvalidData(
@@ -1480,7 +1491,12 @@ fn decode_vtk_binary_block(
         let num_blocks = read_header_word(bytes, 0, byte_order, header_type)?;
         let block_size = read_header_word(bytes, word_sz, byte_order, header_type)?;
         let last_block_size = read_header_word(bytes, 2 * word_sz, byte_order, header_type)?;
-        let header_end = (3 + num_blocks) * word_sz;
+        let header_words = (3usize).checked_add(num_blocks).ok_or_else(|| {
+            IoError::InvalidData("VTK compressed block count overflow".into())
+        })?;
+        let header_end = header_words.checked_mul(word_sz).ok_or_else(|| {
+            IoError::InvalidData("VTK compressed header size overflow".into())
+        })?;
         if bytes.len() < header_end {
             return Err(IoError::InvalidData(
                 "VTK compressed block header truncated".into(),
@@ -1489,24 +1505,41 @@ fn decode_vtk_binary_block(
         let mut out = Vec::new();
         let mut cursor = header_end;
         for b in 0..num_blocks {
-            let c_len = read_header_word(bytes, (3 + b) * word_sz, byte_order, header_type)?;
-            if cursor + c_len > bytes.len() {
+            let hdr_off = (3 + b).checked_mul(word_sz).ok_or_else(|| {
+                IoError::InvalidData("VTK block header offset overflow".into())
+            })?;
+            let c_len = read_header_word(bytes, hdr_off, byte_order, header_type)?;
+            let block_end = cursor.checked_add(c_len).ok_or_else(|| {
+                IoError::InvalidData("VTK compressed block offset overflow".into())
+            })?;
+            if block_end > bytes.len() {
                 return Err(IoError::InvalidData(
                     "VTK compressed block truncated".into(),
                 ));
             }
-            let block_slice = &bytes[cursor..cursor + c_len];
+            let block_slice = &bytes[cursor..block_end];
             let expected_uncompressed = if b + 1 == num_blocks {
                 last_block_size
             } else {
                 block_size
             };
+            let remaining = crate::limits::MAX_DECOMPRESSED_BYTES.saturating_sub(out.len());
+            if remaining == 0 {
+                return Err(IoError::InvalidData(
+                    "VTK decompressed payload exceeds maximum allowed size".into(),
+                ));
+            }
             match compressor {
                 XmlCompressor::Zlib => {
-                    let mut decoder = ZlibDecoder::new(block_slice);
-                    decoder.read_to_end(&mut out)?;
+                    let dec = crate::limits::decompress_zlib_limited(block_slice, remaining)?;
+                    out.extend_from_slice(&dec);
                 }
                 XmlCompressor::Lz4 => {
+                    if expected_uncompressed > remaining {
+                        return Err(IoError::InvalidData(format!(
+                            "VTK LZ4 block declared size ({expected_uncompressed} bytes) exceeds remaining limit ({remaining} bytes)"
+                        )));
+                    }
                     let decompressed =
                         lz4_flex::block::decompress(block_slice, expected_uncompressed).map_err(
                             |e| IoError::InvalidData(format!("VTK LZ4 decompress error: {e}")),
@@ -1514,20 +1547,15 @@ fn decode_vtk_binary_block(
                     out.extend_from_slice(&decompressed);
                 }
                 XmlCompressor::Lzma => {
-                    let mut cur = std::io::Cursor::new(block_slice);
-                    // VTK LZMA uses xz container format; fallback to raw lzma if needed
-                    let start_len = out.len();
-                    if lzma_rs::xz_decompress(&mut cur, &mut out).is_err() {
-                        out.truncate(start_len);
-                        let mut cur2 = std::io::Cursor::new(block_slice);
-                        lzma_rs::lzma_decompress(&mut cur2, &mut out).map_err(|e| {
-                            IoError::InvalidData(format!("VTK LZMA decompress error: {e}"))
-                        })?;
-                    }
+                    crate::limits::decompress_lzma_or_xz_limited(
+                        block_slice,
+                        &mut out,
+                        remaining,
+                    )?;
                 }
                 XmlCompressor::None => unreachable!(),
             }
-            cursor += c_len;
+            cursor = block_end;
         }
         Ok(out)
     }
@@ -1541,10 +1569,13 @@ fn read_header_word(
 ) -> Result<usize> {
     match header_type {
         HeaderType::UInt32 => {
-            if offset + 4 > bytes.len() {
+            let end = offset.checked_add(4).ok_or_else(|| {
+                IoError::InvalidData("UInt32 header offset overflow".into())
+            })?;
+            if end > bytes.len() {
                 return Err(IoError::InvalidData("Truncated UInt32 header word".into()));
             }
-            let s = &bytes[offset..offset + 4];
+            let s = &bytes[offset..end];
             let v = match byte_order {
                 ByteOrder::LittleEndian => u32::from_le_bytes([s[0], s[1], s[2], s[3]]),
                 ByteOrder::BigEndian => u32::from_be_bytes([s[0], s[1], s[2], s[3]]),
@@ -1552,10 +1583,13 @@ fn read_header_word(
             Ok(v as usize)
         }
         HeaderType::UInt64 => {
-            if offset + 8 > bytes.len() {
+            let end = offset.checked_add(8).ok_or_else(|| {
+                IoError::InvalidData("UInt64 header offset overflow".into())
+            })?;
+            if end > bytes.len() {
                 return Err(IoError::InvalidData("Truncated UInt64 header word".into()));
             }
-            let s = &bytes[offset..offset + 8];
+            let s = &bytes[offset..end];
             let v = match byte_order {
                 ByteOrder::LittleEndian => {
                     u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
@@ -1564,7 +1598,9 @@ fn read_header_word(
                     u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
                 }
             };
-            Ok(v as usize)
+            usize::try_from(v).map_err(|_| {
+                IoError::InvalidData(format!("UInt64 header word {v} overflows usize"))
+            })
         }
     }
 }

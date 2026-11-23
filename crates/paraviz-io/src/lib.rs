@@ -14,6 +14,7 @@ pub mod error;
 pub mod gif;
 pub mod gltf;
 pub mod html_viewer;
+pub(crate) mod limits;
 pub mod medical_volume;
 pub mod mesh;
 pub mod nifti;

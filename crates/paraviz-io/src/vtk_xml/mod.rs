@@ -6,7 +6,6 @@
 use crate::error::{IoError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use paraviz_core::{
@@ -16,7 +15,7 @@ use paraviz_core::{
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 mod reader;
@@ -177,7 +176,8 @@ pub(crate) fn parse_pvd_index(content: &str, base_dir: &Path) -> Result<Vec<(f64
                         }
                     }
                     if let Some(rel) = file {
-                        entries.push((timestep, base_dir.join(rel)));
+                        let safe_path = crate::limits::resolve_safe_path(base_dir, &rel)?;
+                        entries.push((timestep, safe_path));
                     }
                 }
             }

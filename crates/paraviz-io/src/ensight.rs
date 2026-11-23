@@ -56,12 +56,13 @@ pub fn read_ensight_case(path: impl AsRef<Path>) -> Result<DataSet> {
     let geo_name = geo_file.ok_or_else(|| {
         IoError::InvalidData("EnSight .case file missing 'model:' geometry entry".into())
     })?;
-    let geo_path = base_dir.join(&geo_name);
+    let geo_path = crate::limits::resolve_safe_path(base_dir, &geo_name)?;
     let mut parts = read_ensight_ascii_geo(&geo_path)?;
 
     // Attach per-node scalar variables
     for (var_name, var_file) in node_scalars {
-        if let Ok(part_vals) = read_ensight_ascii_var(&base_dir.join(var_file), 1) {
+        let var_path = crate::limits::resolve_safe_path(base_dir, &var_file)?;
+        if let Ok(part_vals) = read_ensight_ascii_var(&var_path, 1) {
             for (idx, (_, grid)) in parts.iter_mut().enumerate() {
                 if let Some(vals) = part_vals.get(idx) {
                     if vals.len() == grid.points.len() {
@@ -74,7 +75,8 @@ pub fn read_ensight_case(path: impl AsRef<Path>) -> Result<DataSet> {
     }
     // Attach per-node vector variables
     for (var_name, var_file) in node_vectors {
-        if let Ok(part_vals) = read_ensight_ascii_var(&base_dir.join(var_file), 3) {
+        let var_path = crate::limits::resolve_safe_path(base_dir, &var_file)?;
+        if let Ok(part_vals) = read_ensight_ascii_var(&var_path, 3) {
             for (idx, (_, grid)) in parts.iter_mut().enumerate() {
                 if let Some(vals) = part_vals.get(idx) {
                     let n = grid.points.len();
@@ -91,7 +93,8 @@ pub fn read_ensight_case(path: impl AsRef<Path>) -> Result<DataSet> {
     }
     // Attach per-element scalar variables
     for (var_name, var_file) in elem_scalars {
-        if let Ok(part_vals) = read_ensight_ascii_var(&base_dir.join(var_file), 1) {
+        let var_path = crate::limits::resolve_safe_path(base_dir, &var_file)?;
+        if let Ok(part_vals) = read_ensight_ascii_var(&var_path, 1) {
             for (idx, (_, grid)) in parts.iter_mut().enumerate() {
                 if let Some(vals) = part_vals.get(idx) {
                     if vals.len() == grid.num_cells() {
