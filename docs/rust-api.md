@@ -191,3 +191,27 @@ See the runnable examples in [`examples/`](../examples):
 - [`examples/streamlines_and_tubes.rs`](../examples/streamlines_and_tubes.rs)
 - [`examples/volume_raymarch.rs`](../examples/volume_raymarch.rs)
 - [`examples/benchmark_pipeline.rs`](../examples/benchmark_pipeline.rs)
+
+---
+
+## 5. Python Bindings (`paraviz-py`)
+
+A standalone PyO3 extension crate lives in [`crates/paraviz-py/`](../crates/paraviz-py), exposing `paraviz.Session` with a workflow modeled after `paraview.simple`:
+
+```python
+import paraviz
+
+s = paraviz.Session()
+wav = s.wavelet("Wavelet")
+iso = s.contour("Contour", wav, "RTData", [120.0, 175.0])
+s.hide(wav)
+s.show(iso, repr="edges", colormap="viridis", color_by="RTData")
+s.reset_camera()
+s.render_png("wavelet.png", 1280, 720)
+print(s.to_rust_trace())
+```
+
+Build and install locally with `maturin` inside `crates/paraviz-py`:
+```bash
+cd crates/paraviz-py && maturin develop --release
+```

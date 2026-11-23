@@ -108,17 +108,19 @@ cargo run -p paraviz-app -- convert input.vtk output.glb
 
 ## Documentation
 
-Full guides and reference documentation live in [`docs/`](docs/README.md):
+Full end-user and developer documentation lives in [`docs/`](docs/README.md):
 
-- [Architecture & WebGPU Rendering Pipeline](docs/architecture.md)
-- [Rust API Guide](docs/rust-api.md)
-- [Sources & Filters Reference](docs/filters-and-sources.md)
-- [File Formats & I/O](docs/file-formats.md)
-- [Desktop Studio GUI & Headless CLI](docs/gui-and-cli.md)
+- [**User Guide**](docs/user-guide.md) — Step-by-step workflows for the Studio GUI, volume raymarching, CFD streamlines, picking/probing, animations, and web exports
+- [**Differences from Classic ParaView**](docs/differences-from-paraview.md) — Architectural improvements, shortcut/UI mapping, and current feature scope vs. Kitware ParaView
+- [**Desktop Studio GUI & Headless CLI**](docs/gui-and-cli.md) — GUI inspector tabs, shortcuts (`F1`), and CLI batch reference
+- [**Architecture & WebGPU Rendering Pipeline**](docs/architecture.md) — Crate breakdown, `PipelineGraph`, WGSL shaders, EDL, and GPU Compute Marching Cubes
+- [**Rust API Guide (& Python Bindings)**](docs/rust-api.md) — `ParaViz` session API, `DataSet` construction, `WebGpuRenderer`, and `paraviz-py`
+- [**Sources & Filters Reference**](docs/filters-and-sources.md) — All 14 sources, 37 `FilterConfig` filters, multi-input filters, and `CalculatorFilter` syntax
+- [**File Formats & I/O**](docs/file-formats.md) — VTK Legacy/XML, `.pvd`, NIfTI, NRRD, MetaImage, EnSight, XDMF, OpenFOAM, `.glb`, `.gif`, and `.html`
 
 Generate local rustdoc HTML documentation:
 ```bash
-cargo doc --workspace --no-deps --open
+cargo doc --workspace --exclude paraviz-app --no-deps --open
 ```
 
 ---

@@ -29,19 +29,24 @@ You can also drag-and-drop any supported dataset or state file directly onto the
 
 ### 2. Left Dock: Pipeline Browser & Inspector
 - **Pipeline Browser**: Tree view with visibility eye toggles, `All` / `None` / `Solo` actions, **Copy / Paste Filter** (`Ctrl/Cmd+C` & `Ctrl/Cmd+V`, plus right-click `Copy Filter Chain` / `Paste Filter Chain`), inline Rename, Duplicate, and Delete.
-- **Properties Tab**: Auto-Apply toggle (with explicit Apply/Reset), dynamic array dropdowns, and bounds presets for sources and filters.
-- **Display Tab**: Representation selector (`Surface`, `SurfaceWithEdges`, `Wireframe`, `Points`, `PointGaussian`, `Volume`, `Outline`), Color By array & component, Color Map preset + log-scale + custom range/rescale-to-data, Opacity, Volume Transfer Function editor, Point Size / Line Width / Edge Color & Width, and material lighting (`Ambient`, `Specular`, `Shininess`, `Two-Sided`).
-- **Information Tab**: Dataset type, point/cell counts, memory usage, 3D bounding box, and per-array scalar ranges/types.
-- **Scene Tab**: Background skybox gradient presets, FOV / Orthographic toggle, Camera Bookmarks, MSAA (`1x` / `4x`), Eye-Dome Lighting (`EDL` + strength), Axes Gizmo, Bounding Box, 3D Axes Grid, and Turntable spin.
+- **Properties Tab**: **Auto-Apply** toggle (with explicit **Apply** / **Discard** when disabled), dynamic array dropdowns, plane-snap presets (`X`/`Y`/`Z`/Center), and bounds presets (`Fit Parent Bounds`) for sources and filters.
+- **Display Tab**:
+  - **Representation**: `Surface`, `SurfaceWithEdges`, `Wireframe`, `Points`, `PointGaussian`, `Volume`, `Outline`.
+  - **Color By**: `Solid Color` (with RGBA picker), `Point` or `Cell` arrays, plus `Magnitude` or component (`X`/`Y`/`Z`) selection for vector arrays.
+  - **Colormap & Range**: 11 presets (`Cool to Warm`, `Fast`, `Viridis`, `Plasma`, `Inferno`, `Magma`, `Turbo`, `Rainbow`, `Grayscale`, `Black-Body Radiation`, `Cividis`), `Invert`, `Log Scale`, `Auto`, `Fit Data`, `±Sym`, and manual `Min` / `Max`.
+  - **Material & Geometry Style**: `Opacity`, `Ambient`, `Specular`, `Shininess`, `Two-Sided Lighting`, `Point Size`, `Line Width`, `Edge Width`, and `Edge Color`.
+  - **Volume Transfer Function** *(when `Representation::Volume`)*: `Step Size`, `Gradient Shading`, live **3D Volume Clip Plane** (`Clip Origin` & `Clip Normal`), quick opacity presets (`Linear`, `Soft`, `Iso-Shell`, `Peak`), interactive histogram-backed opacity curve editor, and `Control Points Table`.
+- **Information Tab**: Dataset type, point/cell counts, memory usage, 3D bounding box + diagonal, surface area & topology counts (`PolyData`), and per-array scalar types, components, ranges, and on-demand `Compute Mean / StdDev`.
+- **Scene Tab**: Background skybox gradient presets (`ViewportBgPreset`) + custom Top/Bottom pickers, FOV / `Orthographic` toggle, numeric camera position/target, **Bookmark View**, `4x MSAA`, `Eye-Dome Lighting (EDL)` + `EDL Strength`, `3D Axes Gizmo`, `Scene Bounding Box`, `3D Cube Axes Grid`, `Transparent Background (Export)`, `3D Filter Widgets`, `Scalar Color Bar`, and Turntable spin.
 
 ### 3. Center WebGPU Viewport
-- Supports three interaction modes (`1` Orbit, `2` Pick, `3` Ruler) with a floating HUD displaying picked point/cell IDs, world coordinates, scalar values, distance measurements, `Reveal in Spreadsheet`, `Focus`, and `Clear` actions.
-- Renders optional 3D `ViewportWidget` guides (`Plane`, `Line`, `Box`, `Sphere`) synced with active filters (`W` to toggle).
+- Supports three interaction modes (`1` Orbit, `2` Pick, `3` Ruler) with a floating HUD displaying picked point/cell IDs, world coordinates, scalar values, Euclidean/axis distance measurements, `Reveal in Spreadsheet`, `Focus`, and `Clear` actions.
+- Renders optional 3D `ViewportWidget` guides (`Plane`, `Line`, `Box`, `Sphere`) synced with active filters (`W` to toggle), plus an interactive **Scalar Color Bar** overlay and corner **3D Axes Gizmo**.
 
 ### 4. Bottom Drawer
-- **Spreadsheet**: Inspect Point, Cell, or Field attributes with column filtering, click-to-highlight in 3D, and **Export CSV**.
-- **Chart / Histogram**: Interactive value histogram and `ProbeOverLine` XY plots.
-- **Rust Trace**: Live generated Rust API code (`pv.to_rust_trace()`) reproducing the current interactive session.
+- **Spreadsheet**: Inspect `Points`, `Cells`, or `Field` attributes with pagination, column name filtering, click-to-highlight in 3D, and **Export CSV**.
+- **Chart / Histogram**: Automatic **XY Plot (ArcLength)** for `ProbeOverLine` and streamlines (with `Markers`, `Log Y`, series toggles, and CSV export), plus interactive **Scalar Histogram** for any point/cell array.
+- **Rust Trace**: Live generated Rust API code (`pv.to_rust_trace()`) with **Copy to Clipboard** to reproduce the current interactive session in code.
 
 ---
 
