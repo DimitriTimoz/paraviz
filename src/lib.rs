@@ -87,15 +87,18 @@ pub mod prelude {
         WarpByScalarFilter, WarpByVectorFilter,
     };
     pub use crate::io::{
-        encode_animated_gif_bytes, encode_html_viewer, read_dataset, read_ensight_case,
-        read_metaimage, read_nifti, read_nrrd, read_openfoam, read_pvd_series, read_raw_volume,
-        read_xdmf, write_animated_gif, write_dataset, write_glb, write_html_viewer,
-        write_metaimage, write_nifti, write_pvd_series, PvdSeriesSource, RawEndian, RawScalarType,
+        encode_animated_gif_bytes, encode_html_viewer, inspect_exodus_time_steps,
+        inspect_vtkhdf_time_steps, read_cgns, read_dataset, read_ensight_case, read_exodus,
+        read_exodus_at_time, read_metaimage, read_nifti, read_nrrd, read_openfoam,
+        read_pvd_series, read_raw_volume, read_vtkhdf, read_vtkhdf_at_time, read_xdmf,
+        write_animated_gif, write_dataset, write_glb, write_html_viewer, write_metaimage,
+        write_nifti, write_pvd_series, DatasetReader, PvdSeriesSource, RawEndian, RawScalarType,
         RawVolumeDescriptor, VtkFileSource,
     };
     pub use crate::render::{
         pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,
-        RenderScene, Representation, SceneActor, SceneSettings, ViewportWidget, WebGpuRenderer,
+        RenderScene, Representation, ScalarBarConfig, SceneActor, SceneSettings,
+        ViewportAnnotation, ViewportWidget, WebGpuRenderer,
     };
     pub use crate::session::{FilterConfig, ParaViz, SessionError, SourceConfig};
     pub use crate::sources::{

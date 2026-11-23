@@ -371,6 +371,24 @@ impl PipelineGraph {
         Ok(result)
     }
 
+    /// Seeds a pre-evaluated output (for example from a background worker) into `id`'s cache
+    /// and clears its `dirty` flag so subsequent updates reuse it without re-executing.
+    pub fn seed_cached_output(
+        &mut self,
+        id: NodeId,
+        dataset: Arc<DataSet>,
+        time: f64,
+    ) -> Result<(), PipelineError> {
+        let entry = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(PipelineError::MissingNode(id))?;
+        entry.cached_output = Some(dataset);
+        entry.dirty = false;
+        entry.cached_time = time;
+        Ok(())
+    }
+
     /// Returns the human-readable label for a node.
     pub fn label(&self, id: NodeId) -> Option<&str> {
         self.nodes.get(&id).map(|e| e.label.as_str())

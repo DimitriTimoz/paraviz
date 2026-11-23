@@ -114,3 +114,50 @@ fn gpu_compute_contour_picking_and_glb_export() {
     let restored = ParaViz::load_state_json(&state_json).unwrap();
     assert_eq!(restored.nodes().len(), 2);
 }
+
+#[test]
+fn multiblock_block_controls_time_annotation_and_preloaded_seed() {
+    let mut mb = MultiBlockDataSet::new();
+    let sphere = SphereSource {
+        radius: 1.0,
+        theta_resolution: 12,
+        phi_resolution: 12,
+        ..Default::default()
+    }
+    .execute(0.0)
+    .unwrap();
+    let cube = CubeSource {
+        center: [3.0, 0.0, 0.0],
+        ..Default::default()
+    }
+    .execute(0.0)
+    .unwrap();
+    mb.add_block("inlet", sphere);
+    mb.add_block("wall", cube);
+
+    let mut pv = ParaViz::new();
+    let id = pv.add_dataset("Assembly", DataSet::MultiBlock(mb));
+    pv.show(id)
+        .hide_block("wall")
+        .block_color("inlet", [0.9, 0.2, 0.2, 1.0]);
+    pv.set_time(2.5);
+    pv.settings.show_time_annotation = true;
+    pv.settings.show_scalar_bar = true;
+    pv.settings.scalar_bar.horizontal = true;
+    pv.settings.annotations.push(ViewportAnnotation {
+        id: 1,
+        text: "CFD Case".into(),
+        pos: [0.05, 0.08],
+        font_size: 16.0,
+        color: [1.0, 1.0, 1.0, 1.0],
+        visible: true,
+    });
+    pv.camera_preset(CameraPreset::Isometric).unwrap();
+
+    let scene = pv.build_scene().unwrap();
+    assert_eq!(scene.settings.time_label.as_deref(), Some("Time: 2.5000"));
+    assert!(scene.actors[0].style.hidden_blocks.contains("wall"));
+
+    let rgba = pv.render_rgba(320, 240).unwrap();
+    assert_eq!(rgba.len(), 320 * 240 * 4);
+}

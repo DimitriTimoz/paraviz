@@ -442,6 +442,30 @@ impl<'a> DisplayHandle<'a> {
         self.node.style.volume_step_size = step.max(0.05);
         self
     }
+
+    /// Hides a named or slash-pathed block inside a `MultiBlockDataSet`.
+    pub fn hide_block(self, block: impl Into<String>) -> Self {
+        self.node.style.hidden_blocks.insert(block.into());
+        self
+    }
+
+    /// Shows a previously hidden block inside a `MultiBlockDataSet`.
+    pub fn show_block(self, block: &str) -> Self {
+        self.node.style.hidden_blocks.remove(block);
+        self
+    }
+
+    /// Sets a solid RGBA color override on a named or slash-pathed block in a `MultiBlockDataSet`.
+    pub fn block_color(self, block: impl Into<String>, rgba: [f32; 4]) -> Self {
+        self.node.style.block_colors.insert(block.into(), rgba);
+        self
+    }
+
+    /// Removes any per-block color override for `block`.
+    pub fn clear_block_color(self, block: &str) -> Self {
+        self.node.style.block_colors.remove(block);
+        self
+    }
 }
 
 /// Serializable snapshot of a [`ParaViz`] pipeline, styles, and camera.
@@ -591,6 +615,52 @@ impl ParaViz {
         };
         let label = cfg.default_label();
         self.add_source_cfg(label, cfg)
+    }
+
+    /// Registers a file source whose dataset was already loaded (for example on a background worker thread)
+    /// without re-reading from disk on the first evaluation.
+    pub fn open_preloaded(
+        &mut self,
+        path: impl AsRef<Path>,
+        reader: DatasetReader,
+        dataset: DataSet,
+        time_steps: Vec<f64>,
+    ) -> Result<NodeId, SessionError> {
+        let path = path.as_ref().to_path_buf();
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let cfg = if ext == "pvd" && reader == DatasetReader::Auto {
+            SourceConfig::PvdSeries(path)
+        } else if reader == DatasetReader::Auto {
+            SourceConfig::File(path)
+        } else {
+            SourceConfig::FileWithReader { path, reader }
+        };
+        let label = cfg.default_label();
+        let src = cfg.build_source()?;
+        let id = self.graph.add_source(label.clone(), src);
+        let arc = Arc::new(dataset);
+        self.graph.seed_cached_output(id, arc.clone(), self.time)?;
+        let mut style = ActorStyle::default();
+        auto_select_color_by(&mut style, &arc);
+        if matches!(arc.as_ref(), DataSet::ImageData(_)) {
+            style.representation = Representation::Outline;
+        }
+        self.nodes.push(SessionNode {
+            id,
+            name: label,
+            parent: None,
+            source_config: Some(cfg),
+            filter_config: None,
+            style,
+            cached_dataset: Some(arc),
+            time_steps,
+            auto_styled: true,
+        });
+        Ok(id)
     }
 
     /// Adds a custom [`Filter`] node connected to `input`.
@@ -756,6 +826,25 @@ impl ParaViz {
         Ok(ds)
     }
 
+    /// Seeds a pre-evaluated dataset (for example from a background worker) for `id` at `time`,
+    /// avoiding synchronous re-execution on the main UI thread.
+    pub fn seed_evaluated(
+        &mut self,
+        id: NodeId,
+        dataset: Arc<DataSet>,
+        time: f64,
+    ) -> Result<(), SessionError> {
+        self.graph.seed_cached_output(id, dataset.clone(), time)?;
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
+            if !node.auto_styled {
+                auto_select_color_by(&mut node.style, &dataset);
+                node.auto_styled = true;
+            }
+            node.cached_dataset = Some(dataset);
+        }
+        Ok(())
+    }
+
     /// Evaluates all visible nodes in the pipeline.
     pub fn update_visible(&mut self) -> Result<(), SessionError> {
         let visible_ids: Vec<NodeId> = self
@@ -782,10 +871,14 @@ impl ParaViz {
     /// Builds a [`RenderScene`] from all evaluated visible nodes.
     pub fn build_scene(&mut self) -> Result<RenderScene, SessionError> {
         self.update_visible()?;
+        let mut settings = self.settings.clone();
+        if settings.show_time_annotation && settings.time_label.is_none() {
+            settings.time_label = Some(format!("Time: {:.4}", self.time));
+        }
         let mut scene = RenderScene {
             camera: self.camera.clone(),
             actors: Vec::new(),
-            settings: self.settings.clone(),
+            settings,
             widgets: self.widgets.clone(),
             selection_highlight: self.selection_highlight,
         };
