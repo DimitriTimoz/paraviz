@@ -29,7 +29,7 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 ### Top Menu & Toolbar
 - **File**: Open File Browser (with `DatasetReader` dropdown), Open by Path, Import Raw 3D Volume (`RawVolumeDescriptor`), Recent Files, Save/Load State `.json`, Export Dataset (`.vtp`, `.vtu`, `.vti`, `.vtk`, `.stl`, `.obj`, `.ply`, `.csv`, `.glb`, standalone WebGL2 `.html`), Save Screenshot `.png`, Export Animation `.gif` (turntable or time-series).
 - **Sources**: All 14 geometric & analytical procedural sources.
-- **Filters**: All 37 `FilterConfig` filters (contextually gated by input dataset type) + **GPU Compute Contour (WebGPU)...** + **Append Visible Datasets**.
+- **Filters**: Searchable **Filters** menu (`Search 39 filters...`) grouped into **Common**, **Extraction & Slicing**, **Flow, Vectors & Warp**, **Mesh & Topology**, **Fields, Probing & Resampling**, **Temporal**, and **All Alphabetical (A-Z)** scrollable submenus — including **GPU Compute Contour (WebGPU)...** (`ImageData`) and **Append Visible Datasets**.
 - **Demos**: Launch any of the 5 built-in `DemoPreset` pipelines (Studio opens with **Swirling Vortex Streamlines + Glyphs**).
 - **View & Quick Bar**:
   - Panels: `Inspector Dock (Tab)`, `Data Drawer`, `Zen Mode (Full Viewport)`.
