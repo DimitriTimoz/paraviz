@@ -25,6 +25,7 @@
 - **Release overflow checks**: `[profile.release]` enables `overflow-checks = true` in `Cargo.toml`.
 - **HTML export**: Embedded JSON in `<script>` tags must escape `<`, `>`, `&`, and JS line terminators.
 - **CI/CD**: Workflows default to `permissions: contents: read`, never interpolate `${{ ... }}` directly inside `run:` scripts (always pass via `env:` and validate), and verify downloaded release tooling with pinned versions and SHA-256 checksums.
+- **Always update documentation**: Every change to features, GUI controls, CLI flags, supported file formats, filters/sources, rendering/scene options, public Rust/Python APIs, or architecture must update the relevant documentation (`README.md`, `docs/` guides, rustdoc comments, and CLI `--help` text) before finishing or committing.
 
 ### Pre-Commit Verification
 
@@ -75,5 +76,6 @@ Follow **Conventional Commits** with small, atomic, single-purpose commits.
 
 1. **One logical change per commit**: Separate security hardening in `paraviz-io`, `paraviz-core`/`paraviz-filters`, CI/packaging, `paraviz-py`, and documentation into distinct commits so each can be reviewed, cherry-picked, or reverted independently.
 2. **Include tests with the fix**: Add regression tests alongside the code they verify (or in the dedicated test commit for that layer).
-3. **Never commit untracked junk or secrets**: Check `git status` and `git diff --cached` before committing; never commit `.DS_Store`, `target/`, or credentials.
-4. **Never bypass hooks or checks**: Do not use `--no-verify` to skip failing checks.
+3. **Always keep docs in sync**: Update `README.md`, relevant files in `docs/` (`architecture.md`, `differences-from-paraview.md`, `file-formats.md`, `filters-and-sources.md`, `gui-and-cli.md`, `rendering-and-scene.md`, `rust-api.md`, `user-guide.md`), and `--help`/docstrings whenever behavior, UI, CLI, or APIs change.
+4. **Never commit untracked junk or secrets**: Check `git status` and `git diff --cached` before committing; never commit `.DS_Store`, `target/`, or credentials.
+5. **Never bypass hooks or checks**: Do not use `--no-verify` to skip failing checks.
