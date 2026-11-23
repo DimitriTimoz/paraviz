@@ -8,44 +8,16 @@ use cli::{parse_args, run_headless_command, CliCommand};
 use std::sync::Arc;
 
 fn build_app_icon() -> egui::IconData {
-    let size = 64u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let nx = (x as f32 + 0.5) / size as f32;
-            let ny = (y as f32 + 0.5) / size as f32;
-            let dx = (nx - 0.5).abs() - 0.36;
-            let dy = (ny - 0.5).abs() - 0.36;
-            let dist = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - 0.12;
-            let alpha = ((-dist * 32.0).clamp(0.0, 1.0) * 255.0) as u8;
-
-            // Indigo -> Cyan studio gradient
-            let t = (nx * 0.65 + ny * 0.35).clamp(0.0, 1.0);
-            let mut r = (79.0 * (1.0 - t) + 14.0 * t) as u8;
-            let mut g = (70.0 * (1.0 - t) + 165.0 * t) as u8;
-            let mut b = (229.0 * (1.0 - t) + 233.0 * t) as u8;
-
-            // Crisp geometric diamond/prism highlight in center
-            let cx = (nx - 0.5).abs();
-            let cy = (ny - 0.5).abs();
-            let diamond = cx + cy;
-            if (0.20..=0.25).contains(&diamond) || (cx < 0.025 && ny > 0.5 && ny < 0.74) {
-                r = 248;
-                g = 251;
-                b = 255;
-            }
-
-            let idx = ((y * size + x) * 4) as usize;
-            rgba[idx] = r;
-            rgba[idx + 1] = g;
-            rgba[idx + 2] = b;
-            rgba[idx + 3] = alpha;
-        }
-    }
+    let icon_bytes: &[u8] = include_bytes!("../../../assets/icon.png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(icon_bytes));
+    let mut reader = decoder.read_info().expect("valid bundled icon.png");
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(256 * 256 * 4)];
+    let info = reader.next_frame(&mut buf).expect("valid icon.png frame");
+    buf.truncate(info.buffer_size());
     egui::IconData {
-        rgba,
-        width: size,
-        height: size,
+        rgba: buf,
+        width: info.width,
+        height: info.height,
     }
 }
 

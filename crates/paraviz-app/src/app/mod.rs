@@ -1,8 +1,9 @@
 pub(crate) use crate::charts::{draw_chart_tab, draw_opacity_tf_editor, ChartMode, ChartState};
 pub(crate) use crate::cli::format_memory_bytes;
 pub(crate) use crate::modals::{
-    draw_modal, is_raw_volume_ext, AppModal, ExportSpreadsheetModalState, FileBrowserState,
-    GifModalState, GpuContourModalState, ModalAction, RawVolumeModalState, ScreenshotModalState,
+    draw_modal, is_raw_volume_ext, native_pick_scientific_file, native_pick_state_file,
+    native_save_file, AppModal, GifModalState, GpuContourModalState, ModalAction,
+    RawVolumeModalState, ScreenshotModalState,
 };
 pub(crate) use crate::theme::{
     apply_theme, node_badge_style, paint_logo_badge, palette, pill_badge, section_card,
@@ -189,7 +190,7 @@ impl ParaVizApp {
             cached_total_points: 0,
             cached_total_cells: 0,
             theme,
-            theme_applied: true,
+            theme_applied: false,
             selected_node: None,
             renaming_node: None,
             copied_filter: None,
@@ -1185,6 +1186,20 @@ impl ParaVizApp {
             self.viewport_tex_size,
             self.theme,
         );
+        self.execute_modal_action(action);
+    }
+
+    pub(super) fn open_picked_scientific_file(&mut self, p: PathBuf) {
+        if is_raw_volume_ext(&p) {
+            self.modal = Some(AppModal::RawVolume(RawVolumeModalState::with_path(
+                p.display().to_string(),
+            )));
+        } else {
+            self.load_path(&p);
+        }
+    }
+
+    pub(super) fn execute_modal_action(&mut self, action: ModalAction) {
         match action {
             ModalAction::None => {}
             ModalAction::OpenFile(p) | ModalAction::LoadState(p) => self.load_path(&p),

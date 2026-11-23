@@ -187,6 +187,10 @@ pub fn apply_theme(ctx: &egui::Context, theme: UiTheme) {
         }
     }
 
+    ctx.set_theme(match theme {
+        UiTheme::DarkStudio => egui::ThemePreference::Dark,
+        UiTheme::LightStudio => egui::ThemePreference::Light,
+    });
     style.visuals = vis;
     ctx.set_global_style(style);
 }

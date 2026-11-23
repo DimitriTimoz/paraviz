@@ -105,6 +105,7 @@ pub struct ExportSpreadsheetModalState {
     pub row_count: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum AppModal {
     OpenFile(String),
@@ -416,11 +417,22 @@ pub fn draw_modal(
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.label("File path:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut rv.path)
-                            .desired_width(380.0)
-                            .hint_text("path/to/volume.raw"),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut rv.path)
+                                .desired_width(305.0)
+                                .hint_text("path/to/volume.raw"),
+                        );
+                        if ui.button("Browse...").clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .set_title("Select Raw 3D Volume")
+                                .add_filter("Raw Volumes", &["raw", "bin", "vol"])
+                                .add_filter("All Files", &["*"])
+                                .pick_file()
+                        {
+                            rv.path = p.display().to_string();
+                        }
+                    });
                     ui.add_space(4.0);
                     ui.label("Dimensions (X, Y, Z):");
                     ui.horizontal(|ui| {
@@ -579,13 +591,18 @@ pub fn draw_modal(
 
         AppModal::SaveScreenshot(ss) => {
             let mut confirm = false;
-            let mut browse_folder = false;
             egui::Window::new("Save Screenshot (PNG)")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    browse_folder = draw_save_destination_picker(ui, "Output PNG path:", &mut ss.path);
+                    draw_save_destination_picker(
+                        ui,
+                        "Output PNG path:",
+                        &mut ss.path,
+                        "Save Screenshot (PNG)",
+                        &[("PNG Image", &["png"])],
+                    );
                     ui.checkbox(&mut ss.use_viewport_size, "Match current viewport size");
                     if ss.use_viewport_size {
                         ss.width = viewport_size.0.max(640);
@@ -632,13 +649,6 @@ pub fn draw_modal(
                     });
                 });
 
-            if browse_folder {
-                let p = ss.path.clone();
-                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::for_save_modal(
-                    &p, modal,
-                )));
-                return ModalAction::None;
-            }
             if confirm {
                 let p = ss.path.trim();
                 if !p.is_empty() {
@@ -658,13 +668,18 @@ pub fn draw_modal(
 
         AppModal::ExportGif(gm) => {
             let mut confirm = false;
-            let mut browse_folder = false;
             egui::Window::new("Export Animation (GIF)")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    browse_folder = draw_save_destination_picker(ui, "Output GIF path:", &mut gm.path);
+                    draw_save_destination_picker(
+                        ui,
+                        "Output GIF path:",
+                        &mut gm.path,
+                        "Export Animation (GIF)",
+                        &[("GIF Animation", &["gif"])],
+                    );
                     ui.horizontal(|ui| {
                         ui.label("Mode:");
                         ui.radio_value(&mut gm.is_turntable, true, "360° Turntable");
@@ -707,13 +722,6 @@ pub fn draw_modal(
                     });
                 });
 
-            if browse_folder {
-                let p = gm.path.clone();
-                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::for_save_modal(
-                    &p, modal,
-                )));
-                return ModalAction::None;
-            }
             if confirm {
                 let p = gm.path.trim();
                 if !p.is_empty() {
@@ -840,7 +848,6 @@ pub fn draw_modal(
 
         AppModal::ExportSpreadsheetCsv(es) => {
             let mut confirm = false;
-            let mut browse_folder = false;
             egui::Window::new("Export Spreadsheet CSV")
                 .collapsible(false)
                 .resizable(false)
@@ -859,9 +866,13 @@ pub fn draw_modal(
                             ui.monospace(es.col_filter.trim());
                         });
                     }
-                    if draw_save_destination_picker(ui, "Output CSV path:", &mut es.path) {
-                        browse_folder = true;
-                    }
+                    draw_save_destination_picker(
+                        ui,
+                        "Output CSV path:",
+                        &mut es.path,
+                        "Export Spreadsheet CSV",
+                        &[("CSV Table", &["csv"])],
+                    );
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Export CSV").clicked() {
@@ -873,13 +884,6 @@ pub fn draw_modal(
                     });
                 });
 
-            if browse_folder {
-                let p = es.path.clone();
-                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::for_save_modal(
-                    &p, modal,
-                )));
-                return ModalAction::None;
-            }
             if confirm {
                 let p = es.path.trim();
                 if !p.is_empty() {
@@ -921,9 +925,26 @@ pub fn draw_modal(
                         _ => unreachable!(),
                     };
                     if is_save {
-                        if draw_save_destination_picker(ui, "Save to:", path_str) {
-                            switch_to_browser = true;
-                        }
+                        let (dlg_title, filters): (&str, &[(&str, &[&str])]) = if is_export {
+                            (
+                                "Export Active Dataset",
+                                &[
+                                    ("VTK PolyData", &["vtp"]),
+                                    ("VTK Unstructured", &["vtu"]),
+                                    ("VTK ImageData", &["vti"]),
+                                    ("Legacy VTK", &["vtk"]),
+                                    ("STL Mesh", &["stl"]),
+                                    ("Wavefront OBJ", &["obj"]),
+                                    ("PLY Mesh", &["ply"]),
+                                    ("CSV Table", &["csv"]),
+                                    ("glTF Binary", &["glb"]),
+                                    ("Interactive HTML", &["html"]),
+                                ],
+                            )
+                        } else {
+                            ("Save Pipeline State", &[("ParaViz State JSON", &["json"])])
+                        };
+                        draw_save_destination_picker(ui, "Save to:", path_str, dlg_title, filters);
                     } else {
                         ui.label("File path:");
                         let resp = ui.add(
@@ -1071,17 +1092,72 @@ fn apply_dir_to_modal(modal: &mut AppModal, dir: &Path) {
     }
 }
 
-fn draw_save_destination_picker(ui: &mut egui::Ui, label: &str, path_str: &mut String) -> bool {
-    let mut browse_clicked = false;
+pub fn native_pick_scientific_file(start_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut dlg = rfd::FileDialog::new()
+        .set_title("Open Scientific Dataset")
+        .add_filter(
+            "Scientific Datasets",
+            &[
+                "vtp", "vtu", "vti", "vtr", "vts", "vtk", "pvtp", "pvtu", "pvti", "pvtr", "pvts",
+                "pvd", "stl", "obj", "ply", "csv", "nii", "gz", "mhd", "mha", "nrrd", "nhdr",
+                "case", "xdmf", "xmf", "raw", "bin", "vol", "foam", "json",
+            ],
+        )
+        .add_filter("All Files", &["*"]);
+    if let Some(dir) = start_dir.filter(|d| d.is_dir()) {
+        dlg = dlg.set_directory(dir);
+    }
+    dlg.pick_file()
+}
+
+pub fn native_pick_state_file(start_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut dlg = rfd::FileDialog::new()
+        .set_title("Load Pipeline State")
+        .add_filter("ParaViz State JSON", &["json"])
+        .add_filter("All Files", &["*"]);
+    if let Some(dir) = start_dir.filter(|d| d.is_dir()) {
+        dlg = dlg.set_directory(dir);
+    }
+    dlg.pick_file()
+}
+
+pub fn native_save_file(
+    title: &str,
+    current_path: &str,
+    filters: &[(&str, &[&str])],
+) -> Option<PathBuf> {
+    let mut dlg = rfd::FileDialog::new().set_title(title);
+    let p = Path::new(current_path.trim());
+    if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+        dlg = dlg.set_directory(dir);
+    }
+    if let Some(fname) = p.file_name().and_then(|s| s.to_str()).filter(|s| !s.is_empty()) {
+        dlg = dlg.set_file_name(fname);
+    }
+    for (name, exts) in filters {
+        dlg = dlg.add_filter(*name, exts);
+    }
+    dlg = dlg.add_filter("All Files", &["*"]);
+    dlg.save_file()
+}
+
+fn draw_save_destination_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    path_str: &mut String,
+    dialog_title: &str,
+    filters: &[(&str, &[&str])],
+) {
     ui.label(label);
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(path_str).desired_width(310.0));
+        ui.add(egui::TextEdit::singleline(path_str).desired_width(305.0));
         if ui
-            .button("Browse Folder...")
-            .on_hover_text("Choose destination folder")
+            .button("Browse...")
+            .on_hover_text("Open native file explorer")
             .clicked()
+            && let Some(picked) = native_save_file(dialog_title, path_str, filters)
         {
-            browse_clicked = true;
+            *path_str = picked.display().to_string();
         }
     });
     ui.horizontal_wrapped(|ui| {
@@ -1094,7 +1170,6 @@ fn draw_save_destination_picker(ui: &mut egui::Ui, label: &str, path_str: &mut S
             }
         }
     });
-    browse_clicked
 }
 
 fn format_short_size(bytes: u64) -> String {

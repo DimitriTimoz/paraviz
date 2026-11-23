@@ -162,10 +162,10 @@ impl ParaVizApp {
                     .hint_text("array name..."),
             );
             if ui.small_button("Export CSV").clicked() {
-                let (domain_slug, domain_label) = match self.spreadsheet_target {
-                    SpreadsheetTarget::Points => ("points", "Point Data"),
-                    SpreadsheetTarget::Cells => ("cells", "Cell Data"),
-                    SpreadsheetTarget::Field => ("field", "Field Data"),
+                let domain_slug = match self.spreadsheet_target {
+                    SpreadsheetTarget::Points => "points",
+                    SpreadsheetTarget::Cells => "cells",
+                    SpreadsheetTarget::Field => "field",
                 };
                 let stem: String = node_name
                     .chars()
@@ -184,12 +184,13 @@ impl ParaVizApp {
                     format!("{stem}_{domain_slug}.csv")
                 };
                 let default_path = self.default_export_path(&fname);
-                self.modal = Some(AppModal::ExportSpreadsheetCsv(ExportSpreadsheetModalState {
-                    path: default_path,
-                    domain_label: domain_label.to_string(),
-                    col_filter: self.spreadsheet_filter.clone(),
-                    row_count: total_rows,
-                }));
+                if let Some(p) = native_save_file(
+                    "Export Spreadsheet CSV",
+                    &default_path,
+                    &[("CSV Table", &["csv"])],
+                ) {
+                    self.execute_modal_action(ModalAction::ExportSpreadsheetCsv(p));
+                }
             }
             if let Some(hl) = &self.picked_highlight
                 && hl.node_id == sel_id

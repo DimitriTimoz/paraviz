@@ -15,9 +15,11 @@ impl ParaVizApp {
             ui.separator();
 
             ui.menu_button("File", |ui| {
-                if ui.button("File Browser...").clicked() {
-                    self.modal = Some(AppModal::FileBrowser(FileBrowserState::new()));
+                if ui.button("Open File...").clicked() {
                     ui.close();
+                    if let Some(p) = native_pick_scientific_file(self.last_export_dir.as_deref()) {
+                        self.open_picked_scientific_file(p);
+                    }
                 }
                 if ui.button("Open File by Path...").clicked() {
                     self.modal = Some(AppModal::OpenFile(String::new()));
@@ -49,12 +51,20 @@ impl ParaVizApp {
                 ui.separator();
                 if ui.button("Save State JSON...").clicked() {
                     let path = self.default_export_path("paraviz_state.json");
-                    self.modal = Some(AppModal::SaveState(path));
                     ui.close();
+                    if let Some(p) = native_save_file(
+                        "Save Pipeline State",
+                        &path,
+                        &[("ParaViz State JSON", &["json"])],
+                    ) {
+                        self.execute_modal_action(ModalAction::SaveState(p));
+                    }
                 }
                 if ui.button("Load State JSON...").clicked() {
-                    self.modal = Some(AppModal::LoadState("paraviz_state.json".into()));
                     ui.close();
+                    if let Some(p) = native_pick_state_file(self.last_export_dir.as_deref()) {
+                        self.load_path(&p);
+                    }
                 }
                 ui.separator();
                 let has_sel = self.selected_node.is_some();
@@ -63,8 +73,25 @@ impl ParaVizApp {
                     .clicked()
                 {
                     let path = self.default_export_path("export.vtp");
-                    self.modal = Some(AppModal::ExportDataset(path));
                     ui.close();
+                    if let Some(p) = native_save_file(
+                        "Export Active Dataset",
+                        &path,
+                        &[
+                            ("VTK PolyData", &["vtp"]),
+                            ("VTK Unstructured", &["vtu"]),
+                            ("VTK ImageData", &["vti"]),
+                            ("Legacy VTK", &["vtk"]),
+                            ("STL Mesh", &["stl"]),
+                            ("Wavefront OBJ", &["obj"]),
+                            ("PLY Mesh", &["ply"]),
+                            ("CSV Table", &["csv"]),
+                            ("glTF Binary", &["glb"]),
+                            ("Interactive HTML", &["html"]),
+                        ],
+                    ) {
+                        self.execute_modal_action(ModalAction::ExportDataset(p));
+                    }
                 }
                 if ui.button("Save Screenshot PNG...").clicked() {
                     let (w, h) = self.viewport_tex_size;
@@ -427,8 +454,10 @@ impl ParaVizApp {
                 }
                 ui.toggle_value(&mut self.zen_mode, "Zen")
                     .on_hover_text("Hide side & bottom panels");
-                if ui.small_button("Browse").on_hover_text("Open File Browser").clicked() {
-                    self.modal = Some(AppModal::FileBrowser(FileBrowserState::new()));
+                if ui.small_button("Open...").on_hover_text("Open File (Native Explorer)").clicked()
+                    && let Some(p) = native_pick_scientific_file(self.last_export_dir.as_deref())
+                {
+                    self.open_picked_scientific_file(p);
                 }
             });
         });

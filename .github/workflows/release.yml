@@ -165,6 +165,19 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp target/universal/paraviz "$APP/Contents/MacOS/paraviz"
           cp assets/icon.svg "$APP/Contents/Resources/icon.svg"
+          if [ -f assets/icon.png ]; then
+            ICONSET="target/universal/paraviz.iconset"
+            rm -rf "$ICONSET"
+            mkdir -p "$ICONSET"
+            for sz in 16 32 64 128 256; do
+              sips -z $sz $sz assets/icon.png --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+            done
+            cp "$ICONSET/icon_32x32.png" "$ICONSET/icon_16x16@2x.png"
+            cp "$ICONSET/icon_64x64.png" "$ICONSET/icon_32x32@2x.png"
+            cp "$ICONSET/icon_256x256.png" "$ICONSET/icon_128x128@2x.png"
+            cp assets/icon.png "$ICONSET/icon_128x128@2x.png"
+            iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/paraviz.icns" || true
+          fi
           printf 'APPL????' > "$APP/Contents/PkgInfo"
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -177,6 +190,7 @@ jobs:
             <key>CFBundleVersion</key><string>${{ steps.meta.outputs.tag }}</string>
             <key>CFBundleShortVersionString</key><string>${{ steps.meta.outputs.tag }}</string>
             <key>CFBundleExecutable</key><string>paraviz</string>
+            <key>CFBundleIconFile</key><string>paraviz</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>

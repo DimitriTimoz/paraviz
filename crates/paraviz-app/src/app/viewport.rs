@@ -460,8 +460,11 @@ impl ParaVizApp {
                             if ui.button("Open Demo Gallery").clicked() {
                                 self.modal = Some(AppModal::DemoGallery);
                             }
-                            if ui.button("Browse Files").clicked() {
-                                self.modal = Some(AppModal::FileBrowser(FileBrowserState::new()));
+                            if ui.button("Open File...").clicked()
+                                && let Some(p) =
+                                    native_pick_scientific_file(self.last_export_dir.as_deref())
+                            {
+                                self.open_picked_scientific_file(p);
                             }
                         });
                     });
