@@ -54,13 +54,28 @@ EOF
 chmod +x "${APPDIR}/AppRun"
 
 TOOL_ARCH="${ARCH}"
+APPIMAGETOOL_VERSION="1.9.0"
+case "${TOOL_ARCH}" in
+  x86_64)
+    APPIMAGETOOL_SHA256="e8c1169c4af66c3184d7ee110713d4be04befe671fa358e2c1591ee840553b03"
+    ;;
+  aarch64)
+    APPIMAGETOOL_SHA256="d6a061996de690434996c2a523eafedd0a23780aaf02d69ce364537e71607e94"
+    ;;
+  *)
+    echo "Unsupported architecture for appimagetool verification: ${TOOL_ARCH}" >&2
+    exit 1
+    ;;
+esac
+
 APPIMAGETOOL="${APPIMAGETOOL:-$(command -v appimagetool || true)}"
 if [ -z "${APPIMAGETOOL}" ]; then
   APPIMAGETOOL="${ROOT_DIR}/target/appimagetool-${TOOL_ARCH}.AppImage"
   if [ ! -x "${APPIMAGETOOL}" ]; then
     curl -fSL \
-      "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${TOOL_ARCH}.AppImage" \
+      "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${TOOL_ARCH}.AppImage" \
       -o "${APPIMAGETOOL}"
+    echo "${APPIMAGETOOL_SHA256}  ${APPIMAGETOOL}" | sha256sum -c -
     chmod +x "${APPIMAGETOOL}"
   fi
 fi
