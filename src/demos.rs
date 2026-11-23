@@ -143,8 +143,8 @@ impl DemoPreset {
                         vector_field: Some("Velocity".into()),
                         scalar_field: Some("Speed".into()),
                         scale_mode: ScaleMode::VectorMagnitude,
-                        scale_factor: 0.12,
-                        max_points: 180,
+                        scale_factor: 0.42,
+                        max_points: 120,
                     }),
                 )?;
                 pv.show(glyphs)
