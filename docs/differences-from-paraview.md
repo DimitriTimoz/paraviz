@@ -51,7 +51,7 @@ ParaViz covers core single-workstation visualization, filtering, volume renderin
 
 - **Distributed MPI / Client-Server (`pvserver`)**: ParaViz runs on a single workstation/server (parallelized across all CPU cores with `rayon` and on the GPU via `wgpu`), without MPI domain decomposition or remote `pvserver` streaming.
 - **CPU/GPU Path Tracing**: No OSPRay or OptiX photorealistic path tracing; rendering uses rasterization + screen-space EDL + raymarched volumes in WebGPU.
-- **Specialized Formats**: HDF5 / VTKHDF, CGNS, Exodus II, Silo, Plot3D, and STEP/IGES CAD B-Rep readers are not yet implemented (see [File Formats & I/O](file-formats.md) for the 16+ supported formats).
+- **Specialized Formats**: Standalone VTKHDF / raw `.h5` (outside XDMF), CGNS, Exodus II, Silo, Plot3D, and STEP/IGES CAD B-Rep readers are not yet implemented (see [File Formats & I/O](file-formats.md) for the 16+ supported formats, including XDMF+HDF5).
 - **In-GUI Python Programmable Filter**: The GUI does not embed a Python interpreter; custom scripted pipelines are written in Rust (`Source`/`Filter` traits) or via the `paraviz-py` PyO3 crate, while inline math expressions use `CalculatorFilter`.
 - **Viewport Annotations**: Headless exports support a single active `Scalar Color Bar` overlay (`--scalar-bar` / `SceneSettings::show_scalar_bar`), rather than multiple independently draggable text boxes and multi-bar viewport layouts.
 - **In-Situ Co-Processing**: No Catalyst / Ascent live simulation coupling yet.

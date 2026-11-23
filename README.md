@@ -11,10 +11,15 @@
 <p align="center">
   <a href="https://github.com/DimitriTimoz/paraviz/actions/workflows/ci.yml"><img src="https://github.com/DimitriTimoz/paraviz/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/DimitriTimoz/paraviz/releases"><img src="https://img.shields.io/github/v/release/DimitriTimoz/paraviz?include_prereleases" alt="Release"></a>
+  <a href="https://dimitritimoz.github.io/paraviz/"><img src="https://img.shields.io/badge/Web_App-Live_Demo-0ea5e9.svg" alt="Live Web Demo"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
 </p>
 
-Explore 3D meshes, CFD flows, finite-element grids, and medical/volumetric scans in an interactive desktop app, automate batch renders from the command line, or embed pipelines directly in Rust and Python.
+Explore 3D meshes, CFD flows, finite-element grids, and medical/volumetric scans in an interactive desktop app (or try the [**Live Web App**](https://dimitritimoz.github.io/paraviz/) in your browser), automate batch renders from the command line, or embed pipelines directly in Rust and Python.
+
+<p align="center">
+  <img src="assets/showcase.png" width="760" alt="ParaViz WebGPU Render">
+</p>
 
 ---
 
@@ -50,7 +55,7 @@ cargo run --release -p paraviz-app -- path/to/mesh.vtu
 - **Broad Format Support**:
   - **VTK & 3D Meshes**: `.vtk`, `.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, partitioned `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.stl`, `.obj`, `.ply`, `.csv`/`.tsv`
   - **Medical & Volumetric**: NIfTI-1 (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), Raw binary volumes (`.raw`)
-  - **CFD / CAE**: EnSight Gold (`.case`), OpenFOAM (`polyMesh`), XDMF (`.xdmf`, `.xmf`)
+  - **CFD / CAE**: EnSight Gold (`.case`), OpenFOAM (`polyMesh`), XDMF (`.xdmf`, `.xmf` with XML, Binary, and pure-Rust HDF5 `Format="HDF"` + temporal collections)
 - **Publication & Web Exports**:
   - High-res **PNG** screenshots (up to 4K, with optional **transparent background** & **Scalar Color Bar**)
   - Animated **GIF** exports (360° turntables & time series)
@@ -65,7 +70,7 @@ cargo run --release -p paraviz-app -- path/to/mesh.vtu
 - **Instant Live Editing**: `Auto-Apply` is enabled by default in Properties (with explicit Apply/Discard still available for heavy datasets), plus native Copy/Paste of filters and chains.
 - **Built-In Portable Sharing**: Export animated `.gif` turntables, `.glb` meshes, and standalone WebGL2 `.html` viewers directly without plugins.
 - **Lightweight Single Binary**: Fast startup with zero Qt/VTK installation overhead, plus live **Rust Trace** export alongside JSON session files.
-- **Current Scope**: Focused on single-workstation visualization and batch CLI rendering (no distributed MPI `pvserver`, OSPRay path-tracing, or HDF5/CGNS/CAD B-Rep readers yet).
+- **Current Scope**: Early `v0.2.x` release focused on single-workstation visualization and batch CLI rendering — 100% pure Rust + WebGPU with zero VTK C++ dependency (distributed MPI `pvserver`, OSPRay path-tracing, standalone VTKHDF/`.h5` without XDMF, CGNS, and CAD B-Rep readers are not yet in scope).
 
 See the full side-by-side comparison in [**Differences from Classic ParaView**](docs/differences-from-paraview.md).
 

@@ -22,7 +22,7 @@
 | **NRRD** | `.nrrd`, `.nhdr` | Yes | — | `read_nrrd` (`raw` and `gzip` encoding, `ImageData`) |
 | **MetaImage** | `.mhd`, `.mha` | Yes | Yes (`.mha`) | `read_metaimage`, `write_metaimage` (`ImageData`) |
 | **EnSight Gold** | `.case` | Yes | — | `read_ensight_case` (ASCII geometry + node/element variables -> `UnstructuredGrid` / `MultiBlockDataSet`) |
-| **XDMF** | `.xdmf`, `.xmf` | Yes | — | `read_xdmf` (XML and Binary `DataItem` payloads -> `UnstructuredGrid`) |
+| **XDMF** | `.xdmf`, `.xmf` | Yes | — | `read_xdmf`, `read_xdmf_at_time` (XML, Binary, pure-Rust HDF5 `Format="HDF"`, `Mixed`/Structured/Rectilinear/`ImageData`, `MultiBlock`, temporal collections) |
 | **OpenFOAM** | `.foam`, `controlDict`, case dir | Yes | — | `read_openfoam` (reads `constant/polyMesh` + latest time fields -> `PolyData`) |
 
 ---
