@@ -5,5 +5,6 @@ dist/
 **/*.DS_Store
 *.png
 !assets/*.png
+!crates/paraviz-app/assets/*.png
 *.gif
 *.glb

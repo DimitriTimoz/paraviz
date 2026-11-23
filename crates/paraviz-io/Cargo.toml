@@ -3,7 +3,14 @@ name = "paraviz-io"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Scientific file format readers and writers (Legacy VTK, VTK XML .vtp/.vti/.vtu/.vtr/.vts/.vtm/.pvd, STL, OBJ, PLY, CSV) for ParaViz"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/paraviz-io"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Scientific file readers and writers (VTK, VTKHDF, CGNS, Exodus II, XDMF, EnSight, OpenFOAM, NIfTI, NRRD, MetaImage, STL, OBJ, PLY, CSV, GLB, GIF, HTML) for ParaViz"
 
 [dependencies]
 paraviz-core.workspace = true

@@ -3,10 +3,17 @@ name = "paraviz-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/paraviz-app"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Interactive ParaView-style WebGPU desktop application and headless CLI renderer for ParaViz"
 
 [dependencies]
-paraviz = { path = "../.." }
+paraviz = { path = "../..", version = "0.2.5" }
 paraviz-core.workspace = true
 paraviz-sources.workspace = true
 paraviz-filters.workspace = true

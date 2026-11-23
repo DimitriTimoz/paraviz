@@ -3,6 +3,13 @@ name = "paraviz-sources"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/paraviz-sources"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Procedural geometric and analytical scientific dataset sources for ParaViz"
 
 [dependencies]

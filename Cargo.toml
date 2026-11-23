@@ -17,13 +17,18 @@ license = "MIT OR Apache-2.0"
 authors = ["ParaViz Contributors"]
 description = "ParaView rewritten in Rust using WebGPU (wgpu) for scientific visualization"
 repository = "https://github.com/DimitriTimoz/paraviz"
+homepage = "https://dimitritimoz.github.io/paraviz/"
+documentation = "https://docs.rs/paraviz"
+keywords = ["visualization", "paraview", "vtk", "wgpu", "scientific"]
+categories = ["visualization", "science", "graphics", "rendering"]
+readme = "README.md"
 
 [workspace.dependencies]
-paraviz-core = { path = "crates/paraviz-core" }
-paraviz-sources = { path = "crates/paraviz-sources" }
-paraviz-filters = { path = "crates/paraviz-filters" }
-paraviz-io = { path = "crates/paraviz-io" }
-paraviz-render = { path = "crates/paraviz-render" }
+paraviz-core = { path = "crates/paraviz-core", version = "0.2.5" }
+paraviz-sources = { path = "crates/paraviz-sources", version = "0.2.5" }
+paraviz-filters = { path = "crates/paraviz-filters", version = "0.2.5" }
+paraviz-io = { path = "crates/paraviz-io", version = "0.2.5" }
+paraviz-render = { path = "crates/paraviz-render", version = "0.2.5" }
 
 glam = { version = "0.34", features = ["serde"] }
 bytemuck = { version = "1.25", features = ["derive"] }
@@ -53,8 +58,27 @@ name = "paraviz"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+exclude = [
+    ".github/",
+    "assets/",
+    "crates/",
+    "docs/",
+    "packaging/",
+    "AGENT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "*.png",
+    "*.gif",
+    "*.glb",
+]
 
 [dependencies]
 paraviz-core.workspace = true

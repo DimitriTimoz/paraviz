@@ -3,6 +3,13 @@ name = "paraviz-filters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/paraviz-filters"
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Parallel scientific visualization filters (contour, slice, clip, threshold, streamlines, glyphs, gradients) for ParaViz"
 
 [dependencies]

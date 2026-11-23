@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn build_app_icon() -> egui::IconData {
-    let icon_bytes: &[u8] = include_bytes!("../../../assets/icon.png");
+    let icon_bytes: &[u8] = include_bytes!("../assets/icon.png");
     let decoder = png::Decoder::new(std::io::Cursor::new(icon_bytes));
     let mut reader = decoder.read_info().expect("valid bundled icon.png");
     let mut buf = vec![0u8; reader.output_buffer_size().unwrap_or(256 * 256 * 4)];
