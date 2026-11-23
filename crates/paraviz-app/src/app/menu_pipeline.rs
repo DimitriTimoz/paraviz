@@ -189,154 +189,109 @@ impl ParaVizApp {
                     .is_some_and(|ds| ds.as_image_data().is_some());
                 let has_visible = self.session.nodes().iter().any(|n| n.style.visible);
 
-                let entries: Vec<(&'static str, FilterConfig)> = vec![
-                    (
-                        "Extract Surface",
-                        FilterConfig::ExtractSurface(ExtractSurface::new()),
-                    ),
-                    ("Contour", FilterConfig::Contour(ContourFilter::default())),
-                    ("Slice", FilterConfig::Slice(SliceFilter::default())),
-                    ("Clip", FilterConfig::Clip(ClipFilter::default())),
-                    (
-                        "Threshold",
-                        FilterConfig::Threshold(ThresholdFilter::default()),
-                    ),
-                    (
-                        "Stream Tracer",
-                        FilterConfig::StreamTracer(StreamTracerFilter::default()),
-                    ),
-                    ("Tube", FilterConfig::Tube(TubeFilter::default())),
-                    ("Glyph", FilterConfig::Glyph(GlyphFilter::default())),
-                    (
-                        "Warp By Vector",
-                        FilterConfig::WarpByVector(WarpByVectorFilter::default()),
-                    ),
-                    (
-                        "Warp By Scalar",
-                        FilterConfig::WarpByScalar(WarpByScalarFilter::default()),
-                    ),
-                    (
-                        "Gradient / Vorticity",
-                        FilterConfig::Gradient(GradientFilter::default()),
-                    ),
-                    (
-                        "Calculator",
-                        FilterConfig::Calculator(CalculatorFilter::default()),
-                    ),
-                    ("Smooth", FilterConfig::Smooth(SmoothFilter::default())),
-                    (
-                        "Transform",
-                        FilterConfig::Transform(TransformFilter::default()),
-                    ),
-                    (
-                        "Cell Data to Point Data",
-                        FilterConfig::CellDataToPointData(CellDataToPointDataFilter::default()),
-                    ),
-                    (
-                        "Point Data to Cell Data",
-                        FilterConfig::PointDataToCellData(PointDataToCellDataFilter::default()),
-                    ),
-                    (
-                        "Probe Over Line",
-                        FilterConfig::ProbeOverLine(ProbeOverLineFilter::default()),
-                    ),
-                    (
-                        "Feature Edges",
-                        FilterConfig::FeatureEdges(FeatureEdgesFilter::default()),
-                    ),
-                    (
-                        "Extract All Edges",
-                        FilterConfig::ExtractEdges(ExtractEdgesFilter),
-                    ),
-                    (
-                        "Connectivity",
-                        FilterConfig::Connectivity(ConnectivityFilter::default()),
-                    ),
-                    ("Shrink", FilterConfig::Shrink(ShrinkFilter::default())),
-                    (
-                        "Cell Centers",
-                        FilterConfig::CellCenters(CellCentersFilter::default()),
-                    ),
-                    ("Reflect", FilterConfig::Reflect(ReflectFilter::default())),
-                    (
-                        "Generate Normals",
-                        FilterConfig::GenerateNormals(GenerateNormalsFilter::default()),
-                    ),
-                    (
-                        "Triangulate",
-                        FilterConfig::Triangulate(TriangulateFilter::default()),
-                    ),
-                    (
-                        "Clean PolyData",
-                        FilterConfig::CleanPolyData(CleanPolyDataFilter::default()),
-                    ),
-                    (
-                        "Elevation",
-                        FilterConfig::Elevation(ElevationFilter::default()),
-                    ),
-                    (
-                        "Decimate (QEM)",
-                        FilterConfig::Decimate(DecimateFilter::default()),
-                    ),
-                    (
-                        "Delaunay 2D",
-                        FilterConfig::Delaunay2D(Delaunay2DFilter::default()),
-                    ),
-                    (
-                        "Delaunay 3D",
-                        FilterConfig::Delaunay3D(Delaunay3DFilter::default()),
-                    ),
-                    (
-                        "IsoVolume",
-                        FilterConfig::IsoVolume(IsoVolumeFilter::default()),
-                    ),
-                    (
-                        "Resample To Image",
-                        FilterConfig::ResampleToImage(ResampleToImageFilter::default()),
-                    ),
-                    (
-                        "Integrate Variables",
-                        FilterConfig::IntegrateVariables(IntegrateVariablesFilter::default()),
-                    ),
-                    (
-                        "Extract Block",
-                        FilterConfig::ExtractBlock(ExtractBlockFilter::default()),
-                    ),
-                    (
-                        "Temporal Statistics",
-                        FilterConfig::TemporalStatistics(TemporalStatisticsFilter::default()),
-                    ),
-                    (
-                        "Add TimeSteps",
-                        FilterConfig::AddTimeSteps(AddTimeStepsFilter::default()),
-                    ),
-                    (
-                        "Append Datasets",
-                        FilterConfig::AppendDatasets(AppendDatasetsFilter::default()),
-                    ),
-                ];
-                for (name, cfg) in entries {
-                    if ui.add_enabled(enabled, egui::Button::new(name)).clicked() {
-                        self.add_filter_to_selected(cfg);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter_menu_search)
+                            .hint_text("Search 39 filters...")
+                            .desired_width(170.0),
+                    );
+                    if !self.filter_menu_search.is_empty() && ui.small_button("×").clicked() {
+                        self.filter_menu_search.clear();
+                    }
+                });
+                ui.separator();
+
+                let needle = self.filter_menu_search.trim().to_ascii_lowercase();
+                if !needle.is_empty() {
+                    let matches: Vec<FilterMenuEntry> = filter_menu_catalog()
+                        .into_iter()
+                        .filter(|e| {
+                            e.label.to_ascii_lowercase().contains(&needle)
+                                || e.category.to_ascii_lowercase().contains(&needle)
+                        })
+                        .collect();
+                    if matches.is_empty() {
+                        ui.weak("No matching filters.");
+                    } else if let Some(act) = draw_filter_entries_scroll(
+                        ui,
+                        "filters_search_scroll",
+                        340.0,
+                        matches,
+                        enabled,
+                        is_imagedata,
+                        has_visible,
+                        true,
+                    ) {
+                        self.dispatch_filter_menu_action(act);
+                        self.filter_menu_search.clear();
                         ui.close();
                     }
+                    return;
                 }
-                ui.separator();
-                if ui
-                    .add_enabled(
+
+                let mut chosen: Option<FilterMenuAction> = None;
+
+                ui.menu_button("Common", |ui| {
+                    let common_entries: Vec<FilterMenuEntry> = filter_menu_catalog()
+                        .into_iter()
+                        .filter(|e| e.common)
+                        .collect();
+                    if let Some(act) = draw_filter_entries_scroll(
+                        ui,
+                        "filters_common_scroll",
+                        380.0,
+                        common_entries,
+                        enabled,
                         is_imagedata,
-                        egui::Button::new("GPU Compute Contour (WebGPU)..."),
-                    )
-                    .clicked()
-                {
-                    self.open_gpu_contour_modal();
-                    ui.close();
+                        has_visible,
+                        false,
+                    ) {
+                        chosen = Some(act);
+                    }
+                });
+                ui.separator();
+
+                for &cat in FILTER_CATEGORIES {
+                    ui.menu_button(cat, |ui| {
+                        let cat_entries: Vec<FilterMenuEntry> = filter_menu_catalog()
+                            .into_iter()
+                            .filter(|e| e.category == cat)
+                            .collect();
+                        if let Some(act) = draw_filter_entries_scroll(
+                            ui,
+                            ("filter_cat_scroll", cat),
+                            380.0,
+                            cat_entries,
+                            enabled,
+                            is_imagedata,
+                            has_visible,
+                            false,
+                        ) {
+                            chosen = Some(act);
+                        }
+                    });
                 }
-                if ui
-                    .add_enabled(has_visible, egui::Button::new("Append Visible Datasets"))
-                    .clicked()
-                {
-                    self.append_visible_datasets();
+
+                ui.separator();
+                ui.menu_button("All Alphabetical (A-Z)", |ui| {
+                    let mut all = filter_menu_catalog();
+                    all.sort_by(|a, b| a.label.cmp(b.label));
+                    if let Some(act) = draw_filter_entries_scroll(
+                        ui,
+                        "filters_az_scroll",
+                        380.0,
+                        all,
+                        enabled,
+                        is_imagedata,
+                        has_visible,
+                        true,
+                    ) {
+                        chosen = Some(act);
+                    }
+                });
+
+                if let Some(act) = chosen {
+                    self.dispatch_filter_menu_action(act);
                     ui.close();
                 }
             });
@@ -1087,5 +1042,340 @@ impl ParaVizApp {
         }
         visit(self.session.nodes(), None, 0, &mut out);
         out
+    }
+
+    fn dispatch_filter_menu_action(&mut self, action: FilterMenuAction) {
+        match action {
+            FilterMenuAction::Config(cfg) => self.add_filter_to_selected(cfg),
+            FilterMenuAction::GpuContour => self.open_gpu_contour_modal(),
+            FilterMenuAction::AppendVisible => self.append_visible_datasets(),
+        }
+    }
+}
+
+const FILTER_CATEGORIES: &[&str] = &[
+    "Extraction & Slicing",
+    "Flow, Vectors & Warp",
+    "Mesh & Topology",
+    "Fields, Probing & Resampling",
+    "Temporal",
+];
+
+enum FilterMenuAction {
+    Config(FilterConfig),
+    GpuContour,
+    AppendVisible,
+}
+
+struct FilterMenuEntry {
+    label: &'static str,
+    category: &'static str,
+    common: bool,
+    action: FilterMenuAction,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_filter_entries_scroll(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    max_height: f32,
+    entries: Vec<FilterMenuEntry>,
+    enabled: bool,
+    is_imagedata: bool,
+    has_visible: bool,
+    show_category_hint: bool,
+) -> Option<FilterMenuAction> {
+    let mut chosen = None;
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(max_height)
+        .show(ui, |ui| {
+            for entry in entries {
+                let is_enabled = match entry.action {
+                    FilterMenuAction::Config(_) => enabled,
+                    FilterMenuAction::GpuContour => is_imagedata,
+                    FilterMenuAction::AppendVisible => has_visible,
+                };
+                let mut resp = ui.add_enabled(is_enabled, egui::Button::new(entry.label));
+                if show_category_hint {
+                    resp = resp.on_hover_text(entry.category);
+                }
+                if resp.clicked() {
+                    chosen = Some(entry.action);
+                }
+            }
+        });
+    chosen
+}
+
+fn filter_menu_catalog() -> Vec<FilterMenuEntry> {
+    let f = |label, category, common, cfg: FilterConfig| FilterMenuEntry {
+        label,
+        category,
+        common,
+        action: FilterMenuAction::Config(cfg),
+    };
+    vec![
+        // Extraction & Slicing
+        f(
+            "Extract Surface",
+            "Extraction & Slicing",
+            true,
+            FilterConfig::ExtractSurface(ExtractSurface::new()),
+        ),
+        f(
+            "Contour",
+            "Extraction & Slicing",
+            true,
+            FilterConfig::Contour(ContourFilter::default()),
+        ),
+        FilterMenuEntry {
+            label: "GPU Compute Contour (WebGPU)...",
+            category: "Extraction & Slicing",
+            common: true,
+            action: FilterMenuAction::GpuContour,
+        },
+        f(
+            "Slice",
+            "Extraction & Slicing",
+            true,
+            FilterConfig::Slice(SliceFilter::default()),
+        ),
+        f(
+            "Clip",
+            "Extraction & Slicing",
+            true,
+            FilterConfig::Clip(ClipFilter::default()),
+        ),
+        f(
+            "Threshold",
+            "Extraction & Slicing",
+            true,
+            FilterConfig::Threshold(ThresholdFilter::default()),
+        ),
+        f(
+            "IsoVolume",
+            "Extraction & Slicing",
+            false,
+            FilterConfig::IsoVolume(IsoVolumeFilter::default()),
+        ),
+        f(
+            "Extract Block",
+            "Extraction & Slicing",
+            false,
+            FilterConfig::ExtractBlock(ExtractBlockFilter::default()),
+        ),
+        // Flow, Vectors & Warp
+        f(
+            "Stream Tracer",
+            "Flow, Vectors & Warp",
+            true,
+            FilterConfig::StreamTracer(StreamTracerFilter::default()),
+        ),
+        f(
+            "Tube",
+            "Flow, Vectors & Warp",
+            true,
+            FilterConfig::Tube(TubeFilter::default()),
+        ),
+        f(
+            "Glyph",
+            "Flow, Vectors & Warp",
+            true,
+            FilterConfig::Glyph(GlyphFilter::default()),
+        ),
+        f(
+            "Warp By Vector",
+            "Flow, Vectors & Warp",
+            false,
+            FilterConfig::WarpByVector(WarpByVectorFilter::default()),
+        ),
+        f(
+            "Warp By Scalar",
+            "Flow, Vectors & Warp",
+            false,
+            FilterConfig::WarpByScalar(WarpByScalarFilter::default()),
+        ),
+        f(
+            "Gradient / Vorticity",
+            "Flow, Vectors & Warp",
+            true,
+            FilterConfig::Gradient(GradientFilter::default()),
+        ),
+        // Mesh & Topology
+        f(
+            "Smooth",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Smooth(SmoothFilter::default()),
+        ),
+        f(
+            "Decimate (QEM)",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Decimate(DecimateFilter::default()),
+        ),
+        f(
+            "Delaunay 2D",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Delaunay2D(Delaunay2DFilter::default()),
+        ),
+        f(
+            "Delaunay 3D",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Delaunay3D(Delaunay3DFilter::default()),
+        ),
+        f(
+            "Triangulate",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Triangulate(TriangulateFilter::default()),
+        ),
+        f(
+            "Clean PolyData",
+            "Mesh & Topology",
+            false,
+            FilterConfig::CleanPolyData(CleanPolyDataFilter::default()),
+        ),
+        f(
+            "Generate Normals",
+            "Mesh & Topology",
+            false,
+            FilterConfig::GenerateNormals(GenerateNormalsFilter::default()),
+        ),
+        f(
+            "Feature Edges",
+            "Mesh & Topology",
+            false,
+            FilterConfig::FeatureEdges(FeatureEdgesFilter::default()),
+        ),
+        f(
+            "Extract All Edges",
+            "Mesh & Topology",
+            false,
+            FilterConfig::ExtractEdges(ExtractEdgesFilter),
+        ),
+        f(
+            "Connectivity",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Connectivity(ConnectivityFilter::default()),
+        ),
+        f(
+            "Shrink",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Shrink(ShrinkFilter::default()),
+        ),
+        f(
+            "Cell Centers",
+            "Mesh & Topology",
+            false,
+            FilterConfig::CellCenters(CellCentersFilter::default()),
+        ),
+        f(
+            "Reflect",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Reflect(ReflectFilter::default()),
+        ),
+        f(
+            "Transform",
+            "Mesh & Topology",
+            false,
+            FilterConfig::Transform(TransformFilter::default()),
+        ),
+        // Fields, Probing & Resampling
+        f(
+            "Calculator",
+            "Fields, Probing & Resampling",
+            true,
+            FilterConfig::Calculator(CalculatorFilter::default()),
+        ),
+        f(
+            "Elevation",
+            "Fields, Probing & Resampling",
+            false,
+            FilterConfig::Elevation(ElevationFilter::default()),
+        ),
+        f(
+            "Cell Data to Point Data",
+            "Fields, Probing & Resampling",
+            false,
+            FilterConfig::CellDataToPointData(CellDataToPointDataFilter::default()),
+        ),
+        f(
+            "Point Data to Cell Data",
+            "Fields, Probing & Resampling",
+            false,
+            FilterConfig::PointDataToCellData(PointDataToCellDataFilter::default()),
+        ),
+        f(
+            "Probe Over Line",
+            "Fields, Probing & Resampling",
+            true,
+            FilterConfig::ProbeOverLine(ProbeOverLineFilter::default()),
+        ),
+        f(
+            "Resample To Image",
+            "Fields, Probing & Resampling",
+            false,
+            FilterConfig::ResampleToImage(ResampleToImageFilter::default()),
+        ),
+        f(
+            "Integrate Variables",
+            "Fields, Probing & Resampling",
+            false,
+            FilterConfig::IntegrateVariables(IntegrateVariablesFilter::default()),
+        ),
+        f(
+            "Append Datasets",
+            "Fields, Probing & Resampling",
+            false,
+            FilterConfig::AppendDatasets(AppendDatasetsFilter::default()),
+        ),
+        FilterMenuEntry {
+            label: "Append Visible Datasets",
+            category: "Fields, Probing & Resampling",
+            common: false,
+            action: FilterMenuAction::AppendVisible,
+        },
+        // Temporal
+        f(
+            "Temporal Statistics",
+            "Temporal",
+            false,
+            FilterConfig::TemporalStatistics(TemporalStatisticsFilter::default()),
+        ),
+        f(
+            "Add TimeSteps",
+            "Temporal",
+            false,
+            FilterConfig::AddTimeSteps(AddTimeStepsFilter::default()),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn filter_menu_catalog_covers_all_filters_with_valid_categories() {
+        let entries = filter_menu_catalog();
+        assert_eq!(entries.len(), 39);
+        let mut seen = HashSet::new();
+        for e in &entries {
+            assert!(
+                FILTER_CATEGORIES.contains(&e.category),
+                "Unknown category '{}' for '{}'",
+                e.category,
+                e.label
+            );
+            assert!(seen.insert(e.label), "Duplicate filter label '{}'", e.label);
+        }
     }
 }
