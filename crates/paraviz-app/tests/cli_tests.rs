@@ -26,6 +26,10 @@ fn cli_help_and_version() {
     assert!(stdout.contains("paraviz render"));
     assert!(stdout.contains("paraviz info"));
     assert!(stdout.contains("paraviz convert"));
+    assert!(stdout.contains("--time-annotation"));
+    assert!(stdout.contains(".vtkhdf"));
+    assert!(stdout.contains(".cgns"));
+    assert!(stdout.contains(".exo"));
 
     let ver = Command::new(paraviz_bin())
         .arg("--version")
@@ -359,4 +363,41 @@ fn cli_transparent_scalar_bar_gif_and_html_convert() {
     let _ = std::fs::remove_file(&vtp_path);
     let _ = std::fs::remove_file(&gif_path);
     let _ = std::fs::remove_file(&html_path);
+}
+
+#[test]
+fn cli_render_time_annotation_flag() {
+    let vtp_path = temp_file("vtp");
+    let png_path = temp_file("png");
+
+    let sphere = paraviz::sources::SphereSource::default().build();
+    paraviz::io::write_dataset(&vtp_path, &paraviz::core::DataSet::PolyData(sphere))
+        .expect("write vtp");
+
+    let render = Command::new(paraviz_bin())
+        .args([
+            "render",
+            vtp_path.to_str().unwrap(),
+            "-o",
+            png_path.to_str().unwrap(),
+            "--width",
+            "320",
+            "--height",
+            "240",
+            "--scalar-bar",
+            "--time-annotation",
+        ])
+        .output()
+        .expect("failed to execute paraviz render --time-annotation");
+    assert!(
+        render.status.success(),
+        "render --time-annotation failed: {}",
+        String::from_utf8_lossy(&render.stderr)
+    );
+    let png_bytes = std::fs::read(&png_path).expect("time-annotated png should exist");
+    assert!(png_bytes.len() > 100);
+    assert_eq!(&png_bytes[0..8], b"\x89PNG\r\n\x1a\n");
+
+    let _ = std::fs::remove_file(&vtp_path);
+    let _ = std::fs::remove_file(&png_path);
 }

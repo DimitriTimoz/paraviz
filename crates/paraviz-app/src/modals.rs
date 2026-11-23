@@ -7,6 +7,7 @@ pub struct FileBrowserState {
     pub current_dir: PathBuf,
     pub filter_text: String,
     pub path_input: String,
+    pub reader: paraviz::io::DatasetReader,
     pub return_to_modal: Option<Box<AppModal>>,
 }
 
@@ -18,8 +19,14 @@ impl FileBrowserState {
             current_dir,
             filter_text: String::new(),
             path_input,
+            reader: paraviz::io::DatasetReader::Auto,
             return_to_modal: None,
         }
+    }
+
+    pub fn with_reader(mut self, reader: paraviz::io::DatasetReader) -> Self {
+        self.reader = reader;
+        self
     }
 
     pub fn for_save_modal(current_path: &str, return_modal: AppModal) -> Self {
@@ -34,6 +41,7 @@ impl FileBrowserState {
             current_dir: dir,
             filter_text: String::new(),
             path_input,
+            reader: paraviz::io::DatasetReader::Auto,
             return_to_modal: Some(Box::new(return_modal)),
         }
     }
@@ -179,6 +187,14 @@ pub fn is_supported_open_file(path: &Path) -> bool {
             | "pvts"
             | "xdmf"
             | "xmf"
+            | "vtkhdf"
+            | "cgns"
+            | "exo"
+            | "e"
+            | "ex2"
+            | "h5"
+            | "hdf"
+            | "hdf5"
             | "case"
             | "nrrd"
             | "nhdr"
@@ -285,7 +301,7 @@ pub fn draw_modal(
                         if !is_save_picker {
                             ui.label(
                                 egui::RichText::new(
-                                    ".vtk .vtp .vti .vtu .pvtp .pvtu .stl .obj .ply .csv .raw .json",
+                                    ".vtk .vtp .vti .vtu .pvtp .pvtu .vtkhdf .cgns .exo .e .ex2 .stl .obj .ply .csv .raw .json",
                                 )
                                 .size(10.5)
                                 .color(pal.muted),
@@ -384,8 +400,24 @@ pub fn draw_modal(
                             if ui.button("Cancel").clicked() {
                                 cancel_to_return = true;
                             }
-                        } else if ui.button("Close").clicked() {
-                            keep_open = false;
+                        } else {
+                            ui.label("Reader:");
+                            egui::ComboBox::from_id_salt("file_browser_reader_combo")
+                                .selected_text(fb.reader.label())
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for &r in paraviz::io::DatasetReader::ALL {
+                                        ui.selectable_value(&mut fb.reader, r, r.label());
+                                    }
+                                });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        keep_open = false;
+                                    }
+                                },
+                            );
                         }
                     });
                 });
@@ -411,13 +443,13 @@ pub fn draw_modal(
                     *modal_slot = Some(*ret);
                     return ModalAction::None;
                 }
-                if is_raw_volume_ext(&path) {
+                if is_raw_volume_ext(&path) && fb.reader == paraviz::io::DatasetReader::Auto {
                     *modal_slot = Some(AppModal::RawVolume(RawVolumeModalState::with_path(
                         path.display().to_string(),
                     )));
                     return ModalAction::None;
                 }
-                return ModalAction::OpenFile(path, paraviz::io::DatasetReader::Auto);
+                return ModalAction::OpenFile(path, fb.reader);
             } else if keep_open {
                 *modal_slot = Some(modal);
             }
@@ -1047,6 +1079,7 @@ pub fn draw_modal(
                         let p = s.clone();
                         FileBrowserState::for_save_modal(&p, modal)
                     }
+                    AppModal::OpenFile { reader, .. } => FileBrowserState::new().with_reader(reader),
                     _ => FileBrowserState::new(),
                 };
                 *modal_slot = Some(AppModal::FileBrowser(fb));
@@ -1140,8 +1173,9 @@ pub fn native_pick_scientific_file(start_dir: Option<&Path>) -> Option<PathBuf> 
             "Scientific Datasets",
             &[
                 "vtp", "vtu", "vti", "vtr", "vts", "vtk", "pvtp", "pvtu", "pvti", "pvtr", "pvts",
-                "pvd", "stl", "obj", "ply", "csv", "nii", "gz", "mhd", "mha", "nrrd", "nhdr",
-                "case", "xdmf", "xmf", "raw", "bin", "vol", "foam", "json",
+                "pvd", "vtkhdf", "cgns", "exo", "e", "ex2", "h5", "hdf", "hdf5", "stl", "obj",
+                "ply", "csv", "nii", "gz", "mhd", "mha", "nrrd", "nhdr", "case", "xdmf", "xmf",
+                "raw", "bin", "vol", "foam", "json",
             ],
         )
         .add_filter("All Files", &["*"]);

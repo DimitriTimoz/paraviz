@@ -33,29 +33,15 @@ impl ParaVizApp {
         ui.separator();
 
         match self.drawer_tab {
-            DrawerTab::Spreadsheet => self.draw_spreadsheet(ui),
+            DrawerTab::Spreadsheet => {
+                ui.push_id("drawer_spreadsheet", |ui| {
+                    self.draw_spreadsheet_view(ui, false);
+                });
+            }
             DrawerTab::Chart => {
-                let Some(sel_id) = self.selected_node else {
-                    ui.weak("Select a node to view XY plots or scalar histograms.");
-                    return;
-                };
-                let _ = self.session.evaluate(sel_id);
-                let Ok(node) = self.session.node(sel_id) else {
-                    return;
-                };
-                let Some(ds) = node.dataset().cloned() else {
-                    ui.weak("Dataset not evaluated.");
-                    return;
-                };
-                if let Some(res) = draw_chart_tab(ui, &ds, &mut self.chart_state, self.theme) {
-                    match res {
-                        Ok(msg) => {
-                            self.error_message = None;
-                            self.status_message = msg;
-                        }
-                        Err(err) => self.error_message = Some(err),
-                    }
-                }
+                ui.push_id("drawer_chart", |ui| {
+                    self.draw_chart_view(ui);
+                });
             }
             DrawerTab::RustTrace => {
                 let mut trace = self.session.to_rust_trace();
@@ -90,7 +76,51 @@ impl ParaVizApp {
         }
     }
 
-    fn draw_spreadsheet(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn draw_chart_view(&mut self, ui: &mut egui::Ui) {
+        let Some(sel_id) = self.selected_node else {
+            ui.weak("Select a node to view XY plots or scalar histograms.");
+            return;
+        };
+        let _ = self.session.evaluate(sel_id);
+        let Ok(node) = self.session.node(sel_id) else {
+            return;
+        };
+        let Some(ds) = node.dataset().cloned() else {
+            ui.weak("Dataset not evaluated.");
+            return;
+        };
+        if let Some(res) = draw_chart_tab(ui, &ds, &mut self.chart_state, self.theme) {
+            match res {
+                Ok(msg) => {
+                    self.error_message = None;
+                    self.status_message = msg;
+                }
+                Err(err) => self.error_message = Some(err),
+            }
+        }
+    }
+
+    pub(super) fn draw_spreadsheet_view(&mut self, ui: &mut egui::Ui, show_target_tabs: bool) {
+        if show_target_tabs {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.spreadsheet_target,
+                    SpreadsheetTarget::Points,
+                    "Point Data",
+                );
+                ui.selectable_value(
+                    &mut self.spreadsheet_target,
+                    SpreadsheetTarget::Cells,
+                    "Cell Data",
+                );
+                ui.selectable_value(
+                    &mut self.spreadsheet_target,
+                    SpreadsheetTarget::Field,
+                    "Field Data",
+                );
+            });
+            ui.separator();
+        }
         let Some(sel_id) = self.selected_node else {
             ui.weak("Select a node to inspect data values.");
             return;

@@ -112,7 +112,7 @@ impl ParaVizApp {
                     }
                 }
                 if ui.button("Save Screenshot PNG...").clicked() {
-                    let (w, h) = self.viewport_tex_size;
+                    let (w, h) = self.active_viewport_tex_size();
                     let path = self.default_export_path("screenshot.png");
                     self.modal = Some(AppModal::SaveScreenshot(ScreenshotModalState {
                         path,
@@ -125,7 +125,7 @@ impl ParaVizApp {
                     ui.close();
                 }
                 if ui.button("Export Animation (GIF)...").clicked() {
-                    let (w, h) = self.viewport_tex_size;
+                    let (w, h) = self.active_viewport_tex_size();
                     let has_ts = !self.session.all_time_steps().is_empty();
                     let path = self.default_export_path("paraviz_animation.gif");
                     self.modal = Some(AppModal::ExportGif(GifModalState {
@@ -363,7 +363,41 @@ impl ParaVizApp {
                 );
                 ui.checkbox(&mut self.zen_mode, "Zen Mode (Full Viewport)");
                 ui.separator();
+                ui.menu_button("Viewport Layout", |ui| {
+                    for &layout in ViewportLayout::ALL {
+                        if ui
+                            .selectable_label(self.viewport_layout == layout, layout.menu_label())
+                            .clicked()
+                        {
+                            set_viewport_layout(
+                                &mut self.viewport_layout,
+                                &mut self.active_pane,
+                                layout,
+                            );
+                            self.invalidate_viewport();
+                            ui.close();
+                        }
+                    }
+                });
+                if ui
+                    .checkbox(&mut self.link_cameras, "Link Cameras")
+                    .changed()
+                    && self.link_cameras
+                {
+                    self.sync_camera_from_pane(self.active_pane);
+                    self.invalidate_viewport();
+                }
+                ui.separator();
                 ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
+                if ui
+                    .checkbox(
+                        &mut self.session.settings.show_time_annotation,
+                        "Time Annotation (Time:)",
+                    )
+                    .changed()
+                {
+                    self.invalidate_viewport();
+                }
                 if ui
                     .checkbox(&mut self.show_widgets, "3D Filter Widgets (W)")
                     .changed()
@@ -502,8 +536,7 @@ impl ParaVizApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.small_button("Reset").on_hover_text("Reset camera (R)").clicked() {
-                            let _ = self.session.reset_camera();
-                            self.invalidate_viewport();
+                            self.reset_active_pane_camera();
                         }
                         if ui.small_button("Fit").on_hover_text("Focus selected node (F)").clicked() {
                             self.focus_selected_node();
@@ -518,14 +551,17 @@ impl ParaVizApp {
                             ("Iso", CameraPreset::Isometric),
                         ] {
                             if ui.small_button(label).clicked() {
-                                let _ = self.session.camera_preset(preset);
-                                self.invalidate_viewport();
+                                self.camera_preset_active(preset);
                             }
                         }
                         if ui
-                            .toggle_value(&mut self.session.camera.orthographic, "Ortho")
+                            .toggle_value(
+                                &mut self.panes[self.active_pane].camera.orthographic,
+                                "Ortho",
+                            )
                             .changed()
                         {
+                            self.sync_camera_from_pane(self.active_pane);
                             self.invalidate_viewport();
                         }
                         ui.toggle_value(&mut self.turntable_enabled, "Spin")
@@ -578,6 +614,16 @@ impl ParaVizApp {
                             self.invalidate_viewport();
                         }
                         ui.toggle_value(&mut self.show_scalar_bar, "ColorBar");
+                        if ui
+                            .toggle_value(
+                                &mut self.session.settings.show_time_annotation,
+                                "Time:",
+                            )
+                            .on_hover_text("Toggle Time: annotation badge")
+                            .changed()
+                        {
+                            self.invalidate_viewport();
+                        }
                         let mut msaa_4x = self.session.settings.msaa_samples >= 4;
                         if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
                             self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
@@ -616,6 +662,41 @@ impl ParaVizApp {
                     ui.horizontal(|ui| {
                         ui.toggle_value(&mut self.show_left_dock, "Inspector");
                         ui.toggle_value(&mut self.show_drawer, "Data / Chart");
+                    });
+                });
+
+            // Split layout & linked camera controls
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for &layout in ViewportLayout::ALL {
+                            if ui
+                                .selectable_label(self.viewport_layout == layout, layout.label())
+                                .on_hover_text(layout.menu_label())
+                                .clicked()
+                            {
+                                set_viewport_layout(
+                                    &mut self.viewport_layout,
+                                    &mut self.active_pane,
+                                    layout,
+                                );
+                                self.invalidate_viewport();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .toggle_value(&mut self.link_cameras, "Link Cameras")
+                            .on_hover_text("Sync camera navigation across all 3D panes")
+                            .changed()
+                            && self.link_cameras
+                        {
+                            self.sync_camera_from_pane(self.active_pane);
+                            self.invalidate_viewport();
+                        }
                     });
                 });
 
@@ -935,23 +1016,7 @@ impl ParaVizApp {
             }
         }
         if let Some(id) = to_delete {
-            let removed = self.session.remove_node(id);
-            self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
-            self.volume_tf_hist_cache
-                .retain(|(nid, _, _, _), _| !removed.contains(nid));
-            if self
-                .picked_highlight
-                .as_ref()
-                .is_some_and(|h| removed.contains(&h.node_id))
-            {
-                self.picked_highlight = None;
-            }
-            if self.selected_node.is_some_and(|s| removed.contains(&s)) {
-                self.selected_node = self.session.nodes().last().map(|n| n.id);
-                self.pending_source = None;
-                self.pending_filter = None;
-            }
-            self.invalidate_viewport();
+            self.remove_node_and_cleanup(id);
         }
 
         ui.add_space(6.0);

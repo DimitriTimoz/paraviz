@@ -13,8 +13,12 @@ pub(crate) use crate::theme::{
     visibility_eye_button, UiTheme, ViewportBgPreset,
 };
 use paraviz::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
 use std::sync::Arc;
 use web_time::{Duration, Instant};
 
@@ -70,8 +74,71 @@ struct PickedHighlight {
     scalar_value: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewportLayout {
+    Single,
+    SplitHorizontal,
+    SplitVertical,
+    Quad,
+}
+
+impl ViewportLayout {
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Single,
+        Self::SplitHorizontal,
+        Self::SplitVertical,
+        Self::Quad,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Single => "1x1",
+            Self::SplitHorizontal => "1x2",
+            Self::SplitVertical => "2x1",
+            Self::Quad => "2x2",
+        }
+    }
+
+    pub(crate) fn menu_label(self) -> &'static str {
+        match self {
+            Self::Single => "1x1 Single",
+            Self::SplitHorizontal => "1x2 Split Horizontal",
+            Self::SplitVertical => "2x1 Split Vertical",
+            Self::Quad => "2x2 Quad",
+        }
+    }
+
+    pub(crate) fn pane_count(self) -> usize {
+        match self {
+            Self::Single => 1,
+            Self::SplitHorizontal | Self::SplitVertical => 2,
+            Self::Quad => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PaneKind {
+    #[default]
+    View3D,
+    Chart,
+    Spreadsheet,
+}
+
+impl PaneKind {
+    pub(crate) const ALL: &'static [Self] = &[Self::View3D, Self::Chart, Self::Spreadsheet];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::View3D => "3D View",
+            Self::Chart => "XY Chart",
+            Self::Spreadsheet => "Spreadsheet",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-struct ViewportCacheKey {
+pub(crate) struct ViewportCacheKey {
     scene_revision: u64,
     width: u32,
     height: u32,
@@ -79,6 +146,91 @@ struct ViewportCacheKey {
     settings: SceneSettings,
     widgets: Vec<ViewportWidget>,
     picked_highlight: Option<PickedHighlight>,
+    visible_nodes_override: Option<BTreeSet<NodeId>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ViewportPane {
+    pub(crate) kind: PaneKind,
+    pub(crate) camera: Camera,
+    pub(crate) tex_id: Option<egui::TextureId>,
+    pub(crate) tex_size: (u32, u32),
+    pub(crate) cache_key: Option<ViewportCacheKey>,
+    pub(crate) cached_scene: Option<RenderScene>,
+    pub(crate) cached_total_points: usize,
+    pub(crate) cached_total_cells: usize,
+    pub(crate) visible_nodes_override: Option<BTreeSet<NodeId>>,
+}
+
+pub(crate) fn set_viewport_layout(
+    layout: &mut ViewportLayout,
+    active_pane: &mut usize,
+    next: ViewportLayout,
+) {
+    *layout = next;
+    let max_idx = next.pane_count().saturating_sub(1);
+    if *active_pane > max_idx {
+        *active_pane = max_idx;
+    }
+}
+
+pub(crate) fn sync_linked_pane_cameras(
+    panes: &mut [ViewportPane],
+    source_idx: usize,
+    link_cameras: bool,
+) {
+    if !link_cameras {
+        return;
+    }
+    let Some(cam) = panes.get(source_idx).map(|p| p.camera.clone()) else {
+        return;
+    };
+    for (idx, pane) in panes.iter_mut().enumerate() {
+        if idx != source_idx && pane.kind == PaneKind::View3D {
+            pane.camera = cam.clone();
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ActiveWorkerJob {
+    pub(crate) id: u64,
+    pub(crate) label: String,
+    pub(crate) started_at: Instant,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
+    pub(crate) cancel_node_to_remove: Option<NodeId>,
+    pub(crate) restore_visibility: Vec<(NodeId, bool)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) enum WorkerPayload {
+    OpenFile {
+        path: PathBuf,
+        reader: paraviz::io::DatasetReader,
+        used_reader: Option<paraviz::io::DatasetReader>,
+        result: Result<(DataSet, Vec<f64>), String>,
+    },
+    RawVolume {
+        path: PathBuf,
+        dimensions: [usize; 3],
+        result: Result<ImageData, String>,
+    },
+    EvaluateNode {
+        node_id: NodeId,
+        label: String,
+        time: f64,
+        show_on_finish: bool,
+        repr_override: Option<Representation>,
+        open_probe_chart: bool,
+        result: Result<DataSet, String>,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct WorkerCompletion {
+    pub(crate) job_id: u64,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
+    pub(crate) payload: WorkerPayload,
 }
 
 struct PipelineTreeRow {
@@ -100,13 +252,11 @@ pub struct ParaVizApp {
     renderer: WebGpuRenderer,
     device: wgpu::Device,
     egui_renderer: Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>,
-    viewport_tex_id: Option<egui::TextureId>,
-    viewport_tex_size: (u32, u32),
+    viewport_layout: ViewportLayout,
+    panes: [ViewportPane; 4],
+    active_pane: usize,
+    link_cameras: bool,
     scene_revision: u64,
-    viewport_cache_key: Option<ViewportCacheKey>,
-    cached_scene: Option<RenderScene>,
-    cached_total_points: usize,
-    cached_total_cells: usize,
 
     theme: UiTheme,
     theme_applied: bool,
@@ -117,6 +267,9 @@ pub struct ParaVizApp {
     auto_apply: bool,
     pending_source: Option<(NodeId, SourceConfig)>,
     pending_filter: Option<(NodeId, FilterConfig)>,
+    multiblock_filter: String,
+    selected_multiblock_patch: Option<(NodeId, String)>,
+    next_annotation_id: u64,
 
     inspector_tab: InspectorTab,
     show_left_dock: bool,
@@ -160,6 +313,14 @@ pub struct ParaVizApp {
     modal: Option<AppModal>,
     status_message: String,
     error_message: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    next_job_id: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    active_job: Option<ActiveWorkerJob>,
+    #[cfg(not(target_arch = "wasm32"))]
+    worker_tx: mpsc::Sender<WorkerCompletion>,
+    #[cfg(not(target_arch = "wasm32"))]
+    worker_rx: mpsc::Receiver<WorkerCompletion>,
 }
 
 impl ParaVizApp {
@@ -181,18 +342,19 @@ impl ParaVizApp {
         let theme = UiTheme::DarkStudio;
         apply_theme(&cc.egui_ctx, theme);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let (worker_tx, worker_rx) = mpsc::channel();
+
         let mut app = Self {
             session: ParaViz::new(),
             renderer,
             device,
             egui_renderer,
-            viewport_tex_id: None,
-            viewport_tex_size: (0, 0),
+            viewport_layout: ViewportLayout::Single,
+            panes: std::array::from_fn(|_| ViewportPane::default()),
+            active_pane: 0,
+            link_cameras: false,
             scene_revision: 1,
-            viewport_cache_key: None,
-            cached_scene: None,
-            cached_total_points: 0,
-            cached_total_cells: 0,
             theme,
             theme_applied: false,
             selected_node: None,
@@ -202,6 +364,9 @@ impl ParaVizApp {
             auto_apply: true,
             pending_source: None,
             pending_filter: None,
+            multiblock_filter: String::new(),
+            selected_multiblock_patch: None,
+            next_annotation_id: 1,
             inspector_tab: InspectorTab::Properties,
             show_left_dock: true,
             zen_mode: false,
@@ -238,6 +403,14 @@ impl ParaVizApp {
             modal: None,
             status_message: "Ready".into(),
             error_message: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            next_job_id: 1,
+            #[cfg(not(target_arch = "wasm32"))]
+            active_job: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            worker_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            worker_rx,
         };
 
         if let Some(path) = initial_path {
@@ -253,6 +426,154 @@ impl ParaVizApp {
         self.scene_revision = self.scene_revision.wrapping_add(1);
     }
 
+    pub(super) fn active_viewport_tex_size(&self) -> (u32, u32) {
+        let size = self.panes[self.active_pane].tex_size;
+        if size.0 > 0 && size.1 > 0 {
+            size
+        } else {
+            self.panes
+                .iter()
+                .find(|p| p.tex_size.0 > 0 && p.tex_size.1 > 0)
+                .map(|p| p.tex_size)
+                .unwrap_or((1280, 720))
+        }
+    }
+
+    pub(super) fn sync_active_camera_to_panes(&mut self) {
+        let cam = self.session.camera.clone();
+        self.panes[self.active_pane].camera = cam.clone();
+        if self.link_cameras {
+            sync_linked_pane_cameras(&mut self.panes, self.active_pane, true);
+        }
+    }
+
+    pub(super) fn sync_all_panes_to_session_camera(&mut self) {
+        let cam = self.session.camera.clone();
+        for pane in &mut self.panes {
+            pane.camera = cam.clone();
+        }
+    }
+
+    pub(super) fn sync_camera_from_pane(&mut self, source_pane: usize) {
+        sync_linked_pane_cameras(&mut self.panes, source_pane, self.link_cameras);
+        if source_pane == self.active_pane || self.link_cameras {
+            self.session.camera = self.panes[source_pane].camera.clone();
+        }
+    }
+
+    pub(super) fn reset_active_pane_camera(&mut self) {
+        let idx = self.active_pane;
+        if let Ok(scene) = self.build_pane_scene(idx) {
+            let bounds = scene.bounds();
+            self.panes[idx].camera.fit_bounds(&bounds);
+            self.sync_camera_from_pane(idx);
+            self.invalidate_viewport();
+        } else {
+            let _ = self.session.reset_camera();
+            self.sync_active_camera_to_panes();
+            self.invalidate_viewport();
+        }
+    }
+
+    pub(super) fn camera_preset_active(&mut self, preset: CameraPreset) {
+        let idx = self.active_pane;
+        if self.panes[idx].visible_nodes_override.is_some()
+            && let Ok(scene) = self.build_pane_scene(idx)
+        {
+            let bounds = scene.bounds();
+            self.panes[idx].camera.apply_preset(preset, &bounds);
+            self.sync_camera_from_pane(idx);
+            self.invalidate_viewport();
+            return;
+        }
+        let _ = self.session.camera_preset(preset);
+        self.sync_active_camera_to_panes();
+        self.invalidate_viewport();
+    }
+
+    pub(super) fn build_pane_scene(&mut self, pane_idx: usize) -> Result<RenderScene, SessionError> {
+        let pane_cam = self.panes[pane_idx].camera.clone();
+        let override_ids = self.panes[pane_idx].visible_nodes_override.clone();
+        if let Some(allowed) = override_ids {
+            let eval_ids: Vec<NodeId> = self
+                .session
+                .nodes()
+                .iter()
+                .filter(|n| allowed.contains(&n.id))
+                .map(|n| n.id)
+                .collect();
+            for id in eval_ids {
+                let _ = self.session.evaluate(id)?;
+            }
+            let mut settings = self.session.settings.clone();
+            if settings.show_time_annotation && settings.time_label.is_none() {
+                settings.time_label = Some(format!("Time: {:.4}", self.session.time));
+            }
+            let mut scene = RenderScene {
+                camera: pane_cam,
+                actors: Vec::new(),
+                settings,
+                widgets: self.session.widgets.clone(),
+                selection_highlight: self.session.selection_highlight,
+            };
+            for node in self.session.nodes() {
+                if !allowed.contains(&node.id) {
+                    continue;
+                }
+                if let Some(ds) = &node.cached_dataset {
+                    let mut style = node.style.clone();
+                    style.visible = true;
+                    scene.add_actor(SceneActor {
+                        id: node.id.0,
+                        name: node.name.clone(),
+                        dataset: ds.clone(),
+                        style,
+                    });
+                }
+            }
+            Ok(scene)
+        } else {
+            let mut scene = self.session.build_scene()?;
+            scene.camera = pane_cam;
+            Ok(scene)
+        }
+    }
+
+    pub(super) fn remove_node_and_cleanup(&mut self, id: NodeId) {
+        let removed = self.session.remove_node(id);
+        self.info_stats_cache
+            .retain(|(nid, _, _), _| !removed.contains(nid));
+        self.volume_tf_hist_cache
+            .retain(|(nid, _, _, _), _| !removed.contains(nid));
+        for pane in &mut self.panes {
+            if let Some(set) = &mut pane.visible_nodes_override {
+                for r in &removed {
+                    set.remove(r);
+                }
+            }
+        }
+        if self
+            .selected_multiblock_patch
+            .as_ref()
+            .is_some_and(|(nid, _)| removed.contains(nid))
+        {
+            self.selected_multiblock_patch = None;
+        }
+        if self
+            .picked_highlight
+            .as_ref()
+            .is_some_and(|h| removed.contains(&h.node_id))
+        {
+            self.picked_highlight = None;
+        }
+        if self.selected_node.is_some_and(|s| removed.contains(&s)) {
+            self.selected_node = self.session.nodes().last().map(|n| n.id);
+            self.pending_source = None;
+            self.pending_filter = None;
+        }
+        self.invalidate_viewport();
+    }
+
     fn clear_stats_caches(&mut self) {
         self.info_stats_cache.clear();
         self.volume_tf_hist_cache.clear();
@@ -266,23 +587,24 @@ impl ParaVizApp {
 
     fn focus_on_world_pos(&mut self, pos: [f32; 3]) {
         let p = glam::Vec3::from_array(pos);
-        let offset = self.session.camera.position - self.session.camera.target;
+        let cam = &mut self.panes[self.active_pane].camera;
+        let offset = cam.position - cam.target;
         let dist = offset.length().max(1e-4);
         let dir = offset.normalize_or(glam::Vec3::Z);
         let target_dist = self
             .selected_node
             .and_then(|id| self.session.node(id).ok())
-            .and_then(|n| n.dataset())
-            .map(|ds| ds.bounds().diagonal() * 0.35)
+            .and_then(|n| n.dataset().map(|ds| n.style.dataset_bounds(ds)))
+            .map(|bb| bb.diagonal() * 0.35)
             .filter(|d| *d > 1e-4)
             .map(|d| dist.min(d))
             .unwrap_or(dist);
-        self.session.camera.target = p;
-        self.session.camera.position = p + dir * target_dist;
-        if self.session.camera.orthographic {
-            self.session.camera.ortho_scale =
-                (self.session.camera.ortho_scale * (target_dist / dist)).max(1e-5);
+        cam.target = p;
+        cam.position = p + dir * target_dist;
+        if cam.orthographic {
+            cam.ortho_scale = (cam.ortho_scale * (target_dist / dist)).max(1e-5);
         }
+        self.sync_camera_from_pane(self.active_pane);
         self.invalidate_viewport();
     }
 
@@ -357,7 +679,26 @@ impl ParaVizApp {
         self.recent_files.truncate(8);
     }
 
+    fn reset_pane_overrides_on_session_replace(&mut self) {
+        self.selected_multiblock_patch = None;
+        for pane in &mut self.panes {
+            pane.visible_nodes_override = None;
+        }
+        self.next_annotation_id = self
+            .session
+            .settings
+            .annotations
+            .iter()
+            .map(|a| a.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.sync_all_panes_to_session_camera();
+    }
+
     fn load_demo(&mut self, preset: DemoPreset) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cancel_active_job(false);
         match preset.build() {
             Ok(mut pv) => {
                 let _ = pv.update_visible();
@@ -373,6 +714,7 @@ impl ParaVizApp {
                 self.clear_stats_caches();
                 self.playing = false;
                 self.error_message = None;
+                self.reset_pane_overrides_on_session_replace();
                 self.invalidate_viewport();
                 self.status_message = format!("Loaded demo: {}", preset.name());
             }
@@ -403,6 +745,7 @@ impl ParaVizApp {
                     self.clear_stats_caches();
                     self.playing = false;
                     self.error_message = None;
+                    self.reset_pane_overrides_on_session_replace();
                     self.invalidate_viewport();
                     self.status_message = format!("Loaded state: {name}");
                 }
@@ -436,6 +779,8 @@ impl ParaVizApp {
             .unwrap_or_default();
 
         if ext == "json" {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.cancel_active_job(false);
             match std::fs::read_to_string(path).and_then(|s| {
                 ParaViz::load_state_json(&s).map_err(|e| std::io::Error::other(e.to_string()))
             }) {
@@ -453,6 +798,7 @@ impl ParaVizApp {
                     self.clear_stats_caches();
                     self.playing = false;
                     self.error_message = None;
+                    self.reset_pane_overrides_on_session_replace();
                     self.invalidate_viewport();
                     self.push_recent_file(path);
                     self.status_message = format!("Loaded state: {}", path.display());
@@ -464,67 +810,76 @@ impl ParaVizApp {
             return;
         }
 
-        let is_first = self.session.nodes().is_empty();
-        let used_reader = match reader {
-            paraviz::io::DatasetReader::Auto => paraviz::io::detect_reader(path).ok(),
-            explicit => Some(explicit),
-        };
-        match self.session.open_with_reader(path, reader) {
-            Ok(id) => {
-                if is_first
-                    && let Some(first_t) = self.session.all_time_steps().first().copied()
-                {
-                    self.session.time = first_t;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.spawn_open_file_job(path.to_path_buf(), reader);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let is_first = self.session.nodes().is_empty();
+            let used_reader = match reader {
+                paraviz::io::DatasetReader::Auto => paraviz::io::detect_reader(path).ok(),
+                explicit => Some(explicit),
+            };
+            match self.session.open_with_reader(path, reader) {
+                Ok(id) => {
+                    if is_first
+                        && let Some(first_t) = self.session.all_time_steps().first().copied()
+                    {
+                        self.session.time = first_t;
+                    }
+                    if let Err(e) = self.session.evaluate(id) {
+                        let _ = self.session.remove_node(id);
+                        let reader_desc = used_reader
+                            .map(|r| format!(" ({})", r.short_name()))
+                            .unwrap_or_default();
+                        self.error_message = Some(format!(
+                            "Failed to read '{}'{}: {e}",
+                            path.display(),
+                            reader_desc
+                        ));
+                        return;
+                    }
+                    self.session.show(id);
+                    if is_first {
+                        let _ = self.session.camera_preset(CameraPreset::Isometric);
+                    } else {
+                        let _ = self.session.reset_camera();
+                    }
+                    self.sync_all_panes_to_session_camera();
+                    self.select_node(id);
+                    self.clear_stats_caches();
+                    self.error_message = None;
+                    self.invalidate_viewport();
+                    self.push_recent_file(path);
+                    let reader_desc = used_reader
+                        .map(|r| r.short_name())
+                        .unwrap_or("Auto");
+                    let counts_desc = self
+                        .session
+                        .node(id)
+                        .ok()
+                        .and_then(|n| n.dataset())
+                        .map(|ds| format!(" ({} pts, {} cells)", ds.num_points(), ds.num_cells()))
+                        .unwrap_or_default();
+                    self.status_message = format!(
+                        "Opened '{}' via {}{}",
+                        path.display(),
+                        reader_desc,
+                        counts_desc
+                    );
                 }
-                if let Err(e) = self.session.evaluate(id) {
-                    let _ = self.session.remove_node(id);
+                Err(e) => {
                     let reader_desc = used_reader
                         .map(|r| format!(" ({})", r.short_name()))
                         .unwrap_or_default();
                     self.error_message = Some(format!(
-                        "Failed to read '{}'{}: {e}",
+                        "Failed to open '{}'{}: {e}",
                         path.display(),
                         reader_desc
                     ));
-                    return;
                 }
-                self.session.show(id);
-                if is_first {
-                    let _ = self.session.camera_preset(CameraPreset::Isometric);
-                } else {
-                    let _ = self.session.reset_camera();
-                }
-                self.select_node(id);
-                self.clear_stats_caches();
-                self.error_message = None;
-                self.invalidate_viewport();
-                self.push_recent_file(path);
-                let reader_desc = used_reader
-                    .map(|r| r.short_name())
-                    .unwrap_or("Auto");
-                let counts_desc = self
-                    .session
-                    .node(id)
-                    .ok()
-                    .and_then(|n| n.dataset())
-                    .map(|ds| format!(" ({} pts, {} cells)", ds.num_points(), ds.num_cells()))
-                    .unwrap_or_default();
-                self.status_message = format!(
-                    "Opened '{}' via {}{}",
-                    path.display(),
-                    reader_desc,
-                    counts_desc
-                );
-            }
-            Err(e) => {
-                let reader_desc = used_reader
-                    .map(|r| format!(" ({})", r.short_name()))
-                    .unwrap_or_default();
-                self.error_message = Some(format!(
-                    "Failed to open '{}'{}: {e}",
-                    path.display(),
-                    reader_desc
-                ));
             }
         }
     }
@@ -544,35 +899,50 @@ impl ParaVizApp {
             },
         };
         let path = PathBuf::from(rv.path.trim());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.spawn_raw_volume_job(path, desc, rv.scalar_type);
+        }
+        #[cfg(target_arch = "wasm32")]
         match paraviz::io::read_raw_volume_with_type(&path, &desc, rv.scalar_type) {
             Ok(img) => {
-                let is_first = self.session.nodes().is_empty();
-                let base_name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("RawVolume");
-                let label = self.unique_label(base_name);
-                let id = self.session.add_dataset(label.clone(), DataSet::ImageData(img));
-                let _ = self.session.evaluate(id);
-                self.session.show(id).representation(Representation::Volume);
-                if is_first {
-                    let _ = self.session.camera_preset(CameraPreset::Isometric);
-                } else {
-                    let _ = self.session.reset_camera();
-                }
-                self.select_node(id);
-                self.error_message = None;
-                self.invalidate_viewport();
-                self.push_recent_file(&path);
-                self.status_message = format!(
-                    "Imported raw volume '{label}' ({}×{}×{})",
-                    rv.dimensions[0], rv.dimensions[1], rv.dimensions[2]
-                );
+                self.finish_raw_volume_import(&path, rv.dimensions, img);
             }
             Err(e) => {
                 self.error_message = Some(format!("Raw volume import failed: {e}"));
             }
         }
+    }
+
+    fn finish_raw_volume_import(
+        &mut self,
+        path: &Path,
+        dimensions: [usize; 3],
+        img: ImageData,
+    ) {
+        let is_first = self.session.nodes().is_empty();
+        let base_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("RawVolume");
+        let label = self.unique_label(base_name);
+        let id = self.session.add_dataset(label.clone(), DataSet::ImageData(img));
+        let _ = self.session.evaluate(id);
+        self.session.show(id).representation(Representation::Volume);
+        if is_first {
+            let _ = self.session.camera_preset(CameraPreset::Isometric);
+        } else {
+            let _ = self.session.reset_camera();
+        }
+        self.sync_all_panes_to_session_camera();
+        self.select_node(id);
+        self.error_message = None;
+        self.invalidate_viewport();
+        self.push_recent_file(path);
+        self.status_message = format!(
+            "Imported raw volume '{label}' ({}×{}×{})",
+            dimensions[0], dimensions[1], dimensions[2]
+        );
     }
 
     fn add_source(&mut self, cfg: SourceConfig) {
@@ -587,6 +957,7 @@ impl ParaVizApp {
                 } else {
                     let _ = self.session.reset_camera();
                 }
+                self.sync_all_panes_to_session_camera();
                 self.select_node(id);
                 self.error_message = None;
                 self.invalidate_viewport();
@@ -703,16 +1074,50 @@ impl ParaVizApp {
             cfg,
             FilterConfig::FeatureEdges(_) | FilterConfig::ExtractEdges(_)
         );
+        let repr_override = if is_cell_centers {
+            Some(Representation::Points)
+        } else if is_wire_edges {
+            Some(Representation::Wireframe)
+        } else {
+            None
+        };
         let is_probe = matches!(cfg, FilterConfig::ProbeOverLine(_));
         let label = self.unique_label(cfg.default_label());
-        match self.session.add_filter_cfg(label.clone(), parent_id, cfg) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let parent_ds = self
+            .session
+            .node(parent_id)
+            .ok()
+            .and_then(|n| n.dataset().cloned());
+        match self.session.add_filter_cfg(label.clone(), parent_id, cfg.clone()) {
             Ok(id) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(input_ds) = parent_ds {
+                    if let Some(repr) = repr_override
+                        && let Ok(n) = self.session.node_mut(id)
+                    {
+                        n.style.representation = repr;
+                    }
+                    self.session.hide(id);
+                    self.select_node(id);
+                    self.spawn_filter_eval_job(
+                        id,
+                        label,
+                        cfg,
+                        input_ds,
+                        true,
+                        repr_override,
+                        is_probe,
+                        Some(id),
+                        Vec::new(),
+                    );
+                    return;
+                }
+
                 let eval_res = self.session.evaluate(id);
                 let handle = self.session.show(id);
-                if is_cell_centers {
-                    handle.representation(Representation::Points);
-                } else if is_wire_edges {
-                    handle.representation(Representation::Wireframe);
+                if let Some(repr) = repr_override {
+                    handle.representation(repr);
                 }
                 if let Err(e) = eval_res {
                     self.error_message = Some(format!("Filter '{label}' failed: {e}"));
@@ -730,6 +1135,425 @@ impl ParaVizApp {
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to add filter: {e}"));
+            }
+        }
+    }
+
+    pub(super) fn apply_filter_update(&mut self, id: NodeId, cfg: FilterConfig) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.cancel_active_job(false);
+            let parent_ds = self
+                .session
+                .node(id)
+                .ok()
+                .and_then(|n| n.parent)
+                .and_then(|pid| self.session.node(pid).ok())
+                .and_then(|pn| pn.dataset().cloned());
+            if let Some(input_ds) = parent_ds {
+                let mut restore_visibility = Vec::new();
+                let mut stack = vec![id];
+                while let Some(cur) = stack.pop() {
+                    if let Ok(n) = self.session.node(cur) {
+                        restore_visibility.push((cur, n.style.visible));
+                    }
+                    for child in self.session.nodes() {
+                        if child.parent == Some(cur) {
+                            stack.push(child.id);
+                        }
+                    }
+                }
+                let label = self
+                    .session
+                    .node(id)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|_| cfg.default_label().to_string());
+                if let Err(e) = self.session.update_filter_cfg(id, cfg.clone()) {
+                    self.error_message = Some(format!("Update filter error: {e}"));
+                    return;
+                }
+                for &(nid, _) in &restore_visibility {
+                    self.session.hide(nid);
+                }
+                self.pending_filter = None;
+                self.error_message = None;
+                self.clear_stats_caches_for_node(id);
+                self.spawn_filter_eval_job(
+                    id,
+                    label,
+                    cfg,
+                    input_ds,
+                    false,
+                    None,
+                    false,
+                    None,
+                    restore_visibility,
+                );
+                return;
+            }
+        }
+
+        if let Err(e) = self.session.update_filter_cfg(id, cfg) {
+            self.error_message = Some(format!("Update filter error: {e}"));
+        } else {
+            self.pending_filter = None;
+            self.error_message = None;
+            self.clear_stats_caches_for_node(id);
+            self.invalidate_viewport();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn next_worker_job_id(&mut self) -> (u64, Arc<AtomicBool>) {
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        (self.next_job_id, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn cancel_active_job(&mut self, update_status: bool) {
+        if let Some(job) = self.active_job.take() {
+            job.cancel_flag.store(true, Ordering::Relaxed);
+            for (nid, vis) in job.restore_visibility {
+                if vis {
+                    if self.session.node(nid).is_ok() {
+                        self.session.show(nid);
+                    }
+                } else {
+                    self.session.hide(nid);
+                }
+            }
+            if let Some(rm_id) = job.cancel_node_to_remove
+                && self.session.node(rm_id).is_ok()
+            {
+                self.remove_node_and_cleanup(rm_id);
+            }
+            if update_status {
+                self.status_message = format!("Cancelled: {}", job.label);
+            }
+            self.invalidate_viewport();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_open_file_job(&mut self, path: PathBuf, reader: paraviz::io::DatasetReader) {
+        self.cancel_active_job(false);
+        let (job_id, cancel_flag) = self.next_worker_job_id();
+        let fname = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let label = format!("Loading {fname}...");
+        let used_reader = match reader {
+            paraviz::io::DatasetReader::Auto => paraviz::io::detect_reader(&path).ok(),
+            explicit => Some(explicit),
+        };
+        self.active_job = Some(ActiveWorkerJob {
+            id: job_id,
+            label: label.clone(),
+            started_at: Instant::now(),
+            cancel_flag: cancel_flag.clone(),
+            cancel_node_to_remove: None,
+            restore_visibility: Vec::new(),
+        });
+        self.status_message = label;
+        self.error_message = None;
+
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            let result = if ext == "pvd" && reader == paraviz::io::DatasetReader::Auto {
+                paraviz::io::PvdSeriesSource::new(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|pvd| {
+                        let ts = pvd.time_steps();
+                        let first_t = ts.first().copied().unwrap_or(0.0);
+                        pvd.execute(first_t)
+                            .map(|ds| (ds, ts))
+                            .map_err(|e| e.to_string())
+                    })
+            } else {
+                paraviz::io::read_dataset_with_reader(&path, reader)
+                    .map(|(ds, resolved)| {
+                        let ts = inspect_file_time_steps(&path, resolved);
+                        (ds, ts)
+                    })
+                    .map_err(|e| e.to_string())
+            };
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(WorkerCompletion {
+                job_id,
+                cancel_flag,
+                payload: WorkerPayload::OpenFile {
+                    path,
+                    reader,
+                    used_reader,
+                    result,
+                },
+            });
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_raw_volume_job(
+        &mut self,
+        path: PathBuf,
+        desc: RawVolumeDescriptor,
+        scalar_type: RawScalarType,
+    ) {
+        self.cancel_active_job(false);
+        let (job_id, cancel_flag) = self.next_worker_job_id();
+        let fname = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("volume")
+            .to_string();
+        let label = format!("Importing {fname}...");
+        let dimensions = desc.dimensions;
+        self.active_job = Some(ActiveWorkerJob {
+            id: job_id,
+            label: label.clone(),
+            started_at: Instant::now(),
+            cancel_flag: cancel_flag.clone(),
+            cancel_node_to_remove: None,
+            restore_visibility: Vec::new(),
+        });
+        self.status_message = label;
+        self.error_message = None;
+
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let result = paraviz::io::read_raw_volume_with_type(&path, &desc, scalar_type)
+                .map_err(|e| e.to_string());
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(WorkerCompletion {
+                job_id,
+                cancel_flag,
+                payload: WorkerPayload::RawVolume {
+                    path,
+                    dimensions,
+                    result,
+                },
+            });
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_filter_eval_job(
+        &mut self,
+        node_id: NodeId,
+        label: String,
+        cfg: FilterConfig,
+        input_ds: Arc<DataSet>,
+        show_on_finish: bool,
+        repr_override: Option<Representation>,
+        open_probe_chart: bool,
+        cancel_node_to_remove: Option<NodeId>,
+        restore_visibility: Vec<(NodeId, bool)>,
+    ) {
+        self.cancel_active_job(false);
+        let (job_id, cancel_flag) = self.next_worker_job_id();
+        let time = self.session.time;
+        let job_label = format!("Evaluating {label}...");
+        self.active_job = Some(ActiveWorkerJob {
+            id: job_id,
+            label: job_label.clone(),
+            started_at: Instant::now(),
+            cancel_flag: cancel_flag.clone(),
+            cancel_node_to_remove,
+            restore_visibility,
+        });
+        self.status_message = job_label;
+
+        let tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let filter = cfg.build_filter();
+            let result = filter.apply(&input_ds).map_err(|e| e.to_string());
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(WorkerCompletion {
+                job_id,
+                cancel_flag,
+                payload: WorkerPayload::EvaluateNode {
+                    node_id,
+                    label,
+                    time,
+                    show_on_finish,
+                    repr_override,
+                    open_probe_chart,
+                    result,
+                },
+            });
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_worker_jobs(&mut self) {
+        let completions: Vec<WorkerCompletion> = self.worker_rx.try_iter().collect();
+        for comp in completions {
+            if comp.cancel_flag.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Some(active) = self.active_job.as_ref() else {
+                continue;
+            };
+            if active.id != comp.job_id {
+                continue;
+            }
+            let finished_job = self.active_job.take().unwrap();
+            match comp.payload {
+                WorkerPayload::OpenFile {
+                    path,
+                    reader,
+                    used_reader,
+                    result,
+                } => match result {
+                    Ok((dataset, time_steps)) => {
+                        let is_first = self.session.nodes().is_empty();
+                        if is_first
+                            && let Some(first_t) = time_steps.first().copied()
+                        {
+                            self.session.time = first_t;
+                        }
+                        match self
+                            .session
+                            .open_preloaded(&path, reader, dataset, time_steps)
+                        {
+                            Ok(id) => {
+                                self.session.show(id);
+                                if is_first {
+                                    let _ = self.session.camera_preset(CameraPreset::Isometric);
+                                } else {
+                                    let _ = self.session.reset_camera();
+                                }
+                                self.sync_all_panes_to_session_camera();
+                                self.select_node(id);
+                                self.clear_stats_caches();
+                                self.error_message = None;
+                                self.invalidate_viewport();
+                                self.push_recent_file(&path);
+                                let reader_desc =
+                                    used_reader.map(|r| r.short_name()).unwrap_or("Auto");
+                                let counts_desc = self
+                                    .session
+                                    .node(id)
+                                    .ok()
+                                    .and_then(|n| n.dataset())
+                                    .map(|ds| {
+                                        format!(" ({} pts, {} cells)", ds.num_points(), ds.num_cells())
+                                    })
+                                    .unwrap_or_default();
+                                self.status_message = format!(
+                                    "Opened '{}' via {}{}",
+                                    path.display(),
+                                    reader_desc,
+                                    counts_desc
+                                );
+                            }
+                            Err(e) => {
+                                let reader_desc = used_reader
+                                    .map(|r| format!(" ({})", r.short_name()))
+                                    .unwrap_or_default();
+                                self.error_message = Some(format!(
+                                    "Failed to open '{}'{}: {e}",
+                                    path.display(),
+                                    reader_desc
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let reader_desc = used_reader
+                            .map(|r| format!(" ({})", r.short_name()))
+                            .unwrap_or_default();
+                        self.error_message = Some(format!(
+                            "Failed to open '{}'{}: {e}",
+                            path.display(),
+                            reader_desc
+                        ));
+                    }
+                },
+                WorkerPayload::RawVolume {
+                    path,
+                    dimensions,
+                    result,
+                } => match result {
+                    Ok(img) => self.finish_raw_volume_import(&path, dimensions, img),
+                    Err(e) => {
+                        self.error_message = Some(format!("Raw volume import failed: {e}"));
+                    }
+                },
+                WorkerPayload::EvaluateNode {
+                    node_id,
+                    label,
+                    time,
+                    show_on_finish,
+                    repr_override,
+                    open_probe_chart,
+                    result,
+                } => {
+                    for (nid, vis) in finished_job.restore_visibility {
+                        if self.session.node(nid).is_ok() {
+                            if vis {
+                                self.session.show(nid);
+                            } else {
+                                self.session.hide(nid);
+                            }
+                        }
+                    }
+                    match result {
+                        Ok(ds) => {
+                            if let Err(e) = self.session.seed_evaluated(node_id, Arc::new(ds), time)
+                            {
+                                self.error_message = Some(format!("Filter '{label}' failed: {e}"));
+                            } else {
+                                if show_on_finish && self.session.node(node_id).is_ok() {
+                                    let handle = self.session.show(node_id);
+                                    if let Some(repr) = repr_override {
+                                        handle.representation(repr);
+                                    }
+                                }
+                                self.error_message = None;
+                                self.status_message = format!("Applied filter '{label}'");
+                                self.select_node(node_id);
+                                self.clear_stats_caches_for_node(node_id);
+                                self.invalidate_viewport();
+                                if open_probe_chart {
+                                    self.chart_state.mode = ChartMode::XYPlot;
+                                    self.drawer_tab = DrawerTab::Chart;
+                                    self.show_drawer = true;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if finished_job.cancel_node_to_remove == Some(node_id)
+                                && self.session.node(node_id).is_ok()
+                            {
+                                self.remove_node_and_cleanup(node_id);
+                            }
+                            self.error_message = Some(format!("Filter '{label}' failed: {e}"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -834,23 +1658,22 @@ impl ParaVizApp {
 
     fn focus_selected_node(&mut self) {
         let Some(sel_id) = self.selected_node else {
-            let _ = self.session.reset_camera();
-            self.invalidate_viewport();
+            self.reset_active_pane_camera();
             return;
         };
         let _ = self.session.evaluate(sel_id);
         if let Ok(node) = self.session.node(sel_id)
             && let Some(ds) = node.dataset()
         {
-            let bb = ds.bounds();
+            let bb = node.style.dataset_bounds(ds);
             if bb.is_valid() {
-                self.session.camera.fit_bounds(&bb);
+                self.panes[self.active_pane].camera.fit_bounds(&bb);
+                self.sync_camera_from_pane(self.active_pane);
                 self.invalidate_viewport();
                 return;
             }
         }
-        let _ = self.session.reset_camera();
-        self.invalidate_viewport();
+        self.reset_active_pane_camera();
     }
 
     fn duplicate_selected_node(&mut self) {
@@ -1134,23 +1957,7 @@ impl ParaVizApp {
 
     fn delete_selected_node(&mut self) {
         if let Some(id) = self.selected_node {
-            let removed = self.session.remove_node(id);
-            self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
-            self.volume_tf_hist_cache
-                .retain(|(nid, _, _, _), _| !removed.contains(nid));
-            if self
-                .picked_highlight
-                .as_ref()
-                .is_some_and(|h| removed.contains(&h.node_id))
-            {
-                self.picked_highlight = None;
-            }
-            if self.selected_node.is_some_and(|s| removed.contains(&s)) {
-                self.selected_node = self.session.nodes().last().map(|n| n.id);
-                self.pending_source = None;
-                self.pending_filter = None;
-            }
-            self.invalidate_viewport();
+            self.remove_node_and_cleanup(id);
         }
     }
 
@@ -1199,8 +2006,7 @@ impl ParaVizApp {
 
         if !ctx.egui_wants_keyboard_input() && self.modal.is_none() && self.renaming_node.is_none() {
             if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-                let _ = self.session.reset_camera();
-                self.invalidate_viewport();
+                self.reset_active_pane_camera();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) {
                 self.focus_selected_node();
@@ -1274,11 +2080,12 @@ impl ParaVizApp {
 
 
     fn handle_modals(&mut self, ctx: &egui::Context) {
+        let vp_size = self.active_viewport_tex_size();
         let action = draw_modal(
             ctx,
             &mut self.modal,
             &mut self.export_glb_colors,
-            self.viewport_tex_size,
+            vp_size,
             self.theme,
         );
         self.execute_modal_action(action);
@@ -1437,6 +2244,14 @@ impl eframe::App for ParaVizApp {
             self.theme_applied = true;
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.poll_worker_jobs();
+            if self.active_job.is_some() {
+                ui.ctx().request_repaint();
+            }
+        }
+
         let now = Instant::now();
         let dt = (now - self.last_frame_time).as_secs_f64();
         self.last_frame_time = now;
@@ -1446,9 +2261,10 @@ impl eframe::App for ParaVizApp {
         }
 
         if self.turntable_enabled {
-            self.session
+            self.panes[self.active_pane]
                 .camera
                 .orbit((dt as f32) * self.turntable_speed, 0.0);
+            self.sync_camera_from_pane(self.active_pane);
             self.invalidate_viewport();
             ui.ctx().request_repaint();
         }
@@ -1490,6 +2306,58 @@ impl eframe::App for ParaVizApp {
         let pal = palette(self.theme);
         egui::Panel::bottom("paraviz_status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
+                #[cfg(not(target_arch = "wasm32"))]
+                let mut cancel_clicked = false;
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(job) = &self.active_job {
+                    ui.spinner();
+                    let elapsed = job.started_at.elapsed().as_secs_f32();
+                    ui.label(
+                        egui::RichText::new(format!("{} ({elapsed:.1}s)", job.label))
+                            .color(pal.accent)
+                            .strong(),
+                    );
+                    if ui.small_button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                    ui.separator();
+                } else if let Some(err) = &self.error_message {
+                    pill_badge(
+                        ui,
+                        "ERR",
+                        pal.danger.gamma_multiply(0.25),
+                        pal.danger,
+                    );
+                    ui.colored_label(pal.danger, err);
+                    if ui
+                        .small_button("Report Issue")
+                        .on_hover_text(
+                            "Encountered a bug? Open an issue at github.com/DimitriTimoz/paraviz/issues",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/DimitriTimoz/paraviz/issues/new/choose",
+                        ));
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        self.error_message = None;
+                    }
+                } else {
+                    pill_badge(
+                        ui,
+                        "OK",
+                        pal.success.gamma_multiply(0.22),
+                        pal.success,
+                    );
+                    ui.label(&self.status_message);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if cancel_clicked {
+                    self.cancel_active_job(true);
+                }
+
+                #[cfg(target_arch = "wasm32")]
                 if let Some(err) = &self.error_message {
                     pill_badge(
                         ui,
@@ -1562,6 +2430,31 @@ impl eframe::App for ParaVizApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn inspect_file_time_steps(path: &Path, reader: paraviz::io::DatasetReader) -> Vec<f64> {
+    match reader {
+        paraviz::io::DatasetReader::Xdmf => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                paraviz::io::inspect_xdmf_time_steps(path).unwrap_or_default()
+            }))
+            .unwrap_or_default()
+        }
+        paraviz::io::DatasetReader::VtkHdf => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                paraviz::io::inspect_vtkhdf_time_steps(path).unwrap_or_default()
+            }))
+            .unwrap_or_default()
+        }
+        paraviz::io::DatasetReader::Exodus => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                paraviz::io::inspect_exodus_time_steps(path).unwrap_or_default()
+            }))
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1624,6 +2517,7 @@ mod tests {
             settings: SceneSettings::default(),
             widgets: Vec::new(),
             picked_highlight: None,
+            visible_nodes_override: None,
         };
         assert_eq!(base, base.clone());
 
@@ -1653,5 +2547,39 @@ mod tests {
         assert!((c[0] - 2.0 / 3.0).abs() < 1e-5);
         assert!((c[1] - 2.0 / 3.0).abs() < 1e-5);
         assert!(c[2].abs() < 1e-5);
+    }
+
+    #[test]
+    fn viewport_layout_pane_counts_and_active_clamping() {
+        assert_eq!(ViewportLayout::Single.pane_count(), 1);
+        assert_eq!(ViewportLayout::SplitHorizontal.pane_count(), 2);
+        assert_eq!(ViewportLayout::SplitVertical.pane_count(), 2);
+        assert_eq!(ViewportLayout::Quad.pane_count(), 4);
+
+        let mut layout = ViewportLayout::Quad;
+        let mut active = 3;
+        set_viewport_layout(&mut layout, &mut active, ViewportLayout::SplitHorizontal);
+        assert_eq!(layout, ViewportLayout::SplitHorizontal);
+        assert_eq!(active, 1);
+
+        set_viewport_layout(&mut layout, &mut active, ViewportLayout::Single);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn linked_pane_cameras_sync_only_3d_panes_when_enabled() {
+        let mut panes: [ViewportPane; 4] = std::array::from_fn(|_| ViewportPane::default());
+        panes[2].kind = PaneKind::Chart;
+        panes[0].camera.fov_y_deg = 62.0;
+        panes[0].camera.orbit(0.4, 0.2);
+
+        sync_linked_pane_cameras(&mut panes, 0, false);
+        assert_ne!(panes[1].camera, panes[0].camera);
+
+        sync_linked_pane_cameras(&mut panes, 0, true);
+        assert_eq!(panes[1].camera, panes[0].camera);
+        assert_eq!(panes[3].camera, panes[0].camera);
+        // Chart pane camera stays untouched
+        assert_eq!(panes[2].camera, Camera::default());
     }
 }

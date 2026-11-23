@@ -28,6 +28,7 @@ pub enum CliCommand {
         filters: Vec<String>,
         transparent: bool,
         scalar_bar: bool,
+        time_annotation: bool,
         gif_delay_ms: Option<u16>,
     },
     Info {
@@ -55,6 +56,12 @@ USAGE:
     paraviz --help | -h
     paraviz --version | -V
 
+SUPPORTED INPUT FORMATS:
+    VTK Legacy (.vtk), VTK XML (.vtp, .vti, .vtu, .vtr, .vts, .vtm, .pvd, .pvtp, .pvtu, .pvti),
+    VTKHDF (.vtkhdf), CGNS (.cgns), Exodus II (.exo, .e, .ex2), XDMF (.xdmf, .xmf),
+    EnSight Gold (.case), OpenFOAM (.foam), NIfTI (.nii, .nii.gz), NRRD (.nrrd, .nhdr),
+    MetaImage (.mhd, .mha), Raw Volume (.raw), Mesh (.stl, .obj, .ply), CSV/TSV (.csv, .tsv)
+
 RENDER OPTIONS:
     -o, --output <path>       Output PNG or animated GIF path (required for demo/render)
     --width <px>              Output image width in pixels (default: 1280)
@@ -70,6 +77,7 @@ RENDER OPTIONS:
     --axes-grid               Show 3D Cube Axes Grid with tick marks
     --transparent             Transparent background (alpha=0) for PNG/GIF export
     --scalar-bar              Composite Scalar Color Bar with min/mid/max labels
+    --time-annotation         Composite Time: annotation badge onto PNG/GIF output
     --turntable <frames>      Render a 360-degree turntable sequence (or animated .gif if -o ends in .gif)
     --gif-delay <ms>          Frame delay in milliseconds when exporting animated .gif (default: 60)
     --filter <spec>           Chain filter(s): contour:<v> | decimate:<r> | smooth |
@@ -212,6 +220,7 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
     let mut filters: Vec<String> = Vec::new();
     let mut transparent = false;
     let mut scalar_bar = false;
+    let mut time_annotation = false;
     let mut gif_delay_ms: Option<u16> = None;
 
     let mut i = 0;
@@ -295,6 +304,9 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
             "--scalar-bar" => {
                 scalar_bar = true;
             }
+            "--time-annotation" => {
+                time_annotation = true;
+            }
             "--gif-delay" => {
                 i += 1;
                 let val = args.get(i).ok_or("Missing milliseconds after --gif-delay")?;
@@ -356,6 +368,7 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
         filters,
         transparent,
         scalar_bar,
+        time_annotation,
         gif_delay_ms,
     })
 }
@@ -522,6 +535,7 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             filters,
             transparent,
             scalar_bar,
+            time_annotation,
             gif_delay_ms,
         } => {
             let ext = input
@@ -591,6 +605,9 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             }
             if scalar_bar {
                 pv.settings.show_scalar_bar = true;
+            }
+            if time_annotation {
+                pv.settings.show_time_annotation = true;
             }
 
             let is_gif = output
@@ -752,5 +769,52 @@ fn parse_cli_filter(spec: &str) -> Result<FilterConfig, String> {
             Ok(FilterConfig::IsoVolume(IsoVolumeFilter::new("", parts[0], parts[1])))
         }
         other => Err(format!("Unknown CLI filter '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_render_time_annotation_flag() {
+        let cmd = parse_args([
+            "paraviz",
+            "render",
+            "input.vtp",
+            "-o",
+            "out.png",
+            "--time-annotation",
+        ])
+        .expect("parse render with --time-annotation");
+        match cmd {
+            CliCommand::Render {
+                time_annotation,
+                scalar_bar,
+                ..
+            } => {
+                assert!(time_annotation);
+                assert!(!scalar_bar);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cmd_default = parse_args(["paraviz", "render", "input.vtp", "-o", "out.png"])
+            .expect("parse render without --time-annotation");
+        match cmd_default {
+            CliCommand::Render {
+                time_annotation, ..
+            } => assert!(!time_annotation),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_text_lists_time_annotation_and_formats() {
+        let txt = help_text();
+        assert!(txt.contains("--time-annotation"));
+        assert!(txt.contains(".vtkhdf"));
+        assert!(txt.contains(".cgns"));
+        assert!(txt.contains(".exo"));
     }
 }

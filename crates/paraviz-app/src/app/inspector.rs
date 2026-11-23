@@ -86,14 +86,7 @@ impl ParaVizApp {
             });
             if changed {
                 if self.auto_apply {
-                    if let Err(e) = self.session.update_filter_cfg(sel_id, working) {
-                        self.error_message = Some(format!("Update filter error: {e}"));
-                    } else {
-                        self.pending_filter = None;
-                        self.error_message = None;
-                        self.clear_stats_caches_for_node(sel_id);
-                        self.invalidate_viewport();
-                    }
+                    self.apply_filter_update(sel_id, working);
                 } else {
                     self.pending_filter = Some((sel_id, working));
                     self.invalidate_viewport();
@@ -102,13 +95,7 @@ impl ParaVizApp {
                 && let Some((id, pending)) = self.pending_filter.take()
                 && id == sel_id
             {
-                if let Err(e) = self.session.update_filter_cfg(sel_id, pending) {
-                    self.error_message = Some(format!("Update filter error: {e}"));
-                } else {
-                    self.error_message = None;
-                    self.clear_stats_caches_for_node(sel_id);
-                    self.invalidate_viewport();
-                }
+                self.apply_filter_update(id, pending);
             }
         } else {
             section_card(ui, self.theme, "In-Memory Dataset", |ui| {
@@ -118,6 +105,8 @@ impl ParaVizApp {
                 );
             });
         }
+
+        self.draw_multiblock_patches_section(ui, sel_id, "props");
     }
 
     pub(super) fn draw_display_tab(&mut self, ui: &mut egui::Ui) {
@@ -525,6 +514,15 @@ impl ParaVizApp {
         if style_changed {
             self.invalidate_viewport();
         }
+
+        self.draw_multiblock_patches_section(ui, sel_id, "display");
+
+        let prev_sb = self.session.settings.scalar_bar.clone();
+        let prev_show_sb = self.show_scalar_bar;
+        self.draw_scalar_bar_card(ui, "display");
+        if self.session.settings.scalar_bar != prev_sb || self.show_scalar_bar != prev_show_sb {
+            self.invalidate_viewport();
+        }
     }
 
     pub(super) fn draw_information_tab(&mut self, ui: &mut egui::Ui) {
@@ -552,6 +550,9 @@ impl ParaVizApp {
                     "Actor: {}  Pos: ({:.3}, {:.3}, {:.3})",
                     pick.actor_name, pick.world_pos[0], pick.world_pos[1], pick.world_pos[2]
                 ));
+                if let Some(bp) = &pick.block_path {
+                    ui.monospace(format!("Block: {bp}"));
+                }
                 let pt_str = pick.point_index.map_or_else(|| "-".into(), |i| i.to_string());
                 let cell_str = pick.cell_index.map_or_else(|| "-".into(), |i| i.to_string());
                 let scalar_str = pick
@@ -601,7 +602,7 @@ impl ParaVizApp {
                 });
         });
 
-        let bb = ds.bounds();
+        let bb = node.style.dataset_bounds(&ds);
         if bb.is_valid() {
             let ext = bb.max - bb.min;
             section_card(ui, self.theme, "Spatial Bounds", |ui| {
@@ -734,7 +735,7 @@ impl ParaVizApp {
             });
             ui.horizontal(|ui| {
                 if ui.button("Reset Camera (R)").clicked() {
-                    let _ = self.session.reset_camera();
+                    self.reset_active_pane_camera();
                 }
                 if ui.button("Focus Selected (F)").clicked() {
                     self.focus_selected_node();
@@ -787,16 +788,442 @@ impl ParaVizApp {
             );
             ui.checkbox(&mut self.show_widgets, "3D Filter Widgets");
             ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
+            ui.checkbox(
+                &mut self.session.settings.show_time_annotation,
+                "Time Annotation (Time:)",
+            );
+            if self.session.settings.show_time_annotation {
+                let mut label_buf = self
+                    .session
+                    .settings
+                    .time_label
+                    .clone()
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Time Label:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut label_buf)
+                                .hint_text("auto (Time: <t>)")
+                                .desired_width(150.0),
+                        )
+                        .changed()
+                    {
+                        self.session.settings.time_label = if label_buf.trim().is_empty() {
+                            None
+                        } else {
+                            Some(label_buf)
+                        };
+                    }
+                });
+            }
         });
 
-        if self.session.camera != prev_camera
-            || self.session.settings != prev_settings
-            || self.show_widgets != prev_widgets
-        {
+        self.draw_scalar_bar_card(ui, "scene");
+        self.draw_annotations_card(ui);
+
+        if self.session.camera != prev_camera {
+            self.sync_active_camera_to_panes();
+            self.invalidate_viewport();
+        } else if self.session.settings != prev_settings || self.show_widgets != prev_widgets {
             self.invalidate_viewport();
         }
     }
 
+    fn draw_scalar_bar_card(&mut self, ui: &mut egui::Ui, id_salt: &str) {
+        section_card(ui, self.theme, "Scalar Color Bar", |ui| {
+            ui.push_id(("scalar_bar_cfg", id_salt), |ui| {
+                ui.checkbox(&mut self.show_scalar_bar, "Show Scalar Color Bar");
+                let sb = &mut self.session.settings.scalar_bar;
+                ui.checkbox(&mut sb.horizontal, "Horizontal Orientation");
+                let mut title_buf = sb.custom_title.clone().unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Title:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut title_buf)
+                                .hint_text("auto (scalar array)")
+                                .desired_width(160.0),
+                        )
+                        .changed()
+                    {
+                        sb.custom_title = if title_buf.trim().is_empty() {
+                            None
+                        } else {
+                            Some(title_buf)
+                        };
+                    }
+                });
+                let mut labels_u32 = sb.num_labels.clamp(2, 7) as u32;
+                if ui
+                    .add(egui::Slider::new(&mut labels_u32, 2..=7).text("Labels"))
+                    .changed()
+                {
+                    sb.num_labels = labels_u32 as usize;
+                }
+                ui.add(
+                    egui::Slider::new(&mut sb.font_scale, 0.6..=2.5)
+                        .max_decimals(2)
+                        .text("Font Scale"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Reset Pos").clicked() {
+                        sb.pos = None;
+                    }
+                    if ui.button("Reset Size").clicked() {
+                        sb.size = ScalarBarConfig::default().size;
+                    }
+                });
+            });
+        });
+    }
+
+    fn draw_annotations_card(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(self.theme);
+        section_card(ui, self.theme, "Annotations", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Add Annotation").clicked() {
+                    let id = self.next_annotation_id;
+                    self.next_annotation_id += 1;
+                    let idx = self.session.settings.annotations.len() + 1;
+                    let offset_y = (0.14 + (idx.saturating_sub(1) as f32) * 0.06).min(0.85);
+                    self.session.settings.annotations.push(ViewportAnnotation {
+                        id,
+                        text: format!("Note {idx}"),
+                        pos: [0.05, offset_y],
+                        font_size: 16.0,
+                        color: [0.94, 0.96, 1.0, 1.0],
+                        visible: true,
+                    });
+                }
+                if !self.session.settings.annotations.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Drag pills in 3D view")
+                            .size(11.0)
+                            .color(pal.muted),
+                    );
+                }
+            });
+
+            if self.session.settings.annotations.is_empty() {
+                ui.weak("No viewport annotations yet.");
+                return;
+            }
+
+            let mut remove_idx: Option<usize> = None;
+            for (idx, ann) in self.session.settings.annotations.iter_mut().enumerate() {
+                ui.push_id(("ann_row", ann.id, idx), |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut ann.visible, "");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ann.text)
+                                .desired_width(140.0)
+                                .hint_text("Annotation text..."),
+                        );
+                        ui.color_edit_button_rgba_unmultiplied(&mut ann.color);
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Delete annotation")
+                            .clicked()
+                        {
+                            remove_idx = Some(idx);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut ann.font_size)
+                                .speed(0.25)
+                                .range(8.0..=48.0)
+                                .prefix("Size: "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut ann.pos[0])
+                                .speed(0.005)
+                                .range(0.0..=1.0)
+                                .max_decimals(3)
+                                .prefix("X: "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut ann.pos[1])
+                                .speed(0.005)
+                                .range(0.0..=1.0)
+                                .max_decimals(3)
+                                .prefix("Y: "),
+                        );
+                    });
+                });
+            }
+            if let Some(idx) = remove_idx {
+                self.session.settings.annotations.remove(idx);
+            }
+        });
+    }
+
+    fn draw_multiblock_patches_section(&mut self, ui: &mut egui::Ui, sel_id: NodeId, id_salt: &str) {
+        let _ = self.session.evaluate(sel_id);
+        let ds_opt = self
+            .session
+            .node(sel_id)
+            .ok()
+            .and_then(|n| n.dataset().cloned());
+        let Some(DataSet::MultiBlock(mb)) = ds_opt.as_deref() else {
+            return;
+        };
+
+        let entries = collect_multiblock_entries(mb);
+        if entries.is_empty() {
+            return;
+        }
+        let leaf_paths: Vec<String> = entries
+            .iter()
+            .filter(|e| !e.is_group)
+            .map(|e| e.key().to_string())
+            .collect();
+        let all_keys: Vec<String> = entries.iter().map(|e| e.key().to_string()).collect();
+
+        let pal = palette(self.theme);
+        let picked_fallback = self
+            .last_pick
+            .as_ref()
+            .filter(|p| NodeId(p.actor_id) == sel_id)
+            .and_then(|p| p.block_path.clone());
+        let focused_path = self
+            .selected_multiblock_patch
+            .as_ref()
+            .filter(|(nid, _)| *nid == sel_id)
+            .map(|(_, p)| p.clone())
+            .or(picked_fallback);
+
+        let Ok(node) = self.session.node_mut(sel_id) else {
+            return;
+        };
+        let prev_hidden = node.style.hidden_blocks.clone();
+        let prev_colors = node.style.block_colors.clone();
+        let style = &mut node.style;
+        let mut new_focused: Option<String> = None;
+
+        section_card(ui, self.theme, "", |ui| {
+            egui::CollapsingHeader::new(format!("MultiBlock Patches ({})", entries.len()))
+                .id_salt(("multiblock_patches_hdr", id_salt, sel_id.0))
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.small_button("All").clicked() {
+                            style.hidden_blocks.clear();
+                        }
+                        if ui.small_button("None").clicked() {
+                            let targets = if leaf_paths.is_empty() {
+                                &all_keys
+                            } else {
+                                &leaf_paths
+                            };
+                            for k in targets {
+                                style.hidden_blocks.insert(k.clone());
+                            }
+                        }
+                        if ui.small_button("Invert").clicked() {
+                            let targets: Vec<&MultiBlockEntry> = if leaf_paths.is_empty() {
+                                entries.iter().collect()
+                            } else {
+                                entries.iter().filter(|e| !e.is_group).collect()
+                            };
+                            for e in targets {
+                                let was_vis = style.is_block_visible(&e.path, &e.name);
+                                if was_vis {
+                                    style.hidden_blocks.insert(e.key().to_string());
+                                } else {
+                                    unhide_block_key(&mut style.hidden_blocks, &e.path, &e.name);
+                                }
+                            }
+                        }
+                        let can_solo = focused_path.is_some();
+                        if ui
+                            .add_enabled(can_solo, egui::Button::new("Solo").small())
+                            .on_hover_text("Show only the focused/picked block")
+                            .clicked()
+                            && let Some(ref solo_target) = focused_path
+                        {
+                            style.hidden_blocks.clear();
+                            let targets = if leaf_paths.is_empty() {
+                                &all_keys
+                            } else {
+                                &leaf_paths
+                            };
+                            let prefix = format!("{solo_target}/");
+                            for k in targets {
+                                if k != solo_target && !k.starts_with(&prefix) {
+                                    style.hidden_blocks.insert(k.clone());
+                                }
+                            }
+                        }
+                    });
+
+                    if entries.len() > 1 {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.multiblock_filter)
+                                .hint_text("Filter blocks...")
+                                .desired_width(f32::INFINITY),
+                        );
+                    }
+
+                    let needle = self.multiblock_filter.trim().to_ascii_lowercase();
+                    egui::ScrollArea::vertical()
+                        .id_salt(("multiblock_patches_scroll", id_salt, sel_id.0))
+                        .max_height(210.0)
+                        .show(ui, |ui| {
+                            for (idx, entry) in entries.iter().enumerate() {
+                                if !needle.is_empty()
+                                    && !entry.path.to_ascii_lowercase().contains(&needle)
+                                    && !entry.name.to_ascii_lowercase().contains(&needle)
+                                {
+                                    continue;
+                                }
+                                let key = entry.key().to_string();
+                                let mut visible = style.is_block_visible(&entry.path, &entry.name);
+                                let is_focused = focused_path.as_deref() == Some(key.as_str());
+                                let override_col =
+                                    style.block_color_override(&entry.path, &entry.name);
+
+                                ui.push_id(("mb_row", idx, &entry.path), |ui| {
+                                    ui.horizontal(|ui| {
+                                        if entry.depth > 0 {
+                                            ui.add_space(entry.depth as f32 * 12.0);
+                                        }
+                                        if ui.checkbox(&mut visible, "").changed() {
+                                            if visible {
+                                                unhide_block_key(
+                                                    &mut style.hidden_blocks,
+                                                    &entry.path,
+                                                    &entry.name,
+                                                );
+                                            } else {
+                                                style.hidden_blocks.insert(key.clone());
+                                            }
+                                        }
+                                        let mut col =
+                                            override_col.unwrap_or([0.82, 0.84, 0.88, 1.0]);
+                                        if ui
+                                            .color_edit_button_rgba_unmultiplied(&mut col)
+                                            .changed()
+                                        {
+                                            style.block_colors.insert(key.clone(), col);
+                                        }
+                                        if override_col.is_some()
+                                            && ui
+                                                .small_button("×")
+                                                .on_hover_text("Clear block color override")
+                                                .clicked()
+                                        {
+                                            style.block_colors.remove(&entry.path);
+                                            style.block_colors.remove(&entry.name);
+                                        }
+                                        let display_name = if entry.name.is_empty() {
+                                            "(unnamed)"
+                                        } else {
+                                            entry.name.as_str()
+                                        };
+                                        let label_resp =
+                                            ui.selectable_label(is_focused, display_name);
+                                        if label_resp.clicked() {
+                                            new_focused = Some(key.clone());
+                                        }
+                                        label_resp.on_hover_text(format!(
+                                            "{} ({} pts, {} cells)",
+                                            entry.path, entry.num_points, entry.num_cells
+                                        ));
+                                        if entry.is_group {
+                                            ui.label(
+                                                egui::RichText::new("[Group]")
+                                                    .size(10.0)
+                                                    .color(pal.muted),
+                                            );
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                });
+        });
+
+        let style_changed =
+            node.style.hidden_blocks != prev_hidden || node.style.block_colors != prev_colors;
+        if let Some(p) = new_focused {
+            self.selected_multiblock_patch = Some((sel_id, p));
+        }
+        if style_changed {
+            self.clear_stats_caches_for_node(sel_id);
+            self.invalidate_viewport();
+        }
+    }
+}
+
+struct MultiBlockEntry {
+    depth: usize,
+    name: String,
+    path: String,
+    is_group: bool,
+    num_points: usize,
+    num_cells: usize,
+}
+
+impl MultiBlockEntry {
+    fn key(&self) -> &str {
+        if self.path.is_empty() {
+            &self.name
+        } else {
+            &self.path
+        }
+    }
+}
+
+fn collect_multiblock_entries(mb: &MultiBlockDataSet) -> Vec<MultiBlockEntry> {
+    fn visit(
+        mb: &MultiBlockDataSet,
+        parent_path: &str,
+        depth: usize,
+        out: &mut Vec<MultiBlockEntry>,
+    ) {
+        for (name, child) in &mb.blocks {
+            let child_path = if parent_path.is_empty() {
+                name.clone()
+            } else if name.is_empty() {
+                parent_path.to_string()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            let is_group = matches!(child, DataSet::MultiBlock(_));
+            out.push(MultiBlockEntry {
+                depth,
+                name: name.clone(),
+                path: child_path.clone(),
+                is_group,
+                num_points: child.num_points(),
+                num_cells: child.num_cells(),
+            });
+            if let DataSet::MultiBlock(sub) = child {
+                visit(sub, &child_path, depth + 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(mb, "", 0, &mut out);
+    out
+}
+
+fn unhide_block_key(hidden: &mut BTreeSet<String>, path: &str, name: &str) {
+    if !path.is_empty() {
+        hidden.remove(path);
+        // Also clear any hidden ancestor group path so unhiding a leaf makes it visible.
+        let mut cur = path;
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            hidden.remove(parent);
+            cur = parent;
+        }
+    }
+    if !name.is_empty() {
+        hidden.remove(name);
+    }
 }
 
 pub(super) fn paint_colormap_preview(ui: &mut egui::Ui, cmap: &ColorMap, height: f32) {
