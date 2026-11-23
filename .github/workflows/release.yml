@@ -33,14 +33,17 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:bullseye
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux build & AppImage dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
             libxcursor-dev libxi-dev libxrandr-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             librsvg2-bin desktop-file-utils dpkg-dev curl file
 
