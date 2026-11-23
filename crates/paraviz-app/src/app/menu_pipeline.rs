@@ -236,24 +236,34 @@ impl ParaVizApp {
 
                 let mut chosen: Option<FilterMenuAction> = None;
 
-                ui.menu_button("Common", |ui| {
-                    let common_entries: Vec<FilterMenuEntry> = filter_menu_catalog()
-                        .into_iter()
-                        .filter(|e| e.common)
-                        .collect();
-                    if let Some(act) = draw_filter_entries_scroll(
-                        ui,
-                        "filters_common_scroll",
-                        380.0,
-                        common_entries,
-                        enabled,
-                        is_imagedata,
-                        has_visible,
-                        false,
-                    ) {
-                        chosen = Some(act);
-                    }
-                });
+                ui.menu_button(
+                    if self.workspace_profile == WorkspaceProfile::Full {
+                        "Common".to_string()
+                    } else {
+                        format!("Common ({})", self.workspace_profile.label())
+                    },
+                    |ui| {
+                        let common_entries: Vec<FilterMenuEntry> = filter_menu_catalog()
+                            .into_iter()
+                            .filter(|e| {
+                                (e.common || self.favorite_filters.contains(e.label))
+                                    && self.workspace_profile.matches_filter(e.label)
+                            })
+                            .collect();
+                        if let Some(act) = draw_filter_entries_scroll(
+                            ui,
+                            "filters_common_scroll",
+                            380.0,
+                            common_entries,
+                            enabled,
+                            is_imagedata,
+                            has_visible,
+                            false,
+                        ) {
+                            chosen = Some(act);
+                        }
+                    },
+                );
                 ui.separator();
 
                 for &cat in FILTER_CATEGORIES {
@@ -496,6 +506,61 @@ impl ParaVizApp {
     pub(super) fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         let pal = palette(self.theme);
         ui.horizontal_wrapped(|ui| {
+            // Undo / Redo + Command Palette + Workspace Profile
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo").small())
+                            .on_hover_text("Undo (Ctrl/Cmd+Z)")
+                            .clicked()
+                        {
+                            self.undo();
+                        }
+                        if ui
+                            .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo").small())
+                            .on_hover_text("Redo (Ctrl/Cmd+Shift+Z)")
+                            .clicked()
+                        {
+                            self.redo();
+                        }
+                        ui.separator();
+                        if ui
+                            .small_button("⌘K Search")
+                            .on_hover_text("Quick Command & Filter Palette (Ctrl/Cmd+K or Ctrl+Space)")
+                            .clicked()
+                        {
+                            self.command_palette_open = true;
+                            self.command_palette_query.clear();
+                            self.command_palette_index = 0;
+                            self.command_palette_focus_pending = true;
+                        }
+                        ui.separator();
+                        egui::ComboBox::from_id_salt("workspace_profile_combo")
+                            .selected_text(format!("Profile: {}", self.workspace_profile.label()))
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for &prof in WorkspaceProfile::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.workspace_profile,
+                                            prof,
+                                            prof.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.status_message =
+                                            format!("Workspace profile: {}", prof.label());
+                                    }
+                                }
+                            });
+                    });
+                });
+
             // Camera group
             egui::Frame::new()
                 .fill(pal.card_bg)
@@ -1054,6 +1119,285 @@ impl ParaVizApp {
             FilterMenuAction::Config(cfg) => self.add_filter_to_selected(cfg),
             FilterMenuAction::GpuContour => self.open_gpu_contour_modal(),
             FilterMenuAction::AppendVisible => self.append_visible_datasets(),
+        }
+    }
+
+    pub(super) fn draw_command_palette(&mut self, ctx: &egui::Context) {
+        if !self.command_palette_open {
+            return;
+        }
+        let pal = palette(self.theme);
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.command_palette_open = false;
+            return;
+        }
+
+        enum PaletteItemKind {
+            Filter(FilterMenuAction),
+            Action(&'static str),
+        }
+
+        struct PaletteItem {
+            label: &'static str,
+            category: &'static str,
+            score: i32,
+            is_fav: bool,
+            is_filter: bool,
+            enabled: bool,
+            kind: PaletteItemKind,
+        }
+
+        let has_sel = self.selected_node.is_some();
+        let is_imagedata = self
+            .selected_node
+            .and_then(|id| self.session.node(id).ok())
+            .and_then(|n| n.dataset())
+            .is_some_and(|ds| ds.as_image_data().is_some());
+        let has_visible = self.session.nodes().iter().any(|n| n.style.visible);
+
+        let query = self.command_palette_query.trim().to_ascii_lowercase();
+        let mut items: Vec<PaletteItem> = Vec::new();
+
+        for entry in filter_menu_catalog() {
+            let label_l = entry.label.to_ascii_lowercase();
+            let cat_l = entry.category.to_ascii_lowercase();
+            let match_score = if query.is_empty() {
+                10
+            } else if label_l.starts_with(&query) {
+                100
+            } else if label_l.contains(&query) {
+                60
+            } else if cat_l.contains(&query) {
+                30
+            } else {
+                continue;
+            };
+            let is_fav = self.favorite_filters.contains(entry.label);
+            let usage = self.filter_usage_counts.get(entry.label).copied().unwrap_or(0) as i32;
+            let profile_bonus = if self.workspace_profile != WorkspaceProfile::Full
+                && self.workspace_profile.matches_filter(entry.label)
+            {
+                25
+            } else {
+                0
+            };
+            let enabled = match entry.action {
+                FilterMenuAction::Config(_) => has_sel,
+                FilterMenuAction::GpuContour => is_imagedata,
+                FilterMenuAction::AppendVisible => has_visible,
+            };
+            items.push(PaletteItem {
+                label: entry.label,
+                category: entry.category,
+                score: match_score + (if is_fav { 50 } else { 0 }) + usage * 5 + profile_bonus,
+                is_fav,
+                is_filter: true,
+                enabled,
+                kind: PaletteItemKind::Filter(entry.action),
+            });
+        }
+
+        let actions: &[(&str, &str)] = &[
+            ("Reset Camera", "View"),
+            ("Focus Selected Node", "View"),
+            ("Toggle Dark / Light Theme", "View"),
+            ("Toggle Axes Gizmo", "View"),
+            ("Toggle Bounding Box", "View"),
+            ("Toggle Eye-Dome Lighting (EDL)", "View"),
+            ("Toggle 4x MSAA", "View"),
+            ("Toggle Zen Mode", "View"),
+            ("Undo Pipeline Action", "Edit"),
+            ("Redo Pipeline Action", "Edit"),
+            ("Workspace Profile: Full", "Profile"),
+            ("Workspace Profile: CFD", "Profile"),
+            ("Workspace Profile: Medical", "Profile"),
+            ("Workspace Profile: Mesh", "Profile"),
+        ];
+        for &(label, cat) in actions {
+            let label_l = label.to_ascii_lowercase();
+            let match_score = if query.is_empty() {
+                5
+            } else if label_l.starts_with(&query) {
+                95
+            } else if label_l.contains(&query) {
+                55
+            } else {
+                continue;
+            };
+            items.push(PaletteItem {
+                label,
+                category: cat,
+                score: match_score,
+                is_fav: false,
+                is_filter: false,
+                enabled: true,
+                kind: PaletteItemKind::Action(label),
+            });
+        }
+
+        items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(b.label)));
+        if !items.is_empty() {
+            self.command_palette_index = self.command_palette_index.min(items.len() - 1);
+        } else {
+            self.command_palette_index = 0;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !items.is_empty() {
+            self.command_palette_index = (self.command_palette_index + 1) % items.len();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !items.is_empty() {
+            self.command_palette_index = self
+                .command_palette_index
+                .checked_sub(1)
+                .unwrap_or(items.len() - 1);
+        }
+
+        let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut trigger_idx: Option<usize> = if enter_pressed && !items.is_empty() {
+            Some(self.command_palette_index)
+        } else {
+            None
+        };
+        let mut toggle_fav: Option<&'static str> = None;
+
+        egui::Window::new("Command Palette")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⌘K").color(pal.accent).strong());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.command_palette_query)
+                            .hint_text("Type a filter or action (Up/Down, Enter, Esc)...")
+                            .desired_width(400.0),
+                    );
+                    if self.command_palette_focus_pending {
+                        resp.request_focus();
+                        self.command_palette_focus_pending = false;
+                    }
+                    if resp.changed() {
+                        self.command_palette_index = 0;
+                    }
+                    if ui.small_button("×").clicked() {
+                        self.command_palette_open = false;
+                    }
+                });
+                ui.separator();
+
+                if items.is_empty() {
+                    ui.weak("No matching filters or actions.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for (idx, item) in items.iter().enumerate() {
+                                let is_sel = idx == self.command_palette_index;
+                                ui.horizontal(|ui| {
+                                    if item.is_filter {
+                                        let star = if item.is_fav { "★" } else { "☆" };
+                                        if ui
+                                            .small_button(star)
+                                            .on_hover_text("Pin/unpin favorite filter")
+                                            .clicked()
+                                        {
+                                            toggle_fav = Some(item.label);
+                                        }
+                                    } else {
+                                        ui.label("  ");
+                                    }
+                                    let text = egui::RichText::new(item.label).color(if item.enabled {
+                                        ui.visuals().text_color()
+                                    } else {
+                                        pal.muted
+                                    });
+                                    let btn = ui.selectable_label(is_sel, text);
+                                    if btn.clicked() && item.enabled {
+                                        trigger_idx = Some(idx);
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(item.category)
+                                                    .small()
+                                                    .color(pal.muted),
+                                            );
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                }
+            });
+
+        if let Some(fav) = toggle_fav {
+            let key = fav.to_string();
+            if !self.favorite_filters.remove(&key) {
+                self.favorite_filters.insert(key);
+            }
+        }
+
+        if let Some(idx) = trigger_idx {
+            let item = items.swap_remove(idx);
+            if item.enabled {
+                self.command_palette_open = false;
+                match item.kind {
+                    PaletteItemKind::Filter(act) => {
+                        *self.filter_usage_counts.entry(item.label.to_string()).or_insert(0) += 1;
+                        self.dispatch_filter_menu_action(act);
+                    }
+                    PaletteItemKind::Action(name) => match name {
+                        "Reset Camera" => self.reset_active_pane_camera(),
+                        "Focus Selected Node" => self.focus_selected_node(),
+                        "Toggle Dark / Light Theme" => {
+                            self.theme = match self.theme {
+                                UiTheme::DarkStudio => UiTheme::LightStudio,
+                                UiTheme::LightStudio => UiTheme::DarkStudio,
+                            };
+                            self.theme_applied = false;
+                        }
+                        "Toggle Axes Gizmo" => {
+                            self.session.settings.show_axes_gizmo =
+                                !self.session.settings.show_axes_gizmo;
+                            self.invalidate_viewport();
+                        }
+                        "Toggle Bounding Box" => {
+                            self.session.settings.show_bounding_box =
+                                !self.session.settings.show_bounding_box;
+                            self.invalidate_viewport();
+                        }
+                        "Toggle Eye-Dome Lighting (EDL)" => {
+                            self.session.settings.edl_enabled = !self.session.settings.edl_enabled;
+                            self.invalidate_viewport();
+                        }
+                        "Toggle 4x MSAA" => {
+                            self.session.settings.msaa_samples =
+                                if self.session.settings.msaa_samples >= 4 {
+                                    1
+                                } else {
+                                    4
+                                };
+                            self.invalidate_viewport();
+                        }
+                        "Toggle Zen Mode" => {
+                            self.zen_mode = !self.zen_mode;
+                        }
+                        "Undo Pipeline Action" => self.undo(),
+                        "Redo Pipeline Action" => self.redo(),
+                        "Workspace Profile: Full" => self.workspace_profile = WorkspaceProfile::Full,
+                        "Workspace Profile: CFD" => self.workspace_profile = WorkspaceProfile::Cfd,
+                        "Workspace Profile: Medical" => {
+                            self.workspace_profile = WorkspaceProfile::Medical
+                        }
+                        "Workspace Profile: Mesh" => self.workspace_profile = WorkspaceProfile::Mesh,
+                        _ => {}
+                    },
+                }
+            }
         }
     }
 }

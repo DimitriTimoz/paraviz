@@ -123,6 +123,76 @@ impl ViewportLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WorkspaceProfile {
+    #[default]
+    Full,
+    Cfd,
+    Medical,
+    Mesh,
+}
+
+impl WorkspaceProfile {
+    pub(crate) const ALL: &'static [Self] = &[Self::Full, Self::Cfd, Self::Medical, Self::Mesh];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Cfd => "CFD",
+            Self::Medical => "Medical",
+            Self::Mesh => "Mesh",
+        }
+    }
+
+    pub(crate) fn matches_filter(self, filter_label: &str) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Cfd => matches!(
+                filter_label,
+                "Slice"
+                    | "Clip"
+                    | "Threshold"
+                    | "Contour (Iso)"
+                    | "Stream Tracer"
+                    | "Warp by Vector"
+                    | "Glyph (Arrows / Spheres)"
+                    | "Calculator"
+                    | "Gradient"
+                    | "Vorticity / Q-Criterion"
+                    | "Plot Over Line"
+                    | "Probe Location"
+                    | "Integrate Variables"
+                    | "Cell Data to Point Data"
+                    | "Point Data to Cell Data"
+            ),
+            Self::Medical => matches!(
+                filter_label,
+                "Slice"
+                    | "Clip"
+                    | "Threshold"
+                    | "Contour (Iso)"
+                    | "GPU Marching Cubes (ImageData)"
+                    | "Extract Subset (VOI)"
+                    | "Resample to Image"
+                    | "Histogram"
+            ),
+            Self::Mesh => matches!(
+                filter_label,
+                "Smooth Mesh"
+                    | "Decimate"
+                    | "Subdivide"
+                    | "Compute Normals"
+                    | "Extract Surface"
+                    | "Transform"
+                    | "Triangulate"
+                    | "Connectivity"
+                    | "Clip"
+                    | "Slice"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PaneKind {
     #[default]
     View3D,
@@ -269,6 +339,16 @@ pub struct ParaVizApp {
     renaming_node: Option<(NodeId, String)>,
     copied_filter: Option<(String, FilterConfig)>,
     copied_filter_chain: Vec<(String, FilterConfig)>,
+    undo_stack: Vec<String>,
+    redo_stack: Vec<String>,
+    last_undo_snapshot_at: Option<Instant>,
+    workspace_profile: WorkspaceProfile,
+    command_palette_open: bool,
+    command_palette_query: String,
+    command_palette_index: usize,
+    command_palette_focus_pending: bool,
+    filter_usage_counts: HashMap<String, usize>,
+    favorite_filters: BTreeSet<String>,
     auto_apply: bool,
     pending_source: Option<(NodeId, SourceConfig)>,
     pending_filter: Option<(NodeId, FilterConfig)>,
@@ -379,6 +459,16 @@ impl ParaVizApp {
             renaming_node: None,
             copied_filter: None,
             copied_filter_chain: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_undo_snapshot_at: None,
+            workspace_profile: WorkspaceProfile::Full,
+            command_palette_open: false,
+            command_palette_query: String::new(),
+            command_palette_index: 0,
+            command_palette_focus_pending: false,
+            filter_usage_counts: HashMap::new(),
+            favorite_filters: BTreeSet::new(),
             auto_apply: true,
             pending_source: None,
             pending_filter: None,
@@ -1006,6 +1096,7 @@ impl ParaVizApp {
             self.error_message = Some("Select a pipeline node first to apply a filter.".into());
             return;
         };
+        self.push_undo_snapshot();
 
         if let Ok(ds) = self.session.evaluate(parent_id) {
             let bb = ds.bounds();
@@ -1172,6 +1263,7 @@ impl ParaVizApp {
     }
 
     pub(super) fn apply_filter_update(&mut self, id: NodeId, cfg: FilterConfig) {
+        self.push_undo_snapshot_throttled();
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.cancel_active_job(false);
@@ -2036,7 +2128,32 @@ impl ParaVizApp {
             self.load_path(&path);
         }
 
-        if !ctx.egui_wants_keyboard_input() && self.modal.is_none() && self.renaming_node.is_none() {
+        if ctx.input(|i| {
+            (i.modifiers.command && i.key_pressed(egui::Key::K))
+                || (i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Space))
+        }) && self.modal.is_none()
+            && self.renaming_node.is_none()
+        {
+            self.command_palette_open = !self.command_palette_open;
+            if self.command_palette_open {
+                self.command_palette_query.clear();
+                self.command_palette_index = 0;
+                self.command_palette_focus_pending = true;
+            }
+        }
+
+        if !ctx.egui_wants_keyboard_input()
+            && self.modal.is_none()
+            && self.renaming_node.is_none()
+            && !self.command_palette_open
+        {
+            if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Z))
+                || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y))
+            {
+                self.redo();
+            } else if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+                self.undo();
+            }
             if ctx.input(|i| i.key_pressed(egui::Key::R)) {
                 self.reset_active_pane_camera();
             }
@@ -2110,6 +2227,80 @@ impl ParaVizApp {
         }
     }
 
+
+    pub(super) fn push_undo_snapshot(&mut self) {
+        self.last_undo_snapshot_at = Some(Instant::now());
+        if let Ok(json) = self.session.save_state_json() {
+            if self.undo_stack.last().is_some_and(|last| last == &json) {
+                return;
+            }
+            self.undo_stack.push(json);
+            if self.undo_stack.len() > 40 {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+        }
+    }
+
+    pub(super) fn push_undo_snapshot_throttled(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_undo_snapshot_at {
+            if now.duration_since(prev) < Duration::from_millis(450) {
+                return;
+            }
+        }
+        self.push_undo_snapshot();
+    }
+
+    fn restore_undo_state(&mut self, json: &str, status: &str) -> bool {
+        match ParaViz::load_state_json(json) {
+            Ok(restored) => {
+                self.session = restored;
+                self.pending_source = None;
+                self.pending_filter = None;
+                self.renaming_node = None;
+                self.picked_highlight = None;
+                self.last_pick = None;
+                if let Some(sel) = self.selected_node {
+                    if self.session.node(sel).is_err() {
+                        self.selected_node = self.session.nodes().last().map(|n| n.id);
+                    }
+                } else {
+                    self.selected_node = self.session.nodes().last().map(|n| n.id);
+                }
+                self.clear_stats_caches();
+                self.invalidate_viewport();
+                self.status_message = status.into();
+                true
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Undo/Redo failed: {e}"));
+                false
+            }
+        }
+    }
+
+    pub(super) fn undo(&mut self) {
+        let Some(prev_json) = self.undo_stack.pop() else {
+            self.status_message = "Nothing to undo".into();
+            return;
+        };
+        if let Ok(cur_json) = self.session.save_state_json() {
+            self.redo_stack.push(cur_json);
+        }
+        self.restore_undo_state(&prev_json, "Undid last pipeline action");
+    }
+
+    pub(super) fn redo(&mut self) {
+        let Some(next_json) = self.redo_stack.pop() else {
+            self.status_message = "Nothing to redo".into();
+            return;
+        };
+        if let Ok(cur_json) = self.session.save_state_json() {
+            self.undo_stack.push(cur_json);
+        }
+        self.restore_undo_state(&next_json, "Redid pipeline action");
+    }
 
     fn handle_modals(&mut self, ctx: &egui::Context) {
         let vp_size = self.active_viewport_tex_size();
@@ -2505,6 +2696,7 @@ impl eframe::App for ParaVizApp {
         });
 
         self.handle_modals(ui.ctx());
+        self.draw_command_palette(ui.ctx());
 
         #[cfg(not(target_arch = "wasm32"))]
         self.draw_update_modal(ui.ctx());

@@ -58,9 +58,13 @@ USAGE:
 
 SUPPORTED INPUT FORMATS:
     VTK Legacy (.vtk), VTK XML (.vtp, .vti, .vtu, .vtr, .vts, .vtm, .pvd, .pvtp, .pvtu, .pvti),
-    VTKHDF (.vtkhdf), CGNS (.cgns), Exodus II (.exo, .e, .ex2), XDMF (.xdmf, .xmf),
-    EnSight Gold (.case), OpenFOAM (.foam), NIfTI (.nii, .nii.gz), NRRD (.nrrd, .nhdr),
-    MetaImage (.mhd, .mha), Raw Volume (.raw), Mesh (.stl, .obj, .ply), CSV/TSV (.csv, .tsv)
+    ParaView File Series (.series), VTKHDF (.vtkhdf), CGNS (.cgns), Exodus II (.exo, .e, .ex2),
+    YALES2 HDF5 (.h5), XDMF (.xdmf, .xmf), EnSight Gold (.case), OpenFOAM (.foam), Gmsh (.msh),
+    PLOT3D (.xyz, .p3d), Tecplot ASCII (.dat, .tec, .plt), Abaqus (.inp), NetCDF CF (.nc, .cdf),
+    NIfTI (.nii, .nii.gz), NRRD (.nrrd, .nhdr), MetaImage (.mhd, .mha), DICOM (.dcm),
+    Raw Volume (.raw), 2D Images (.png, .bmp, .ppm, .pgm, .pbm),
+    Mesh (.stl, .obj, .ply, .off, .gltf, .glb, .x3d), LiDAR (.las),
+    Molecular (.xyz, .pdb, .ent), CSV/TSV (.csv, .tsv)
 
 RENDER OPTIONS:
     -o, --output <path>       Output PNG or animated GIF path (required for demo/render)

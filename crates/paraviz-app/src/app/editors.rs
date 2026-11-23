@@ -600,8 +600,40 @@ pub(super) fn edit_filter_config(
                         .changed();
                 }
                 ImplicitFunction::Box { min, max } => {
-                    changed |= drag_vec3(ui, "Min", min, 0.05);
-                    changed |= drag_vec3(ui, "Max", max, 0.05);
+                    let mode_id = ui.scope_id().with("clip_box_center_mode");
+                    let mut center_mode = ui.data(|d| d.get_temp::<bool>(mode_id).unwrap_or(false));
+                    ui.horizontal(|ui| {
+                        ui.label("Box Input:");
+                        ui.selectable_value(&mut center_mode, false, "Min / Max");
+                        ui.selectable_value(&mut center_mode, true, "Center / Size");
+                    });
+                    ui.data_mut(|d| d.insert_temp(mode_id, center_mode));
+
+                    if center_mode {
+                        let mut center = [
+                            (min[0] + max[0]) * 0.5,
+                            (min[1] + max[1]) * 0.5,
+                            (min[2] + max[2]) * 0.5,
+                        ];
+                        let mut size = [
+                            (max[0] - min[0]).abs(),
+                            (max[1] - min[1]).abs(),
+                            (max[2] - min[2]).abs(),
+                        ];
+                        let c_chg = drag_vec3(ui, "Center", &mut center, 0.05);
+                        let s_chg = drag_vec3(ui, "Size", &mut size, 0.05);
+                        if c_chg || s_chg {
+                            for k in 0..3 {
+                                let half = size[k].abs() * 0.5;
+                                min[k] = center[k] - half;
+                                max[k] = center[k] + half;
+                            }
+                            changed = true;
+                        }
+                    } else {
+                        changed |= drag_vec3(ui, "Min", min, 0.05);
+                        changed |= drag_vec3(ui, "Max", max, 0.05);
+                    }
                     if let Some(ds) = parent_ds {
                         let bb = ds.bounds();
                         if bb.is_valid() && ui.small_button("Fit Parent Bounds").clicked() {

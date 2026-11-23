@@ -206,6 +206,29 @@ pub fn is_supported_open_file(path: &Path) -> bool {
             | "stl"
             | "obj"
             | "ply"
+            | "off"
+            | "gltf"
+            | "glb"
+            | "x3d"
+            | "las"
+            | "xyz"
+            | "pdb"
+            | "ent"
+            | "msh"
+            | "p3d"
+            | "tec"
+            | "plt"
+            | "dat"
+            | "inp"
+            | "nc"
+            | "cdf"
+            | "series"
+            | "dcm"
+            | "png"
+            | "bmp"
+            | "ppm"
+            | "pgm"
+            | "pbm"
             | "csv"
             | "tsv"
             | "json"
@@ -874,6 +897,8 @@ pub fn draw_modal(
                                 ("T", "Toggle Turntable spin"),
                                 ("Tab", "Toggle Left Inspector Dock"),
                                 ("Space", "Play / Pause time steps"),
+                                ("Ctrl/Cmd + K / Ctrl+Space", "Open Quick Command & Filter Palette"),
+                                ("Ctrl/Cmd + Z / Shift+Z", "Undo / Redo pipeline action"),
                                 ("Ctrl/Cmd + C / V", "Copy / Paste filter in Pipeline"),
                                 ("Delete / Backspace", "Remove selected pipeline node"),
                                 ("F1 / ?", "Open this shortcuts guide"),
@@ -1173,9 +1198,11 @@ pub fn native_pick_scientific_file(start_dir: Option<&Path>) -> Option<PathBuf> 
             "Scientific Datasets",
             &[
                 "vtp", "vtu", "vti", "vtr", "vts", "vtk", "pvtp", "pvtu", "pvti", "pvtr", "pvts",
-                "pvd", "vtkhdf", "cgns", "exo", "e", "ex2", "h5", "hdf", "hdf5", "stl", "obj",
-                "ply", "csv", "nii", "gz", "mhd", "mha", "nrrd", "nhdr", "case", "xdmf", "xmf",
-                "raw", "bin", "vol", "foam", "json",
+                "pvd", "series", "vtkhdf", "cgns", "exo", "e", "ex2", "h5", "hdf", "hdf5", "stl",
+                "obj", "ply", "off", "gltf", "glb", "x3d", "las", "xyz", "pdb", "ent", "msh",
+                "p3d", "tec", "plt", "dat", "inp", "nc", "cdf", "csv", "tsv", "nii", "gz", "mhd",
+                "mha", "nrrd", "nhdr", "dcm", "png", "bmp", "ppm", "pgm", "pbm", "case", "xdmf",
+                "xmf", "raw", "bin", "vol", "foam", "json",
             ],
         )
         .add_filter("All Files", &["*"]);
