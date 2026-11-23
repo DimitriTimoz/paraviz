@@ -4,11 +4,13 @@ use paraviz_core::{
     PipelineGraph, PolyData, RectilinearGrid, StructuredGrid, UnstructuredGrid,
 };
 use paraviz_filters::{
-    extract_surface, CalculatorFilter, CellDataToPointDataFilter, ClipFilter, ContourFilter,
-    ExtractSurface, GlyphFilter, GlyphShape, GradientFilter, ImplicitFunction,
-    IntegrationDirection, Integrator, PointDataToCellDataFilter, ProbeOverLineFilter, ScaleMode,
-    SeedSource, SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter, ThresholdFilter,
-    TransformFilter, TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
+    append_datasets, compute_histogram, extract_surface, AppendDatasetsFilter, CalculatorFilter,
+    CellCentersFilter, CellDataToPointDataFilter, ClipFilter, ConnectivityFilter, ContourFilter,
+    ElevationFilter, ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter,
+    GlyphShape, GradientFilter, ImplicitFunction, IntegrationDirection, Integrator,
+    PointDataToCellDataFilter, ProbeOverLineFilter, ReflectFilter, ReflectPlane, ScaleMode,
+    SeedSource, ShrinkFilter, SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter,
+    ThresholdFilter, TransformFilter, TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
 };
 use paraviz_sources::{LineSource, PlaneSource, SphereSource, VectorFieldSource, WaveletSource};
 use std::collections::HashMap;
@@ -786,4 +788,484 @@ fn test_pipeline_graph_integration() {
     let pd = out.as_poly_data().unwrap();
     assert!(!pd.polys.is_empty());
     assert!(pd.bounds().min.x >= 1.0 - 1e-3);
+}
+
+fn make_unit_cube_polydata() -> PolyData {
+    let points = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0],
+    ];
+    let polys = vec![
+        vec![0, 3, 2, 1], // -Z
+        vec![4, 5, 6, 7], // +Z
+        vec![0, 1, 5, 4], // -Y
+        vec![1, 2, 6, 5], // +X
+        vec![2, 3, 7, 6], // +Y
+        vec![3, 0, 4, 7], // -X
+    ];
+    PolyData {
+        points,
+        polys,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_feature_edges_filter() {
+    // 1. Open planar grid (10x10 quads by default) -> 40 boundary edges, 0 feature/non-manifold edges
+    let plane = PlaneSource::default().build();
+    let mut fe_boundary = FeatureEdgesFilter::new();
+    fe_boundary.feature_edges = false;
+    fe_boundary.non_manifold_edges = false;
+    let out_b = fe_boundary.apply(&DataSet::PolyData(plane)).unwrap();
+    let pd_b = out_b.as_poly_data().unwrap();
+    assert_eq!(pd_b.lines.len(), 40);
+
+    // 2. Closed 3D ImageData box -> surface extracted -> 12 sharp 90° edges, 0 boundary
+    let box_img = ImageData::new([2, 2, 2], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let fe_all = FeatureEdgesFilter::new();
+    let out_box = fe_all.apply(&DataSet::ImageData(box_img)).unwrap();
+    let pd_box = out_box.as_poly_data().unwrap();
+    assert_eq!(pd_box.lines.len(), 12);
+
+    // Raising threshold above 90° yields 0 edges on closed cube
+    let mut fe_high = FeatureEdgesFilter::new();
+    fe_high.feature_angle_deg = 100.0;
+    let out_none = fe_high
+        .apply(&DataSet::PolyData(make_unit_cube_polydata()))
+        .unwrap();
+    assert_eq!(out_none.as_poly_data().unwrap().lines.len(), 0);
+
+    // 3. Non-manifold edge shared by 3 triangles
+    let nm = PolyData::from_triangles(
+        vec![
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.5, 0.0],
+            [-1.0, 0.5, 0.0],
+            [0.0, 0.5, 1.0],
+        ],
+        vec![[0, 1, 2], [0, 1, 3], [0, 1, 4]],
+    );
+    let fe_nm = FeatureEdgesFilter {
+        boundary_edges: false,
+        feature_edges: false,
+        non_manifold_edges: true,
+        feature_angle_deg: 30.0,
+    };
+    let out_nm = fe_nm.apply(&DataSet::PolyData(nm)).unwrap();
+    let pd_nm = out_nm.as_poly_data().unwrap();
+    assert_eq!(pd_nm.lines.len(), 1);
+    assert_eq!(pd_nm.num_points(), 2);
+}
+
+#[test]
+fn test_connectivity_filter() {
+    // PolyData with 2 disconnected components: component A (1 tri), component B (2 connected tris)
+    let mut pd = PolyData::from_triangles(
+        vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            // component B
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+            [11.0, 1.0, 0.0],
+            [10.0, 1.0, 0.0],
+        ],
+        vec![[0, 1, 2], [3, 4, 5], [3, 5, 6]],
+    );
+    pd.cell_data
+        .add_array(DataArray::scalars_f32("cid", vec![10.0, 20.0, 30.0]));
+
+    let labeled = ConnectivityFilter::new(false)
+        .apply(&DataSet::PolyData(pd.clone()))
+        .unwrap();
+    let lpd = labeled.as_poly_data().unwrap();
+    let pt_reg = lpd.point_data.get("RegionId").unwrap();
+    let cell_reg = lpd.cell_data.get("RegionId").unwrap();
+    assert_eq!(pt_reg.get_scalar(0), pt_reg.get_scalar(2));
+    assert_ne!(pt_reg.get_scalar(0), pt_reg.get_scalar(3));
+    assert_eq!(cell_reg.get_scalar(1), cell_reg.get_scalar(2));
+    assert_ne!(cell_reg.get_scalar(0), cell_reg.get_scalar(1));
+
+    let largest = ConnectivityFilter::new(true)
+        .apply(&DataSet::PolyData(pd))
+        .unwrap();
+    let lrg_pd = largest.as_poly_data().unwrap();
+    assert_eq!(lrg_pd.polys.len(), 2);
+    assert_eq!(lrg_pd.num_points(), 4);
+    let cid = lrg_pd.cell_data.get("cid").unwrap();
+    assert_eq!(cid.num_tuples(), 2);
+    assert!((cid.get_scalar(0) - 20.0).abs() < 1e-6);
+    assert!((cid.get_scalar(1) - 30.0).abs() < 1e-6);
+
+    // UnstructuredGrid with 2 disconnected components: 1 tet vs 2 tets
+    let mut ug = UnstructuredGrid::new();
+    ug.points = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [5.0, 0.0, 0.0],
+        [6.0, 0.0, 0.0],
+        [5.0, 1.0, 0.0],
+        [5.0, 0.0, 1.0],
+        [5.0, 0.0, -1.0],
+    ];
+    ug.push_cell(CellType::Tetra, &[0, 1, 2, 3]);
+    ug.push_cell(CellType::Tetra, &[4, 5, 6, 7]);
+    ug.push_cell(CellType::Tetra, &[4, 6, 5, 8]);
+
+    let ug_labeled = ConnectivityFilter::new(false)
+        .apply(&DataSet::UnstructuredGrid(ug.clone()))
+        .unwrap();
+    let ug_c = ug_labeled.cell_data().unwrap().get("RegionId").unwrap();
+    assert_ne!(ug_c.get_scalar(0), ug_c.get_scalar(1));
+    assert_eq!(ug_c.get_scalar(1), ug_c.get_scalar(2));
+
+    let ug_largest = ConnectivityFilter::new(true)
+        .apply(&DataSet::UnstructuredGrid(ug))
+        .unwrap();
+    assert_eq!(ug_largest.num_cells(), 2);
+    assert_eq!(ug_largest.num_points(), 5);
+}
+
+#[test]
+fn test_shrink_filter() {
+    // 2 triangles sharing edge (1)-(2) -> 4 shared points become 6 unshared points
+    let mut pd = PolyData::from_triangles(
+        vec![
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [3.0, 3.0, 0.0],
+        ],
+        vec![[0, 1, 2], [1, 3, 2]],
+    );
+    pd.point_data
+        .set_scalars(DataArray::scalars_f32("pt_val", vec![1.0, 2.0, 3.0, 4.0]));
+    pd.cell_data
+        .set_scalars(DataArray::scalars_f32("cell_val", vec![10.0, 20.0]));
+
+    let shrunk = ShrinkFilter::new(0.5)
+        .apply(&DataSet::PolyData(pd))
+        .unwrap();
+    let spd = shrunk.as_poly_data().unwrap();
+    assert_eq!(spd.num_points(), 6);
+    assert_eq!(spd.polys.len(), 2);
+    // Triangle 0 centroid = (1.0, 1.0, 0.0); vertex 0 (0,0,0) -> (0.5, 0.5, 0.0)
+    assert!((Vec3::from_array(spd.points[0]) - Vec3::new(0.5, 0.5, 0.0)).length() < 1e-5);
+    assert!((spd.cell_data.get("cell_val").unwrap().get_scalar(1) - 20.0).abs() < 1e-6);
+    assert!((spd.point_data.get("pt_val").unwrap().get_scalar(4) - 4.0).abs() < 1e-6);
+
+    // UnstructuredGrid shrink_factor = 0.0 collapses each cell's vertices to its centroid
+    let mut ug = UnstructuredGrid::new();
+    ug.points = vec![
+        [0.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0],
+        [0.0, 4.0, 0.0],
+        [0.0, 0.0, 4.0],
+    ];
+    ug.push_cell(CellType::Tetra, &[0, 1, 2, 3]);
+    ug.cell_data
+        .set_scalars(DataArray::scalars_f32("cid", vec![99.0]));
+    let ug_shrunk = ShrinkFilter::new(0.0)
+        .apply(&DataSet::UnstructuredGrid(ug))
+        .unwrap();
+    let sug = ug_shrunk.as_unstructured_grid().unwrap();
+    assert_eq!(sug.num_points(), 4);
+    for &p in &sug.points {
+        assert!((Vec3::from_array(p) - Vec3::splat(1.0)).length() < 1e-5);
+    }
+    assert!((sug.cell_data.get("cid").unwrap().get_scalar(0) - 99.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_cell_centers_filter() {
+    let mut pd = PolyData::from_triangles(
+        vec![
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [3.0, 3.0, 0.0],
+        ],
+        vec![[0, 1, 2], [1, 3, 2]],
+    );
+    pd.cell_data
+        .set_scalars(DataArray::scalars_f32("area_id", vec![1.0, 2.0]));
+
+    let centers_no_verts = CellCentersFilter::new(false)
+        .apply(&DataSet::PolyData(pd.clone()))
+        .unwrap();
+    let c0 = centers_no_verts.as_poly_data().unwrap();
+    assert_eq!(c0.num_points(), 2);
+    assert!(c0.verts.is_empty());
+    assert!((Vec3::from_array(c0.points[0]) - Vec3::new(1.0, 1.0, 0.0)).length() < 1e-5);
+    assert!((Vec3::from_array(c0.points[1]) - Vec3::new(2.0, 2.0, 0.0)).length() < 1e-5);
+    let pt_arr = c0.point_data.get("area_id").unwrap();
+    assert_eq!(pt_arr.num_tuples(), 2);
+    assert!((pt_arr.get_scalar(1) - 2.0).abs() < 1e-6);
+
+    let mut img = ImageData::new([3, 3, 2], [0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    img.cell_data
+        .set_scalars(DataArray::scalars_f32("cell_s", vec![5.0; img.num_cells()]));
+    let img_centers = CellCentersFilter::new(true)
+        .apply(&DataSet::ImageData(img))
+        .unwrap();
+    let c1 = img_centers.as_poly_data().unwrap();
+    assert_eq!(c1.num_points(), 4);
+    assert_eq!(c1.verts.len(), 4);
+    assert!((Vec3::from_array(c1.points[0]) - Vec3::new(1.0, 1.0, 1.0)).length() < 1e-5);
+    assert!((c1.point_data.get("cell_s").unwrap().get_scalar(0) - 5.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_reflect_filter() {
+    let mut pd = PolyData::from_triangles(
+        vec![[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    pd.point_data
+        .set_normals(DataArray::vectors_f32("Normals", vec![[0.0, 0.0, 1.0]; 3]));
+    pd.point_data
+        .set_vectors(DataArray::vectors_f32("Vel", vec![[1.0, 2.0, 3.0]; 3]));
+
+    // Reflect across XMin (x = 1.0) without copy_input
+    let ref_x = ReflectFilter::new(ReflectPlane::XMin, false)
+        .apply(&DataSet::PolyData(pd.clone()))
+        .unwrap();
+    let rpd = ref_x.as_poly_data().unwrap();
+    assert_eq!(rpd.num_points(), 3);
+    // Point (2, 0, 0) mirrors across x=1 to (0, 0, 0)
+    assert!((Vec3::from_array(rpd.points[1]) - Vec3::new(0.0, 0.0, 0.0)).length() < 1e-5);
+    // Winding flipped so geometric normal stays +Z
+    let tri = &rpd.polys[0];
+    let p0 = Vec3::from_array(rpd.points[tri[0] as usize]);
+    let p1 = Vec3::from_array(rpd.points[tri[1] as usize]);
+    let p2 = Vec3::from_array(rpd.points[tri[2] as usize]);
+    let geom_n = (p1 - p0).cross(p2 - p0).normalize();
+    assert!((geom_n - Vec3::Z).length() < 1e-5);
+    // Vector X component negated
+    let v = rpd.point_data.get("Vel").unwrap().get_vec3(0);
+    assert!((Vec3::from_array(v) - Vec3::new(-1.0, 2.0, 3.0)).length() < 1e-5);
+
+    // Reflect across ZMax with copy_input = true -> 6 points, 2 tris, normal negated on mirrored copy
+    let ref_z = ReflectFilter::new(ReflectPlane::ZMax, true)
+        .apply(&DataSet::PolyData(pd))
+        .unwrap();
+    let rpd_z = ref_z.as_poly_data().unwrap();
+    assert_eq!(rpd_z.num_points(), 6);
+    assert_eq!(rpd_z.polys.len(), 2);
+    let n_orig = rpd_z.point_data.get("Normals").unwrap().get_vec3(0);
+    let n_mirr = rpd_z.point_data.get("Normals").unwrap().get_vec3(3);
+    assert!((n_orig[2] - 1.0).abs() < 1e-5);
+    assert!((n_mirr[2] + 1.0).abs() < 1e-5);
+
+    // UnstructuredGrid reflection across CenterX with copy_input = true
+    let mut ug = UnstructuredGrid::new();
+    ug.points = vec![
+        [1.0, 0.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0],
+    ];
+    ug.push_cell(CellType::Tetra, &[0, 1, 2, 3]);
+    let ug_ref = ReflectFilter::new(ReflectPlane::CenterX, true)
+        .apply(&DataSet::UnstructuredGrid(ug))
+        .unwrap();
+    assert_eq!(ug_ref.num_points(), 8);
+    assert_eq!(ug_ref.num_cells(), 2);
+}
+
+#[test]
+fn test_generate_normals_filter() {
+    // Cube with 8 corners & 6 quads -> splitting at 30 deg produces 24 vertices with exact face normals
+    let cube = make_unit_cube_polydata();
+    let split_out = GenerateNormalsFilter::new()
+        .apply(&DataSet::PolyData(cube.clone()))
+        .unwrap();
+    let spd = split_out.as_poly_data().unwrap();
+    assert_eq!(spd.num_points(), 24);
+    let normals = spd.point_data.active_normals_array().unwrap();
+    // Every vertex normal on a split cube must be axis-aligned (one component == ±1, others 0)
+    for i in 0..spd.num_points() {
+        let n = Vec3::from_array(normals.get_vec3(i));
+        assert!((n.length() - 1.0).abs() < 1e-5);
+        let max_comp = n.x.abs().max(n.y.abs()).max(n.z.abs());
+        assert!((max_comp - 1.0).abs() < 1e-4);
+    }
+
+    // Without splitting -> 8 vertices remain
+    let mut no_split = GenerateNormalsFilter::new();
+    no_split.splitting = false;
+    let unsplit_out = no_split.apply(&DataSet::PolyData(cube.clone())).unwrap();
+    assert_eq!(unsplit_out.as_poly_data().unwrap().num_points(), 8);
+
+    // Consistency fixes inconsistent winding between adjacent triangles
+    let mixed = PolyData::from_triangles(
+        vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        vec![[0, 1, 2], [0, 3, 2]], // 2nd triangle is CW while 1st is CCW
+    );
+    let consistent = GenerateNormalsFilter::new()
+        .apply(&DataSet::PolyData(mixed))
+        .unwrap();
+    let cpd = consistent.as_poly_data().unwrap();
+    let cn = cpd.point_data.active_normals_array().unwrap();
+    for i in 0..cpd.num_points() {
+        let n = cn.get_vec3(i);
+        assert!((n[2] - 1.0).abs() < 1e-5, "expected +Z normal, got {n:?}");
+    }
+
+    // flip_normals reverses normals
+    let mut flipped = GenerateNormalsFilter::new();
+    flipped.flip_normals = true;
+    let fpd = flipped
+        .apply(&DataSet::PolyData(PolyData::from_triangles(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0, 1, 2]],
+        )))
+        .unwrap();
+    let fn_arr = fpd
+        .as_poly_data()
+        .unwrap()
+        .point_data
+        .active_normals_array()
+        .unwrap();
+    assert!((fn_arr.get_vec3(0)[2] + 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_elevation_filter() {
+    let pd = PolyData::from_triangles(
+        vec![
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+        ],
+        vec![[0, 1, 2]],
+    );
+    let mut elev = ElevationFilter::new([0.0, 0.0, 0.0], [4.0, 0.0, 0.0]);
+    elev.scalar_name = "Height".into();
+    let out = elev.apply(&DataSet::PolyData(pd)).unwrap();
+    let arr = out.point_data().unwrap().get("Height").unwrap();
+    assert!((arr.get_scalar(0) - 0.0).abs() < 1e-6);
+    assert!((arr.get_scalar(1) - 0.5).abs() < 1e-6);
+    assert!((arr.get_scalar(2) - 1.0).abs() < 1e-6);
+    assert!((arr.get_scalar(3) - 0.0).abs() < 1e-6); // clamped below
+    assert!((arr.get_scalar(4) - 1.0).abs() < 1e-6); // clamped above
+
+    // Degenerate low == high returns error
+    let bad = ElevationFilter::new([1.0, 1.0, 1.0], [1.0, 1.0, 1.0]);
+    assert!(bad.apply(&out).is_err());
+}
+
+#[test]
+fn test_append_datasets_filter() {
+    // 1. Two PolyData meshes with common & uncommon arrays, including verts + polys
+    let mut pd1 = PolyData::from_triangles(
+        vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    pd1.verts = vec![0];
+    pd1.point_data
+        .set_scalars(DataArray::scalars_f32("temp", vec![1.0, 2.0, 3.0]));
+    pd1.point_data
+        .add_array(DataArray::scalars_f32("only_in_1", vec![9.0, 9.0, 9.0]));
+    pd1.cell_data
+        .set_scalars(DataArray::scalars_f32("cid", vec![10.0, 20.0]));
+
+    let mut pd2 = PolyData::from_triangles(
+        vec![[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    pd2.verts = vec![1];
+    pd2.point_data
+        .set_scalars(DataArray::scalars_f32("temp", vec![4.0, 5.0, 6.0]));
+    pd2.cell_data
+        .set_scalars(DataArray::scalars_f32("cid", vec![30.0, 40.0]));
+
+    let ds1 = DataSet::PolyData(pd1);
+    let ds2 = DataSet::PolyData(pd2);
+    let merged = append_datasets(&[&ds1, &ds2]).unwrap();
+    let mpd = merged.as_poly_data().unwrap();
+    assert_eq!(mpd.num_points(), 6);
+    assert_eq!(mpd.verts.len(), 2);
+    assert_eq!(mpd.polys.len(), 2);
+    assert!(mpd.point_data.get("temp").is_some());
+    assert!(mpd.point_data.get("only_in_1").is_none());
+    let cid = mpd.cell_data.get("cid").unwrap();
+    // Order: verts from pd1 (10), verts from pd2 (30), polys from pd1 (20), polys from pd2 (40)
+    assert_eq!(cid.num_tuples(), 4);
+    assert!((cid.get_scalar(0) - 10.0).abs() < 1e-6);
+    assert!((cid.get_scalar(1) - 30.0).abs() < 1e-6);
+    assert!((cid.get_scalar(2) - 20.0).abs() < 1e-6);
+    assert!((cid.get_scalar(3) - 40.0).abs() < 1e-6);
+
+    // 2. Mixed PolyData + ImageData -> UnstructuredGrid via MultiBlock + AppendDatasetsFilter
+    let mut img = ImageData::new([2, 2, 2], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    img.point_data
+        .set_scalars(DataArray::scalars_f32("temp", vec![7.0; img.num_points()]));
+    let mut mb = MultiBlockDataSet::new();
+    mb.add_block("poly", ds1);
+    mb.add_block("img", DataSet::ImageData(img));
+    let mixed = AppendDatasetsFilter::new()
+        .apply(&DataSet::MultiBlock(mb))
+        .unwrap();
+    let mug = mixed.as_unstructured_grid().unwrap();
+    assert_eq!(mug.num_points(), 3 + 8);
+    assert_eq!(mug.num_cells(), 2 + 1);
+    assert_eq!(mug.point_data.get("temp").unwrap().num_tuples(), 11);
+}
+
+#[test]
+fn test_compute_histogram() {
+    let mut pd = PolyData::new();
+    pd.points = vec![[0.0, 0.0, 0.0]; 4];
+    // Values: 1, 2, 3, 4 -> min=1, max=4, mean=2.5, var=((1.5^2+0.5^2)*2)/4=1.25 -> std=sqrt(1.25)
+    pd.point_data
+        .set_scalars(DataArray::scalars_f32("vals", vec![1.0, 2.0, 3.0, 4.0]));
+    pd.cell_data.set_vectors(DataArray::vectors_f32(
+        "vec",
+        vec![[3.0, 4.0, 0.0], [0.0, 12.0, 5.0]],
+    ));
+    let ds = DataSet::PolyData(pd);
+
+    let hist = compute_histogram(&ds, "vals", AttributeAssociation::Point, None, 3).unwrap();
+    assert_eq!(hist.bin_edges.len(), 4);
+    assert_eq!(hist.counts, vec![1, 1, 2]); // [1,2), [2,3), [3,4]
+    assert!((hist.min - 1.0).abs() < 1e-9);
+    assert!((hist.max - 4.0).abs() < 1e-9);
+    assert!((hist.mean - 2.5).abs() < 1e-9);
+    assert!((hist.std_dev - 1.25f64.sqrt()).abs() < 1e-9);
+
+    // Vector magnitude (component = None) -> 5.0 and 13.0
+    let mag_hist = compute_histogram(&ds, "vec", AttributeAssociation::Cell, None, 2).unwrap();
+    assert!((mag_hist.min - 5.0).abs() < 1e-9);
+    assert!((mag_hist.max - 13.0).abs() < 1e-9);
+    assert!((mag_hist.mean - 9.0).abs() < 1e-9);
+    assert_eq!(mag_hist.counts, vec![1, 1]);
+
+    // Specific vector component (component = Some(1)) -> 4.0 and 12.0
+    let comp_hist = compute_histogram(&ds, "vec", AttributeAssociation::Cell, Some(1), 2).unwrap();
+    assert!((comp_hist.min - 4.0).abs() < 1e-9);
+    assert!((comp_hist.max - 12.0).abs() < 1e-9);
+
+    // Invalid inputs error cleanly
+    assert!(compute_histogram(&ds, "vals", AttributeAssociation::Point, None, 0).is_err());
+    assert!(compute_histogram(&ds, "missing", AttributeAssociation::Point, None, 4).is_err());
+    assert!(compute_histogram(&ds, "vec", AttributeAssociation::Cell, Some(5), 2).is_err());
 }

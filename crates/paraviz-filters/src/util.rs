@@ -135,11 +135,19 @@ pub(crate) fn interpolate_field_data_weighted(
 /// Merges multiple `PolyData` meshes into a single `PolyData`, offsetting vertex indices
 /// and concatenating matching `point_data` and `cell_data` arrays.
 pub(crate) fn merge_polydata(parts: Vec<PolyData>) -> PolyData {
+    let refs: Vec<&PolyData> = parts.iter().collect();
+    merge_polydata_refs(&refs)
+}
+
+/// Merges a slice of `&PolyData` meshes into a single `PolyData`, offsetting vertex indices
+/// and concatenating matching `point_data` and `cell_data` arrays (aligned in `verts`,
+/// `lines`, `polys`, `strips` order).
+pub(crate) fn merge_polydata_refs(parts: &[&PolyData]) -> PolyData {
     if parts.is_empty() {
         return PolyData::new();
     }
     if parts.len() == 1 {
-        return parts.into_iter().next().unwrap();
+        return parts[0].clone();
     }
 
     let total_points: usize = parts.iter().map(|p| p.points.len()).sum();
@@ -149,35 +157,7 @@ pub(crate) fn merge_polydata(parts: Vec<PolyData>) -> PolyData {
     let mut polys = Vec::new();
     let mut strips = Vec::new();
 
-    // Find common point_data array names present in all non-empty parts.
-    let non_empty_parts: Vec<&PolyData> = parts.iter().filter(|p| !p.points.is_empty()).collect();
-    let common_point_arrays: Vec<String> = if let Some(first) = non_empty_parts.first() {
-        first
-            .point_data
-            .arrays()
-            .iter()
-            .filter(|a| {
-                non_empty_parts.iter().all(|p| {
-                    p.point_data
-                        .get(&a.name)
-                        .is_some_and(|other| other.num_components == a.num_components)
-                })
-            })
-            .map(|a| a.name.clone())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut point_buffers: Vec<(String, usize, Vec<f32>)> = common_point_arrays
-        .iter()
-        .map(|name| {
-            let nc = non_empty_parts[0].point_data.get(name).unwrap().num_components;
-            (name.clone(), nc, Vec::with_capacity(total_points * nc))
-        })
-        .collect();
-
-    for part in &parts {
+    for part in parts {
         let offset = points.len() as u32;
         points.extend_from_slice(&part.points);
         for &v in &part.verts {
@@ -192,48 +172,420 @@ pub(crate) fn merge_polydata(parts: Vec<PolyData>) -> PolyData {
         for strip in &part.strips {
             strips.push(strip.iter().map(|&v| v + offset).collect());
         }
-        if !part.points.is_empty() {
-            for (name, nc, buf) in &mut point_buffers {
-                let arr = part.point_data.get(name).unwrap();
-                for t in 0..part.points.len() {
-                    let base = t * *nc;
-                    for c in 0..*nc {
-                        buf.push(arr.data.get_f64(base + c) as f32);
-                    }
-                }
-            }
-        }
     }
 
-    let mut out = PolyData {
+    let point_parts: Vec<(&FieldData, usize)> = parts
+        .iter()
+        .filter(|p| !p.points.is_empty())
+        .map(|p| (&p.point_data, p.points.len()))
+        .collect();
+    let point_data = merge_common_field_data(&point_parts);
+
+    // Build cell_data aligned to output cell order: all verts, then all lines, then all polys, then all strips.
+    let cell_data = merge_polydata_cell_data(parts);
+
+    PolyData {
         points,
         verts,
         lines,
         polys,
         strips,
+        point_data,
+        cell_data,
         ..Default::default()
+    }
+}
+
+fn merge_polydata_cell_data(parts: &[&PolyData]) -> FieldData {
+    let non_empty: Vec<&PolyData> = parts
+        .iter()
+        .copied()
+        .filter(|p| p.num_cells() > 0)
+        .collect();
+    let Some(first) = non_empty.first() else {
+        return FieldData::new();
     };
-    for (name, nc, buf) in point_buffers {
-        out.point_data
-            .add_array(DataArray::new(name, nc, ArrayData::F32(buf)));
+
+    let common_names: Vec<(String, usize)> = first
+        .cell_data
+        .arrays()
+        .iter()
+        .filter(|a| {
+            non_empty.iter().all(|p| {
+                p.cell_data
+                    .get(&a.name)
+                    .is_some_and(|other| other.num_components == a.num_components)
+            })
+        })
+        .map(|a| (a.name.clone(), a.num_components))
+        .collect();
+
+    if common_names.is_empty() {
+        return FieldData::new();
     }
-    if let Some(first) = non_empty_parts.first() {
-        if let Some(ref s) = first.point_data.active_scalars
-            && out.point_data.get(s).is_some()
-        {
-            out.point_data.active_scalars = Some(s.clone());
+
+    let total_cells: usize = non_empty.iter().map(|p| p.num_cells()).sum();
+    let mut out = FieldData::new();
+
+    for (name, nc) in common_names {
+        let same_i32 = non_empty
+            .iter()
+            .all(|p| matches!(p.cell_data.get(&name).unwrap().data, ArrayData::I32(_)));
+        let same_f64 = non_empty
+            .iter()
+            .all(|p| matches!(p.cell_data.get(&name).unwrap().data, ArrayData::F64(_)));
+
+        // Collect tuples in cell-category order: verts, lines, polys, strips.
+        let append_range = |buf_f64: &mut Vec<f64>, p: &PolyData, start: usize, count: usize| {
+            let arr = p.cell_data.get(&name).unwrap();
+            for t in start..(start + count) {
+                let base = t * nc;
+                for c in 0..nc {
+                    buf_f64.push(arr.data.get_f64(base + c));
+                }
+            }
+        };
+
+        let mut buf = Vec::with_capacity(total_cells * nc);
+        for p in &non_empty {
+            append_range(&mut buf, p, 0, p.verts.len());
         }
-        if let Some(ref v) = first.point_data.active_vectors
-            && out.point_data.get(v).is_some()
-        {
-            out.point_data.active_vectors = Some(v.clone());
+        for p in &non_empty {
+            let start = p.verts.len();
+            append_range(&mut buf, p, start, p.lines.len());
         }
-        if let Some(ref n) = first.point_data.active_normals
-            && out.point_data.get(n).is_some()
-        {
-            out.point_data.active_normals = Some(n.clone());
+        for p in &non_empty {
+            let start = p.verts.len() + p.lines.len();
+            append_range(&mut buf, p, start, p.polys.len());
+        }
+        for p in &non_empty {
+            let start = p.verts.len() + p.lines.len() + p.polys.len();
+            append_range(&mut buf, p, start, p.strips.len());
+        }
+
+        let data = if same_i32 {
+            ArrayData::I32(buf.into_iter().map(|v| v as i32).collect())
+        } else if same_f64 {
+            ArrayData::F64(buf)
+        } else {
+            ArrayData::F32(buf.into_iter().map(|v| v as f32).collect())
+        };
+        out.add_array(DataArray::new(name, nc, data));
+    }
+
+    preserve_active_designations(&first.cell_data, &mut out);
+    out
+}
+
+/// Merges common arrays across a list of `(FieldData, tuple_count)` slices.
+pub(crate) fn merge_common_field_data(parts: &[(&FieldData, usize)]) -> FieldData {
+    let Some((first_fd, _)) = parts.first() else {
+        return FieldData::new();
+    };
+    let common_names: Vec<(String, usize)> = first_fd
+        .arrays()
+        .iter()
+        .filter(|a| {
+            parts.iter().all(|(fd, _)| {
+                fd.get(&a.name)
+                    .is_some_and(|other| other.num_components == a.num_components)
+            })
+        })
+        .map(|a| (a.name.clone(), a.num_components))
+        .collect();
+
+    if common_names.is_empty() {
+        return FieldData::new();
+    }
+
+    let total_tuples: usize = parts.iter().map(|(_, n)| *n).sum();
+    let mut out = FieldData::new();
+    for (name, nc) in common_names {
+        let same_i32 = parts
+            .iter()
+            .all(|(fd, _)| matches!(fd.get(&name).unwrap().data, ArrayData::I32(_)));
+        let same_f64 = parts
+            .iter()
+            .all(|(fd, _)| matches!(fd.get(&name).unwrap().data, ArrayData::F64(_)));
+
+        let mut buf = Vec::with_capacity(total_tuples * nc);
+        for &(fd, count) in parts {
+            let arr = fd.get(&name).unwrap();
+            let n = count.min(arr.num_tuples());
+            for t in 0..n {
+                let base = t * nc;
+                for c in 0..nc {
+                    buf.push(arr.data.get_f64(base + c));
+                }
+            }
+        }
+
+        let data = if same_i32 {
+            ArrayData::I32(buf.into_iter().map(|v| v as i32).collect())
+        } else if same_f64 {
+            ArrayData::F64(buf)
+        } else {
+            ArrayData::F32(buf.into_iter().map(|v| v as f32).collect())
+        };
+        out.add_array(DataArray::new(name, nc, data));
+    }
+    preserve_active_designations(first_fd, &mut out);
+    out
+}
+
+fn preserve_active_designations(src: &FieldData, dst: &mut FieldData) {
+    if let Some(ref s) = src.active_scalars
+        && dst.get(s).is_some()
+    {
+        dst.active_scalars = Some(s.clone());
+    }
+    if let Some(ref v) = src.active_vectors
+        && dst.get(v).is_some()
+    {
+        dst.active_vectors = Some(v.clone());
+    }
+    if let Some(ref n) = src.active_normals
+        && dst.get(n).is_some()
+    {
+        dst.active_normals = Some(n.clone());
+    }
+}
+
+/// Computes the unnormalized area-weighted polygon normal using Newell's method.
+/// Its magnitude is `2 * area` for triangles.
+#[inline]
+pub(crate) fn polygon_area_normal(points: &[[f32; 3]], poly: &[u32]) -> Vec3 {
+    let m = poly.len();
+    if m < 3 {
+        return Vec3::ZERO;
+    }
+    let mut n = Vec3::ZERO;
+    for i in 0..m {
+        let a = Vec3::from_array(points[poly[i] as usize]);
+        let b = Vec3::from_array(points[poly[(i + 1) % m] as usize]);
+        n.x += (a.y - b.y) * (a.z + b.z);
+        n.y += (a.z - b.z) * (a.x + b.x);
+        n.z += (a.x - b.x) * (a.y + b.y);
+    }
+    n
+}
+
+/// Builds `(CellType, vertex_indices)` for each cell of a structured grid of `dims`.
+pub(crate) fn structured_cells(dims: [usize; 3], prefer_voxel: bool) -> Vec<(CellType, Vec<u32>)> {
+    let [nx, ny, nz] = dims;
+    if nx == 0 || ny == 0 || nz == 0 {
+        return Vec::new();
+    }
+    let pt = |i: usize, j: usize, k: usize| -> u32 { (i + nx * (j + ny * k)) as u32 };
+    let cx = nx.saturating_sub(1).max(1);
+    let cy = ny.saturating_sub(1).max(1);
+    let cz = nz.saturating_sub(1).max(1);
+    let mut cells = Vec::with_capacity(cx * cy * cz);
+
+    let dim_count = usize::from(nx > 1) + usize::from(ny > 1) + usize::from(nz > 1);
+    match dim_count {
+        0 => {
+            cells.push((CellType::Vertex, vec![0]));
+        }
+        1 => {
+            for k in 0..cz {
+                for j in 0..cy {
+                    for i in 0..cx {
+                        let di = usize::from(nx > 1);
+                        let dj = usize::from(ny > 1);
+                        let dk = usize::from(nz > 1);
+                        cells.push((
+                            CellType::Line,
+                            vec![pt(i, j, k), pt(i + di, j + dj, k + dk)],
+                        ));
+                    }
+                }
+            }
+        }
+        2 => {
+            let ct = if prefer_voxel {
+                CellType::Pixel
+            } else {
+                CellType::Quad
+            };
+            for k in 0..cz {
+                for j in 0..cy {
+                    for i in 0..cx {
+                        let verts = if nz == 1 {
+                            if prefer_voxel {
+                                vec![pt(i, j, 0), pt(i + 1, j, 0), pt(i, j + 1, 0), pt(i + 1, j + 1, 0)]
+                            } else {
+                                vec![pt(i, j, 0), pt(i + 1, j, 0), pt(i + 1, j + 1, 0), pt(i, j + 1, 0)]
+                            }
+                        } else if ny == 1 {
+                            if prefer_voxel {
+                                vec![pt(i, 0, k), pt(i + 1, 0, k), pt(i, 0, k + 1), pt(i + 1, 0, k + 1)]
+                            } else {
+                                vec![pt(i, 0, k), pt(i + 1, 0, k), pt(i + 1, 0, k + 1), pt(i, 0, k + 1)]
+                            }
+                        } else if prefer_voxel {
+                            vec![pt(0, j, k), pt(0, j + 1, k), pt(0, j, k + 1), pt(0, j + 1, k + 1)]
+                        } else {
+                            vec![pt(0, j, k), pt(0, j + 1, k), pt(0, j + 1, k + 1), pt(0, j, k + 1)]
+                        };
+                        cells.push((ct, verts));
+                    }
+                }
+            }
+        }
+        _ => {
+            let ct = if prefer_voxel {
+                CellType::Voxel
+            } else {
+                CellType::Hexahedron
+            };
+            for k in 0..cz {
+                for j in 0..cy {
+                    for i in 0..cx {
+                        let verts = if prefer_voxel {
+                            vec![
+                                pt(i, j, k),
+                                pt(i + 1, j, k),
+                                pt(i, j + 1, k),
+                                pt(i + 1, j + 1, k),
+                                pt(i, j, k + 1),
+                                pt(i + 1, j, k + 1),
+                                pt(i, j + 1, k + 1),
+                                pt(i + 1, j + 1, k + 1),
+                            ]
+                        } else {
+                            vec![
+                                pt(i, j, k),
+                                pt(i + 1, j, k),
+                                pt(i + 1, j + 1, k),
+                                pt(i, j + 1, k),
+                                pt(i, j, k + 1),
+                                pt(i + 1, j, k + 1),
+                                pt(i + 1, j + 1, k + 1),
+                                pt(i, j + 1, k + 1),
+                            ]
+                        };
+                        cells.push((ct, verts));
+                    }
+                }
+            }
         }
     }
+    cells
+}
+
+/// Converts any single-block `DataSet` into an `UnstructuredGrid`.
+pub(crate) fn dataset_to_unstructured(ds: &DataSet) -> Result<UnstructuredGrid, PipelineError> {
+    match ds {
+        DataSet::UnstructuredGrid(ug) => Ok(ug.clone()),
+        DataSet::PolyData(pd) => {
+            let mut ug = UnstructuredGrid::new();
+            ug.points = pd.points.clone();
+            for &v in &pd.verts {
+                ug.push_cell(CellType::Vertex, &[v]);
+            }
+            for line in &pd.lines {
+                let ct = if line.len() == 2 {
+                    CellType::Line
+                } else {
+                    CellType::PolyLine
+                };
+                ug.push_cell(ct, line);
+            }
+            for poly in &pd.polys {
+                let ct = match poly.len() {
+                    3 => CellType::Triangle,
+                    4 => CellType::Quad,
+                    _ => CellType::Polygon,
+                };
+                ug.push_cell(ct, poly);
+            }
+            for strip in &pd.strips {
+                ug.push_cell(CellType::TriangleStrip, strip);
+            }
+            ug.point_data = pd.point_data.clone();
+            ug.cell_data = pd.cell_data.clone();
+            ug.field_data = pd.field_data.clone();
+            Ok(ug)
+        }
+        DataSet::ImageData(img) => {
+            let mut ug = UnstructuredGrid::new();
+            ug.points = img.all_points();
+            for (ct, verts) in structured_cells(img.dimensions, true) {
+                ug.push_cell(ct, &verts);
+            }
+            ug.point_data = img.point_data.clone();
+            ug.cell_data = img.cell_data.clone();
+            ug.field_data = img.field_data.clone();
+            Ok(ug)
+        }
+        DataSet::RectilinearGrid(rg) => {
+            let mut ug = UnstructuredGrid::new();
+            ug.points = rg.all_points();
+            for (ct, verts) in structured_cells(rg.dimensions(), true) {
+                ug.push_cell(ct, &verts);
+            }
+            ug.point_data = rg.point_data.clone();
+            ug.cell_data = rg.cell_data.clone();
+            ug.field_data = rg.field_data.clone();
+            Ok(ug)
+        }
+        DataSet::StructuredGrid(sg) => {
+            let mut ug = UnstructuredGrid::new();
+            ug.points = sg.points.clone();
+            for (ct, verts) in structured_cells(sg.dimensions, false) {
+                ug.push_cell(ct, &verts);
+            }
+            ug.point_data = sg.point_data.clone();
+            ug.cell_data = sg.cell_data.clone();
+            ug.field_data = sg.field_data.clone();
+            Ok(ug)
+        }
+        DataSet::MultiBlock(_) => Err(PipelineError::ExecutionFailed(
+            "Expected single-block dataset, got MultiBlock".into(),
+        )),
+    }
+}
+
+/// Merges multiple `UnstructuredGrid` meshes into one `UnstructuredGrid`, preserving common
+/// `point_data` and `cell_data` arrays.
+pub(crate) fn merge_unstructured_refs(parts: &[&UnstructuredGrid]) -> UnstructuredGrid {
+    if parts.is_empty() {
+        return UnstructuredGrid::new();
+    }
+    if parts.len() == 1 {
+        return parts[0].clone();
+    }
+
+    let total_points: usize = parts.iter().map(|g| g.points.len()).sum();
+    let total_cells: usize = parts.iter().map(|g| g.num_cells()).sum();
+    let mut out = UnstructuredGrid::new();
+    out.points.reserve(total_points);
+    out.cell_types.reserve(total_cells);
+
+    for part in parts {
+        let offset = out.points.len() as u32;
+        out.points.extend_from_slice(&part.points);
+        for c in 0..part.num_cells() {
+            let shifted: Vec<u32> = part.cell_points(c).iter().map(|&v| v + offset).collect();
+            out.push_cell(part.cell_types[c], &shifted);
+        }
+    }
+
+    let point_parts: Vec<(&FieldData, usize)> = parts
+        .iter()
+        .filter(|g| !g.points.is_empty())
+        .map(|g| (&g.point_data, g.points.len()))
+        .collect();
+    out.point_data = merge_common_field_data(&point_parts);
+
+    let cell_parts: Vec<(&FieldData, usize)> = parts
+        .iter()
+        .filter(|g| g.num_cells() > 0)
+        .map(|g| (&g.cell_data, g.num_cells()))
+        .collect();
+    out.cell_data = merge_common_field_data(&cell_parts);
+
     out
 }
 
