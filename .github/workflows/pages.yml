@@ -33,7 +33,7 @@ jobs:
           version: latest
 
       - name: Build Web Bundle
-        run: trunk build --release --public-url "/${{ github.event.repository.name }}/" crates/paraviz-app/index.html
+        run: trunk build --release --public-url "/${{ github.event.repository.name }}/" --dist crates/paraviz-app/dist crates/paraviz-app/index.html
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
