@@ -2,36 +2,93 @@
 
 # ParaViz
 
-**Kitware ParaView rewritten in Rust using WebGPU (`wgpu`)**, with an ergonomic **Rust API**, a **parallel (`rayon`) scientific filter pipeline**, **VTK / mesh file I/O**, **WebGPU rendering**, an **interactive desktop GUI (`egui` + `egui-wgpu`)**, and a **headless CLI renderer**.
+**A fast, modern scientific visualization studio and headless renderer inspired by Kitware ParaView — built with Rust and WebGPU.**
+
+Explore 3D meshes, CFD flows, finite-element grids, and medical/volumetric scans in an interactive desktop app, automate batch renders from the command line, or embed pipelines directly in Rust and Python.
 
 ---
 
-## Architecture
+## Install & Launch
 
-| Crate | ParaView / VTK Equivalent | Responsibilities |
-| --- | --- | --- |
-| [`paraviz-core`](crates/paraviz-core) | `vtkCommonDataModel`, `vtkCommonExecutionModel` | Typed multi-component `DataArray`, `FieldData`, `CellType`, `PolyData`, `ImageData`, `RectilinearGrid`, `StructuredGrid`, `UnstructuredGrid`, `MultiBlockDataSet`, `ColorMap` (11 presets + log scale + NaN color), `TransferFunction`, demand-driven `PipelineGraph` with dirty propagation & caching |
-| [`paraviz-sources`](crates/paraviz-sources) | `vtkFiltersSources` | `SphereSource`, `CubeSource`, `ConeSource`, `CylinderSource`, `PlaneSource`, `LineSource`, `ArrowSource`, `DiskSource`, `TorusSource`, `WaveletSource`, `VectorFieldSource`, `SuperquadricSource`, `GyroidSource`, `PointCloudSource` |
-| [`paraviz-filters`](crates/paraviz-filters) | `vtkFiltersCore` / `vtkFiltersGeneral` / `vtkFiltersFlowPaths` | Parallel (`rayon`) `ExtractSurface`, `ContourFilter` (256-case Marching Cubes + Marching Tetrahedra with edge-hashed vertex welding), `SliceFilter`, `ClipFilter`, `ThresholdFilter`, `IsoVolumeFilter`, `StreamTracerFilter` (RK4 / RK45, point & cell vectors) & `StreamTracerWithCustomSource`, `TubeFilter` (parallel-transport Bishop frames), `GlyphFilter`, `WarpByVectorFilter`, `WarpByScalarFilter`, `GradientFilter` (Gradient / Divergence / Vorticity / Q-Criterion / Lambda2), `CalculatorFilter`, `SmoothFilter` (Laplacian / Taubin), `DecimateFilter` (QEM), `Delaunay2DFilter`, `Delaunay3DFilter`, `ResampleToImageFilter`, `ResampleWithDatasetFilter`, `IntegrateVariablesFilter`, `ExtractBlockFilter`, `TemporalStatisticsFilter`, `AddTimeStepsFilter`, `TransformFilter`, `CellDataToPointDataFilter`, `PointDataToCellDataFilter`, `ProbeOverLineFilter`, `FeatureEdgesFilter`, `ConnectivityFilter`, `ShrinkFilter`, `CellCentersFilter`, `ReflectFilter`, `GenerateNormalsFilter`, `ElevationFilter`, `TriangulateFilter`, `ExtractEdgesFilter`, `CleanPolyDataFilter`, `append_datasets`, `compute_histogram`, `interpolate_datasets` |
-| [`paraviz-io`](crates/paraviz-io) | `vtkIOXML`, `vtkIOLegacy`, `vtkIOGeometry` | Legacy `.vtk` (ASCII & big-endian binary), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd` — ASCII, base64 binary, appended, and `vtkZLibDataCompressor` read/write), partitioned parallel XML readers (`.pvtp`, `.pvti`, `.pvtu`, `.pvtr`, `.pvts`), raw binary 3D volume reader (`read_raw_volume`), NIfTI-1 (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), EnSight Gold (`.case`), XDMF (`.xdmf`, `.xmf`), OpenFOAM `polyMesh`, `.stl` (ASCII & binary), `.obj`, `.ply` (ASCII & binary LE/BE), `.csv`/`.tsv`, binary glTF 2.0 export (`.glb` with optional scalar `COLOR_0`), animated `.gif` export (`write_animated_gif`), self-contained interactive WebGL2 `.html` viewer export (`write_html_viewer`), plus `VtkFileSource` & `PvdSeriesSource` |
-| [`paraviz-render`](crates/paraviz-render) | `vtkRenderingOpenGL2`, `vtkRenderingVolume` | WebGPU (`wgpu`) rendering engine: 3-point Light Kit, `Surface`, single-pass barycentric `SurfaceWithEdges`, `Wireframe`, sphere-impostor `Points`, `PointGaussian`, 3D `Volume` raymarching (`R32Float` + IGN ray jittering + central-difference gradient shading), `Outline`, 4x MSAA, Eye-Dome Lighting (`EDL`) depth-contrast pass, transparent background export, headless Scalar Color Bar compositor, 3D raycast picking (`pick_scene`), interactive 3D `ViewportWidget` overlays (`Plane`, `Line`, `Box`, `Sphere`), WebGPU Compute Marching Cubes (`GpuContourEngine`), 3D Orientation Axes Gizmo & Cube Axes Grid, cached GPU buffers, headless RGBA/PNG export |
-| [`paraviz`](src/lib.rs) | `paraview.simple` | Ergonomic high-level Rust API (`ParaViz`, `DisplayHandle`, `SourceConfig`, `FilterConfig` with 37 filter variants, `DemoPreset`), `gpu_contour`, `pick`, `widgets`, `open_raw_volume`, `export_glb`, `export_html`, `render_turntable_gif`, `render_timeseries_gif`, JSON state save/load, Rust Trace export |
-| [`paraviz-app`](crates/paraviz-app) | ParaView Desktop & `pvbatch` | Interactive WebGPU Studio GUI (`eframe`/`egui` + `egui-wgpu`) with `DarkStudio`/`LightStudio` themes, Pipeline Browser (`All`/`None`/`Solo`/Copy-Paste Filter & Chain/Rename/Duplicate), Auto-Apply Properties with array dropdowns & bounds presets, Display/Lighting & Color Map Editor, Scene tab (skybox gradients, FOV, turntable, Camera Bookmarks, Transparent Export), Raw Volume Importer, GPU Compute Contour Dialog, Export Animation (GIF), MSAA 4x & EDL Strength, 3D Picking reticle & Distance Ruler pins, 3D Viewport Widgets, Information & CSV-exportable Spreadsheet/XY Chart/Histogram tabs, In-App File Browser, Demo Gallery, Shortcuts (`F1`), Live Rust Trace, and headless CLI (`demo`, `render` with `--edl`/`--msaa`/`--filter`/`--axes-grid`/`--turntable`/`--transparent`/`--scalar-bar`, `info`, `convert` incl. `.glb`/`.html`) |
+### Prebuilt Releases
+Download ready-to-run packages from [**GitHub Releases**](https://github.com/DimitriTimoz/paraviz/releases):
+- **Linux (`x86_64` & `aarch64`)**: `.AppImage` (portable, no install needed), `.deb`, or `.tar.gz`
+- **macOS (Universal Apple Silicon + Intel)**: `.dmg` (`ParaViz.app`) or `.tar.gz`
+- **Windows (`x86_64` & `aarch64`)**: `.zip` (`paraviz.exe`)
+
+> On Linux, make the AppImage executable and run it directly:
+> ```bash
+> chmod +x ParaViz-*.AppImage
+> ./ParaViz-*.AppImage path/to/dataset.vtu
+> ```
+
+### From Source
+```bash
+cargo run --release -p paraviz-app
+# Or open a dataset / saved session directly:
+cargo run --release -p paraviz-app -- path/to/mesh.vtu
+```
 
 ---
 
-## Improvements Over Classic ParaView
+## Key Capabilities
 
-1. **Zero-Z-Fighting Single-Pass `SurfaceWithEdges`**: Uses WGSL screen-space `fwidth()` on barycentric coordinates for crisp, anti-aliased wireframe overlays without polygon-offset artifacts.
-2. **Banding-Free WebGPU Volume Raymarching**: Uses Interleaved Gradient Noise (IGN) ray jittering, full `R32Float` 3D precision (manual trilinear interpolation in WGSL requiring zero optional GPU features), central-difference gradient Phong shading, and early ray termination.
-3. **Auto-Apply Toggle in Properties**: Eliminates the classic "forgot to click Apply" friction while preserving explicit Apply/Reset control for heavy pipelines.
-4. **Watertight Parallel Marching Cubes**: Spatial edge-key vertex welding deduplicates shared vertices across cell edges in parallel, reducing triangle vertex memory by ~5-6× and yielding smooth normals.
-5. **Twist-Free Streamline Tubes**: `TubeFilter` uses parallel-transport (Bishop) frames instead of Frenet frames to prevent twisting/pinching around inflection points.
-6. **Live Rust Trace Export**: Generates reproducible Rust API code directly from an interactive pipeline session (`pv.to_rust_trace()`).
+- **Interactive WebGPU Studio**: Real-time `Surface`, `SurfaceWithEdges`, `Wireframe`, `Points`, `PointGaussian`, `Volume`, and `Outline` views with 4x MSAA, Eye-Dome Lighting (EDL), Dark/Light themes, and camera bookmarks.
+- **Live Pipeline & Copy/Paste Filters**: 37+ parallel filters (isosurfaces, slices, clips, thresholds, streamlines & tubes, vector glyphs, QEM decimation, Delaunay 2D/3D, calculator, line probing, domain integration, time steps) with **Auto-Apply** and **Copy/Paste Filter Chains** (`Ctrl/Cmd+C`, `Ctrl/Cmd+V`).
+- **3D Volume Rendering**: Hardware-agnostic `R32Float` raymarching with interactive histogram opacity curves, transfer-function presets, gradient shading, and a live **3D Volume Clip Plane**.
+- **Inspection & Quantitative Plots**: 3D raycast picking (`Reveal in Spreadsheet`), 2-point 3D distance ruler, searchable & CSV-exportable attribute spreadsheets, `Plot Over Line` XY charts, and scalar histograms.
+- **Broad Format Support**:
+  - **VTK & 3D Meshes**: `.vtk`, `.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, partitioned `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.stl`, `.obj`, `.ply`, `.csv`/`.tsv`
+  - **Medical & Volumetric**: NIfTI-1 (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), Raw binary volumes (`.raw`)
+  - **CFD / CAE**: EnSight Gold (`.case`), OpenFOAM (`polyMesh`), XDMF (`.xdmf`, `.xmf`)
+- **Publication & Web Exports**:
+  - High-res **PNG** screenshots (up to 4K, with optional **transparent background** & **Scalar Color Bar**)
+  - Animated **GIF** exports (360° turntables & time series)
+  - Binary **glTF 2.0 (`.glb`)** with baked colormap vertex colors
+  - Self-contained interactive **WebGL2 `.html`** 3D viewers you can share and open in any browser
+
+---
+
+## How ParaViz Differs from Classic ParaView
+
+- **Crisper Edges & Cleaner Volumes**: Single-pass barycentric `SurfaceWithEdges` eliminates polygon-offset Z-fighting, and ray-jittered `R32Float` volume raymarching avoids slicing banding.
+- **Instant Live Editing**: `Auto-Apply` is enabled by default in Properties (with explicit Apply/Discard still available for heavy datasets), plus native Copy/Paste of filters and chains.
+- **Built-In Portable Sharing**: Export animated `.gif` turntables, `.glb` meshes, and standalone WebGL2 `.html` viewers directly without plugins.
+- **Lightweight Single Binary**: Fast startup with zero Qt/VTK installation overhead, plus live **Rust Trace** export alongside JSON session files.
+- **Current Scope**: Focused on single-workstation visualization and batch CLI rendering (no distributed MPI `pvserver`, OSPRay path-tracing, or HDF5/CGNS/CAD B-Rep readers yet).
+
+See the full side-by-side comparison in [**Differences from Classic ParaView**](docs/differences-from-paraview.md).
+
+---
+
+## Headless CLI Quick Start
+
+Render, inspect, and convert datasets without opening a window:
+
+```bash
+# Render a built-in demo scene
+cargo run -p paraviz-app -- demo wavelet -o wavelet.png --width 1280 --height 720
+
+# Render a dataset with chained filters, EDL, 4x MSAA, transparent background & color bar
+cargo run -p paraviz-app -- render volume.vti -o iso.png \
+  --filter contour:140 --repr edges --cmap viridis --color-by RTData \
+  --edl --msaa 4 --transparent --scalar-bar
+
+# Export a 360-degree animated GIF turntable
+cargo run -p paraviz-app -- render mesh.vtu -o spin.gif --turntable 36 --edl
+
+# Inspect dataset metadata, bounds, and scalar ranges
+cargo run -p paraviz-app -- info mesh.vtu
+
+# Convert to binary glTF (.glb) or an interactive WebGL2 (.html) viewer
+cargo run -p paraviz-app -- convert mesh.vtu viewer.html
+```
 
 ---
 
 ## Rust API Quick Start
+
+Use `paraviz` as a library in your own Rust project:
 
 ```rust
 use paraviz::prelude::*;
@@ -59,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Run the included examples:
+Run the included examples (`examples/`):
 ```bash
 cargo run --example wavelet_contour
 cargo run --example streamlines_and_tubes
@@ -67,74 +124,40 @@ cargo run --example volume_raymarch
 cargo run --release --example benchmark_pipeline
 ```
 
-Sample release benchmark output (`benchmark_pipeline`, 128³ `WaveletSource`, Apple Metal WebGPU):
-- `WaveletSource` 128³ (2,097,152 pts, 2,048,383 cells): `24.01 ms`
-- CPU Parallel Rayon Marching Cubes (138,079 pts, 272,506 tris): `93.34 ms`
-- WebGPU Compute Marching Cubes (`GpuContourEngine`, 138,079 pts, 272,506 tris): `96.69 ms`
-- WebGPU Cached Render (1280x720, 4x MSAA + EDL + SurfaceWithEdges): `6.05 ms`
-
----
-
-## Desktop App & CLI
-
-Launch the interactive WebGPU ParaViz GUI:
-```bash
-cargo run -p paraviz-app
-```
-
-> **Prebuilt Multi-Platform Packages**: GitHub Actions (`.github/workflows/release.yml`) builds release packages for **Linux `x86_64` & `aarch64`** (`.AppImage`, `.deb`, `.tar.gz`), **macOS Universal** (`.dmg`, `.app`, `.tar.gz`), and **Windows `x86_64` & `aarch64`** (`.zip`).
-> You can also build a local Linux AppImage via:
-> ```bash
-> cargo build --release -p paraviz-app
-> ./packaging/linux/build-appimage.sh target/release/paraviz x86_64 ParaViz-x86_64.AppImage
-> ```
-
-Headless CLI commands:
-```bash
-# Render a built-in demo scene headlessly with WebGPU
-cargo run -p paraviz-app -- demo wavelet -o wavelet.png --width 1280 --height 720
-
-# Render any VTK / VTP / VTI / PVTP / PVTU / VTU / STL / OBJ / PLY / CSV / NIfTI / EnSight / XDMF / OpenFOAM dataset headlessly (with optional filter chains, axes grid, or turntable sequence)
-cargo run -p paraviz-app -- render mesh.vtu -o out.png --repr edges --cmap viridis --camera iso --edl --msaa 4 --axes-grid
-
-# Inspect dataset statistics, bounds, and field arrays
-cargo run -p paraviz-app -- info mesh.vtu
-
-# Convert between scientific and 3D formats (including binary glTF .glb)
-cargo run -p paraviz-app -- convert input.vtk output.glb
-```
-
 ---
 
 ## Documentation
 
-Full end-user and developer documentation lives in [`docs/`](docs/README.md):
+Full end-user and developer guides live in [`docs/`](docs/README.md):
 
-- [**User Guide**](docs/user-guide.md) — Step-by-step workflows for the Studio GUI, volume raymarching, CFD streamlines, picking/probing, animations, and web exports
-- [**Differences from Classic ParaView**](docs/differences-from-paraview.md) — Architectural improvements, shortcut/UI mapping, and current feature scope vs. Kitware ParaView
-- [**Desktop Studio GUI & Headless CLI**](docs/gui-and-cli.md) — GUI inspector tabs, shortcuts (`F1`), and CLI batch reference
-- [**Architecture & WebGPU Rendering Pipeline**](docs/architecture.md) — Crate breakdown, `PipelineGraph`, WGSL shaders, EDL, and GPU Compute Marching Cubes
-- [**Rust API Guide (& Python Bindings)**](docs/rust-api.md) — `ParaViz` session API, `DataSet` construction, `WebGpuRenderer`, and `paraviz-py`
-- [**Sources & Filters Reference**](docs/filters-and-sources.md) — All 14 sources, 37 `FilterConfig` filters, multi-input filters, and `CalculatorFilter` syntax
-- [**File Formats & I/O**](docs/file-formats.md) — VTK Legacy/XML, `.pvd`, NIfTI, NRRD, MetaImage, EnSight, XDMF, OpenFOAM, `.glb`, `.gif`, and `.html`
-
-Generate local rustdoc HTML documentation:
-```bash
-cargo doc --workspace --exclude paraviz-app --no-deps --open
-```
-
----
-
-## Running Tests
-
-```bash
-cargo test --workspace
-```
+- [**User Guide**](docs/user-guide.md) — Step-by-step Studio GUI workflows, volume rendering, CFD streamlines, picking, and exports
+- [**Differences from Classic ParaView**](docs/differences-from-paraview.md) — UX improvements, shortcut mapping, and feature scope
+- [**Desktop Studio GUI & Headless CLI**](docs/gui-and-cli.md) — Complete controls, keyboard/mouse shortcuts (`F1`), and CLI reference
+- [**File Formats & I/O**](docs/file-formats.md) — Supported VTK, 3D, medical, and CFD formats & exports
+- [**Sources & Filters Reference**](docs/filters-and-sources.md) — All 14 procedural sources, 37+ filters, and `CalculatorFilter` syntax
+- [**Rust API Guide (& Python Bindings)**](docs/rust-api.md) — High-level `ParaViz` API, `DataSet` construction, and `paraviz-py`
+- [**Architecture & WebGPU Rendering Pipeline**](docs/architecture.md) — Workspace crate breakdown, pipeline DAG, and WGSL shaders
 
 ---
 
 ## Feedback & Issues
 
-If you encounter a bug, crash, file-parsing error, rendering artifact, or missing ParaView feature, please **[open an issue on GitHub](https://github.com/DimitriTimoz/paraviz/issues/new/choose)**.
+Encountered a bug, rendering issue, file-loading error, or missing ParaView feature? Please **[open an issue on GitHub](https://github.com/DimitriTimoz/paraviz/issues/new/choose)**.
 
-Including your OS/GPU backend, CLI command (or saved `.json` state / **Rust Trace** output), and steps to reproduce helps us resolve issues quickly.
+Including your OS/GPU backend, CLI command (or saved `.json` state / **Rust Trace** output), and steps to reproduce helps us investigate quickly.
+
+---
+
+## Development & Tests
+
+```bash
+# Run the full test suite
+cargo test --workspace
+
+# Generate local API documentation
+cargo doc --workspace --exclude paraviz-app --no-deps --open
+
+# Build a local Linux AppImage
+cargo build --release -p paraviz-app
+./packaging/linux/build-appimage.sh target/release/paraviz x86_64 ParaViz-x86_64.AppImage
+```
