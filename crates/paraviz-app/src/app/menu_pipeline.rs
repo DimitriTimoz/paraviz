@@ -180,7 +180,12 @@ impl ParaVizApp {
                 }
             });
 
-            ui.menu_button("Filters", |ui| {
+            egui::containers::menu::MenuButton::new("Filters")
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                )
+                .ui(ui, |ui| {
                 let enabled = self.selected_node.is_some();
                 let is_imagedata = self
                     .selected_node
