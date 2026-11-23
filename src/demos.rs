@@ -67,19 +67,29 @@ impl DemoPreset {
         let mut pv = ParaViz::new();
         match self {
             Self::WaveletContour => {
-                let wav = pv.add_source_cfg("Wavelet", SourceConfig::Wavelet(WaveletSource::default()))?;
+                let wav = pv.add_source_cfg(
+                    "Wavelet",
+                    SourceConfig::Wavelet(WaveletSource {
+                        whole_extent: [-20, 20, -20, 20, -20, 20],
+                        x_freq: 20.0,
+                        y_freq: 14.0,
+                        z_freq: 16.0,
+                        std_dev: 0.48,
+                        ..Default::default()
+                    }),
+                )?;
                 pv.show(wav)
                     .representation(Representation::Outline)
                     .solid_color([0.7, 0.75, 0.85, 1.0]);
 
                 let iso = pv.add_filter_cfg(
-                    "Contour (110, 175)",
+                    "Contour (148, 210)",
                     wav,
-                    FilterConfig::Contour(ContourFilter::new("RTData", vec![110.0, 175.0])),
+                    FilterConfig::Contour(ContourFilter::new("RTData", vec![148.0, 210.0])),
                 )?;
                 pv.show(iso)
-                    .representation(Representation::SurfaceWithEdges)
-                    .colormap(ColorMapPreset::Viridis)
+                    .representation(Representation::Surface)
+                    .colormap(ColorMapPreset::Turbo)
                     .color_by_point("RTData");
 
                 let slice = pv.add_filter_cfg(
@@ -91,12 +101,17 @@ impl DemoPreset {
                     .representation(Representation::Surface)
                     .colormap(ColorMapPreset::CoolToWarm)
                     .color_by_point("RTData")
-                    .opacity(0.75);
+                    .opacity(0.62);
+
+                pv.settings.msaa_samples = 4;
+                pv.settings.edl_enabled = true;
+                pv.settings.edl_strength = 0.65;
             }
             Self::VortexStreamlines => {
                 let vf = pv.add_source_cfg(
                     "SwirlingVortex",
                     SourceConfig::VectorField(VectorFieldSource {
+                        dimensions: [32, 32, 32],
                         kind: VectorFieldKind::SwirlingVortex,
                         ..Default::default()
                     }),
@@ -112,14 +127,14 @@ impl DemoPreset {
                         vector_field: "Velocity".into(),
                         seeds: SeedSource::Sphere {
                             center: [0.0, 0.0, 0.0],
-                            radius: 1.2,
-                            count: 24,
+                            radius: 1.25,
+                            count: 40,
                         },
                         direction: IntegrationDirection::Both,
                         integrator: Integrator::Rk45,
-                        step_size: 0.06,
-                        max_steps: 240,
-                        max_length: 8.0,
+                        step_size: 0.045,
+                        max_steps: 320,
+                        max_length: 11.0,
                         terminal_speed: 1e-4,
                     }),
                 )?;
@@ -128,34 +143,52 @@ impl DemoPreset {
                 let tubes = pv.add_filter_cfg(
                     "StreamTubes",
                     streams,
-                    FilterConfig::Tube(TubeFilter::new(0.035, 10)),
+                    FilterConfig::Tube(TubeFilter::new(0.038, 16)),
                 )?;
                 pv.show(tubes)
                     .representation(Representation::Surface)
                     .colormap(ColorMapPreset::Plasma)
                     .color_by_point("Speed");
 
+                let mid_slice = pv.add_filter_cfg(
+                    "Midplane Z=0",
+                    vf,
+                    FilterConfig::Slice(SliceFilter::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0])),
+                )?;
+                pv.show(mid_slice)
+                    .representation(Representation::Surface)
+                    .colormap(ColorMapPreset::Viridis)
+                    .color_by_point("Speed")
+                    .opacity(0.38);
+
                 let glyphs = pv.add_filter_cfg(
                     "VelocityGlyphs",
-                    vf,
+                    mid_slice,
                     FilterConfig::Glyph(GlyphFilter {
                         shape: GlyphShape::Arrow,
                         vector_field: Some("Velocity".into()),
                         scalar_field: Some("Speed".into()),
                         scale_mode: ScaleMode::VectorMagnitude,
-                        scale_factor: 0.42,
-                        max_points: 120,
+                        scale_factor: 0.24,
+                        max_points: 160,
                     }),
                 )?;
                 pv.show(glyphs)
                     .representation(Representation::Surface)
                     .colormap(ColorMapPreset::Turbo)
                     .color_by_point("Speed");
+
+                pv.settings.msaa_samples = 4;
+                pv.settings.edl_enabled = true;
+                pv.settings.edl_strength = 0.6;
             }
             Self::GyroidMinimalSurface => {
                 let gyroid = pv.add_source_cfg(
                     "Gyroid",
-                    SourceConfig::Gyroid(GyroidSource::default()),
+                    SourceConfig::Gyroid(GyroidSource {
+                        dimensions: [44, 44, 44],
+                        ..Default::default()
+                    }),
                 )?;
                 pv.hide(gyroid);
 
@@ -168,6 +201,10 @@ impl DemoPreset {
                     .representation(Representation::Surface)
                     .colormap(ColorMapPreset::CoolToWarm)
                     .color_by_point("Gyroid");
+
+                pv.settings.msaa_samples = 4;
+                pv.settings.edl_enabled = true;
+                pv.settings.edl_strength = 0.6;
             }
             Self::VolumeWavelet => {
                 let wav = pv.add_source_cfg("Wavelet", SourceConfig::Wavelet(WaveletSource::default()))?;
