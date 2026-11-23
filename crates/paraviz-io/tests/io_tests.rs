@@ -3,13 +3,18 @@ use base64::Engine;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use paraviz_core::{
-    ArrayData, CellType, DataArray, DataSet, ImageData, MultiBlockDataSet, PipelineGraph,
-    PolyData, RectilinearGrid, Source, StructuredGrid, UnstructuredGrid,
+    ArrayData, CellType, ColorMap, ColorMapPreset, DataArray, DataSet, ImageData,
+    MultiBlockDataSet, PipelineGraph, PolyData, RectilinearGrid, ScalarType, Source,
+    StructuredGrid, UnstructuredGrid,
 };
 use paraviz_io::csv::{read_csv, read_csv_str, write_csv};
+use paraviz_io::gltf::write_glb;
 use paraviz_io::mesh::{
     read_obj, read_obj_str, read_ply, read_stl, write_obj, write_ply_with_format, write_stl_ascii,
     write_stl_binary, PlyFormat,
+};
+use paraviz_io::raw_volume::{
+    read_raw_volume, read_raw_volume_i16, read_raw_volume_u16, RawEndian, RawVolumeDescriptor,
 };
 use paraviz_io::vtk_legacy::{read_vtk_legacy, write_vtk_legacy_with_format, VtkLegacyFormat};
 use paraviz_io::vtk_xml::{
@@ -622,4 +627,570 @@ Points:0;Points:1;Points:2;Temperature;Pressure;Label
     .unwrap();
     let detected = read_dataset(&no_ext_vtk).unwrap();
     assert_eq!(detected.num_points(), 4);
+}
+
+#[test]
+fn vtk_xml_binary_zlib_roundtrip_and_multiblock() {
+    let dir = TestDir::new("vtk_xml_zlib");
+
+    let datasets: Vec<(&str, &str, DataSet)> = vec![
+        ("poly", "vtp", DataSet::PolyData(sample_polydata())),
+        ("img", "vti", DataSet::ImageData(sample_imagedata())),
+        ("rect", "vtr", DataSet::RectilinearGrid(sample_rectilinear())),
+        ("struct", "vts", DataSet::StructuredGrid(sample_structured())),
+        ("ugrid", "vtu", DataSet::UnstructuredGrid(sample_unstructured())),
+    ];
+
+    for (name, ext, ds) in &datasets {
+        let p = dir.file(&format!("{name}_zlib.{ext}"));
+        write_vtk_xml_with_format(&p, ds, VtkXmlFormat::BinaryZlib).unwrap();
+        let xml_text = fs::read_to_string(&p).unwrap();
+        assert!(
+            xml_text.contains("compressor=\"vtkZLibDataCompressor\""),
+            "{name} missing compressor attr"
+        );
+        assert!(
+            xml_text.contains("format=\"binary\""),
+            "{name} missing format=binary"
+        );
+
+        let back = read_vtk_xml(&p).unwrap();
+        assert_eq!(back.num_points(), ds.num_points(), "{name}");
+        assert_eq!(back.num_cells(), ds.num_cells(), "{name}");
+        assert!(
+            (back.bounds().diagonal() - ds.bounds().diagonal()).abs() < 1e-5,
+            "{name}"
+        );
+        let orig_pd = ds.point_data().unwrap();
+        let back_pd = back.point_data().unwrap();
+        assert_eq!(back_pd.active_scalars, orig_pd.active_scalars);
+        for arr in orig_pd.arrays() {
+            let got = back_pd.get(&arr.name).unwrap();
+            assert_eq!(got.num_components, arr.num_components);
+            for i in 0..arr.data.len() {
+                assert!((got.data.get_f64(i) - arr.data.get_f64(i)).abs() < 1e-5);
+            }
+        }
+    }
+
+    // Large PolyData (> 32 KiB raw points) to exercise multi-block vtkZLibDataCompressor headers
+    let n_pts = 4096usize;
+    let pts: Vec<[f32; 3]> = (0..n_pts)
+        .map(|i| [i as f32 * 0.1, (i as f32).sin(), (i as f32).cos()])
+        .collect();
+    let tris: Vec<[u32; 3]> = (0..(n_pts as u32 - 2))
+        .map(|i| [i, i + 1, i + 2])
+        .collect();
+    let mut big_poly = PolyData::from_triangles(pts, tris);
+    big_poly.point_data.set_scalars(DataArray::scalars_f32(
+        "wave",
+        (0..n_pts).map(|i| (i as f32 * 0.01).sin()).collect(),
+    ));
+    let big_path = dir.file("big_zlib.vtp");
+    write_vtk_xml_with_format(
+        &big_path,
+        &DataSet::PolyData(big_poly.clone()),
+        VtkXmlFormat::BinaryZlib,
+    )
+    .unwrap();
+    let big_back = read_vtk_xml(&big_path).unwrap();
+    let big_poly_back = big_back.as_poly_data().unwrap();
+    assert_eq!(big_poly_back.points.len(), n_pts);
+    assert_eq!(big_poly_back.polys.len(), big_poly.polys.len());
+    assert_eq!(big_poly_back.points[4095], big_poly.points[4095]);
+    let wave_back = big_poly_back.point_data.get("wave").unwrap();
+    assert!(
+        (wave_back.get_scalar(3500) - big_poly.point_data.get("wave").unwrap().get_scalar(3500))
+            .abs()
+            < 1e-6
+    );
+}
+
+#[test]
+fn partitioned_vtk_xml_pvtp_pvtu_pvti() {
+    let dir = TestDir::new("pvtk");
+    fs::create_dir_all(dir.file("pieces")).unwrap();
+
+    // 1. .pvtp (PPolyData)
+    let mut p0 = PolyData::from_triangles(
+        vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    p0.point_data
+        .set_scalars(DataArray::scalars_f32("temp", vec![1.0, 2.0, 3.0]));
+    p0.cell_data
+        .set_scalars(DataArray::new("part", 1, ArrayData::I32(vec![0])));
+
+    let mut p1 = PolyData::from_triangles(
+        vec![[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+        vec![[0, 1, 2]],
+    );
+    p1.point_data
+        .set_scalars(DataArray::scalars_f32("temp", vec![4.0, 5.0, 6.0]));
+    p1.cell_data
+        .set_scalars(DataArray::new("part", 1, ArrayData::I32(vec![1])));
+
+    write_vtk_xml_with_format(
+        dir.file("pieces/poly_0.vtp"),
+        &DataSet::PolyData(p0),
+        VtkXmlFormat::BinaryZlib,
+    )
+    .unwrap();
+    write_vtk_xml_with_format(
+        dir.file("pieces/poly_1.vtp"),
+        &DataSet::PolyData(p1),
+        VtkXmlFormat::Ascii,
+    )
+    .unwrap();
+
+    let pvtp_xml = r#"<?xml version="1.0"?>
+<VTKFile type="PPolyData" version="0.1" byte_order="LittleEndian">
+  <PPolyData GhostLevel="0">
+    <PPointData Scalars="temp">
+      <PDataArray type="Float32" Name="temp"/>
+    </PPointData>
+    <PCellData Scalars="part">
+      <PDataArray type="Int32" Name="part"/>
+    </PCellData>
+    <PPoints>
+      <PDataArray type="Float32" NumberOfComponents="3"/>
+    </PPoints>
+    <Piece Source="pieces/poly_0.vtp"/>
+    <Piece Source="pieces/poly_1.vtp"></Piece>
+  </PPolyData>
+</VTKFile>"#;
+    let pvtp_path = dir.file("mesh.pvtp");
+    fs::write(&pvtp_path, pvtp_xml).unwrap();
+    let merged_poly_ds = read_dataset(&pvtp_path).unwrap();
+    let merged_poly = merged_poly_ds.as_poly_data().unwrap();
+    assert_eq!(merged_poly.points.len(), 6);
+    assert_eq!(merged_poly.polys, vec![vec![0, 1, 2], vec![3, 4, 5]]);
+    assert_eq!(
+        merged_poly.point_data.active_scalars.as_deref(),
+        Some("temp")
+    );
+    let temps = merged_poly.point_data.get("temp").unwrap();
+    assert_eq!(temps.num_tuples(), 6);
+    assert!((temps.get_scalar(5) - 6.0).abs() < 1e-6);
+    let parts = merged_poly.cell_data.get("part").unwrap();
+    assert_eq!(parts.get_scalar(0) as i32, 0);
+    assert_eq!(parts.get_scalar(1) as i32, 1);
+
+    // 2. .pvtu (PUnstructuredGrid)
+    let mut u0 = UnstructuredGrid::new();
+    u0.points = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    u0.push_cell(CellType::Tetra, &[0, 1, 2, 3]);
+    u0.point_data
+        .set_scalars(DataArray::scalars_f32("u", vec![10.0, 20.0, 30.0, 40.0]));
+    u0.cell_data
+        .set_scalars(DataArray::new("rank", 1, ArrayData::I32(vec![0])));
+
+    let mut u1 = UnstructuredGrid::new();
+    u1.points = vec![[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]];
+    u1.push_cell(CellType::Triangle, &[0, 1, 2]);
+    u1.point_data
+        .set_scalars(DataArray::scalars_f32("u", vec![50.0, 60.0, 70.0]));
+    u1.cell_data
+        .set_scalars(DataArray::new("rank", 1, ArrayData::I32(vec![1])));
+
+    write_vtk_xml_with_format(
+        dir.file("pieces/ug_0.vtu"),
+        &DataSet::UnstructuredGrid(u0),
+        VtkXmlFormat::BinaryZlib,
+    )
+    .unwrap();
+    write_vtk_xml_with_format(
+        dir.file("pieces/ug_1.vtu"),
+        &DataSet::UnstructuredGrid(u1),
+        VtkXmlFormat::Binary,
+    )
+    .unwrap();
+
+    let pvtu_xml = r#"<?xml version="1.0"?>
+<VTKFile type="PUnstructuredGrid" version="0.1" byte_order="LittleEndian">
+  <PUnstructuredGrid GhostLevel="0">
+    <PPointData Scalars="u">
+      <PDataArray type="Float32" Name="u"/>
+    </PPointData>
+    <PCellData Scalars="rank">
+      <PDataArray type="Int32" Name="rank"/>
+    </PCellData>
+    <Piece Source="pieces/ug_0.vtu"/>
+    <Piece Source="pieces/ug_1.vtu"/>
+  </PUnstructuredGrid>
+</VTKFile>"#;
+    let pvtu_path = dir.file("grid.pvtu");
+    fs::write(&pvtu_path, pvtu_xml).unwrap();
+    let merged_ug_ds = read_dataset(&pvtu_path).unwrap();
+    let merged_ug = merged_ug_ds.as_unstructured_grid().unwrap();
+    assert_eq!(merged_ug.num_points(), 7);
+    assert_eq!(merged_ug.num_cells(), 2);
+    assert_eq!(merged_ug.cell_types, vec![CellType::Tetra, CellType::Triangle]);
+    assert_eq!(merged_ug.cell_points(0), &[0, 1, 2, 3]);
+    assert_eq!(merged_ug.cell_points(1), &[4, 5, 6]);
+    assert!((merged_ug.point_data.get("u").unwrap().get_scalar(6) - 70.0).abs() < 1e-6);
+    assert_eq!(
+        merged_ug.cell_data.get("rank").unwrap().get_scalar(1) as i32,
+        1
+    );
+
+    // 3. .pvti (PImageData)
+    let mut img0 = ImageData::new([2, 3, 2], [0.0, 0.0, 0.0], [0.5, 1.0, 2.0]);
+    let mut vals0 = Vec::new();
+    for k in 0..2 {
+        for j in 0..3 {
+            for i in 0..2 {
+                vals0.push((i + 10 * j + 100 * k) as f32);
+            }
+        }
+    }
+    img0.point_data
+        .set_scalars(DataArray::scalars_f32("density", vals0));
+
+    let mut img1 = ImageData::new([2, 3, 2], [1.0, 0.0, 0.0], [0.5, 1.0, 2.0]);
+    let mut vals1 = Vec::new();
+    for k in 0..2 {
+        for j in 0..3 {
+            for i in 2..4 {
+                vals1.push((i + 10 * j + 100 * k) as f32);
+            }
+        }
+    }
+    img1.point_data
+        .set_scalars(DataArray::scalars_f32("density", vals1));
+
+    write_vtk_xml_with_format(
+        dir.file("pieces/img_0.vti"),
+        &DataSet::ImageData(img0),
+        VtkXmlFormat::BinaryZlib,
+    )
+    .unwrap();
+    write_vtk_xml_with_format(
+        dir.file("pieces/img_1.vti"),
+        &DataSet::ImageData(img1),
+        VtkXmlFormat::BinaryZlib,
+    )
+    .unwrap();
+
+    let pvti_xml = r#"<?xml version="1.0"?>
+<VTKFile type="PImageData" version="0.1" byte_order="LittleEndian">
+  <PImageData WholeExtent="0 3 0 2 0 1" Origin="0 0 0" Spacing="0.5 1 2">
+    <PPointData Scalars="density">
+      <PDataArray type="Float32" Name="density"/>
+    </PPointData>
+    <Piece Extent="0 1 0 2 0 1" Source="pieces/img_0.vti"/>
+    <Piece Extent="2 3 0 2 0 1" Source="pieces/img_1.vti"/>
+  </PImageData>
+</VTKFile>"#;
+    let pvti_path = dir.file("vol.pvti");
+    fs::write(&pvti_path, pvti_xml).unwrap();
+    let merged_img_ds = read_dataset(&pvti_path).unwrap();
+    let merged_img = merged_img_ds.as_image_data().unwrap();
+    assert_eq!(merged_img.dimensions, [4, 3, 2]);
+    assert_eq!(merged_img.origin, [0.0, 0.0, 0.0]);
+    assert_eq!(merged_img.spacing, [0.5, 1.0, 2.0]);
+    let dens = merged_img.point_data.get("density").unwrap();
+    for k in 0..2 {
+        for j in 0..3 {
+            for i in 0..4 {
+                let idx = merged_img.point_index(i, j, k);
+                let expected = (i + 10 * j + 100 * k) as f64;
+                assert!((dens.get_scalar(idx) - expected).abs() < 1e-6);
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_volume_reader_all_types_and_endianness() {
+    let dir = TestDir::new("raw_vol");
+    let dims = [2, 2, 2]; // 8 voxels
+    let header = vec![0xAAu8; 16];
+
+    // U8
+    let u8_path = dir.file("vol_u8.raw");
+    let mut u8_bytes = header.clone();
+    u8_bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    fs::write(&u8_path, &u8_bytes).unwrap();
+    let u8_img = read_raw_volume(
+        &u8_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            scalar_type: ScalarType::U8,
+            origin: [-1.0, 0.0, 1.0],
+            spacing: [0.5, 0.5, 2.0],
+            endian: RawEndian::Little,
+            header_bytes: 16,
+            array_name: "ct".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(u8_img.dimensions, dims);
+    assert_eq!(u8_img.origin, [-1.0, 0.0, 1.0]);
+    assert_eq!(u8_img.spacing, [0.5, 0.5, 2.0]);
+    assert_eq!(u8_img.point_data.get("ct").unwrap().get_scalar(7) as u8, 8);
+
+    // I32 BigEndian
+    let i32_path = dir.file("vol_i32_be.raw");
+    let i32_vals: [i32; 8] = [-10, -5, 0, 5, 10, 20, 30, 40];
+    let mut i32_bytes = Vec::new();
+    for v in i32_vals {
+        i32_bytes.extend_from_slice(&v.to_be_bytes());
+    }
+    fs::write(&i32_path, &i32_bytes).unwrap();
+    let i32_img = read_raw_volume(
+        &i32_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            scalar_type: ScalarType::I32,
+            endian: RawEndian::Big,
+            array_name: "signed".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        i32_img.point_data.get("signed").unwrap().get_scalar(0) as i32,
+        -10
+    );
+    assert_eq!(
+        i32_img.point_data.get("signed").unwrap().get_scalar(7) as i32,
+        40
+    );
+
+    // U32 LittleEndian
+    let u32_path = dir.file("vol_u32_le.raw");
+    let mut u32_bytes = Vec::new();
+    for v in 100u32..108u32 {
+        u32_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    fs::write(&u32_path, &u32_bytes).unwrap();
+    let u32_img = read_raw_volume(
+        &u32_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            scalar_type: ScalarType::U32,
+            endian: RawEndian::Little,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        u32_img.point_data.active_scalars_array().unwrap().get_scalar(5) as u32,
+        105
+    );
+
+    // F32 BigEndian + F64 LittleEndian
+    let f32_path = dir.file("vol_f32_be.raw");
+    let mut f32_bytes = Vec::new();
+    for i in 0..8 {
+        f32_bytes.extend_from_slice(&(i as f32 * 0.25).to_be_bytes());
+    }
+    fs::write(&f32_path, &f32_bytes).unwrap();
+    let f32_img = read_raw_volume(
+        &f32_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            scalar_type: ScalarType::F32,
+            endian: RawEndian::Big,
+            array_name: "f32_arr".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!((f32_img.point_data.get("f32_arr").unwrap().get_scalar(3) - 0.75).abs() < 1e-6);
+
+    let f64_path = dir.file("vol_f64_le.raw");
+    let mut f64_bytes = Vec::new();
+    for i in 0..8 {
+        f64_bytes.extend_from_slice(&(i as f64 * 1.125).to_le_bytes());
+    }
+    fs::write(&f64_path, &f64_bytes).unwrap();
+    let f64_img = read_raw_volume(
+        &f64_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            scalar_type: ScalarType::F64,
+            endian: RawEndian::Little,
+            array_name: "f64_arr".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!((f64_img.point_data.get("f64_arr").unwrap().get_scalar(4) - 4.5).abs() < 1e-12);
+
+    // I16 & U16 helpers
+    let i16_path = dir.file("vol_i16_be.raw");
+    let mut i16_bytes = Vec::new();
+    for i in -4i16..4i16 {
+        i16_bytes.extend_from_slice(&i.to_be_bytes());
+    }
+    fs::write(&i16_path, &i16_bytes).unwrap();
+    let i16_img = read_raw_volume_i16(
+        &i16_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            endian: RawEndian::Big,
+            array_name: "hu".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(i16_img.point_data.get("hu").unwrap().get_scalar(0) as i32, -4);
+
+    let u16_path = dir.file("vol_u16_le.raw");
+    let mut u16_bytes = Vec::new();
+    for i in 1000u16..1008u16 {
+        u16_bytes.extend_from_slice(&i.to_le_bytes());
+    }
+    fs::write(&u16_path, &u16_bytes).unwrap();
+    let u16_img = read_raw_volume_u16(
+        &u16_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            endian: RawEndian::Little,
+            array_name: "u16".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        u16_img.point_data.get("u16").unwrap().get_scalar(7) as u32,
+        1007
+    );
+
+    // Truncated file returns error
+    let trunc_path = dir.file("truncated.raw");
+    fs::write(&trunc_path, [0u8; 4]).unwrap();
+    assert!(read_raw_volume(
+        &trunc_path,
+        &RawVolumeDescriptor {
+            dimensions: dims,
+            scalar_type: ScalarType::U8,
+            ..Default::default()
+        }
+    )
+    .is_err());
+}
+
+#[test]
+fn glb_export_header_chunks_alignment_and_json_schema() {
+    let dir = TestDir::new("glb");
+    let mut poly = sample_polydata();
+    // sample_polydata has 4 points, 2 triangles, normals, and "temp" scalars
+    poly.point_data.add_array(DataArray::scalars_f32(
+        "pressure",
+        vec![0.0, 0.25, 0.75, 1.0],
+    ));
+
+    // 1. Export without color map (via write_dataset dispatch)
+    let plain_glb = dir.file("plain.glb");
+    write_dataset(&plain_glb, &DataSet::PolyData(poly.clone())).unwrap();
+    let plain_bytes = fs::read(&plain_glb).unwrap();
+    let (plain_json, plain_bin) = parse_and_validate_glb(&plain_bytes);
+    let plain_attrs = &plain_json["meshes"][0]["primitives"][0]["attributes"];
+    assert!(plain_attrs.get("POSITION").is_some());
+    assert!(plain_attrs.get("NORMAL").is_some());
+    assert!(plain_attrs.get("COLOR_0").is_none());
+    assert!(plain_json["meshes"][0]["primitives"][0]["indices"].is_u64());
+    assert!(!plain_bin.is_empty());
+
+    // 2. Export with ColorMap + explicit scalar array
+    let cmap = ColorMap::from_preset(ColorMapPreset::Viridis);
+    let colored_glb = dir.file("colored.glb");
+    write_glb(&colored_glb, &poly, Some(&cmap), Some("pressure")).unwrap();
+    let colored_bytes = fs::read(&colored_glb).unwrap();
+    let (json, bin) = parse_and_validate_glb(&colored_bytes);
+
+    let prim = &json["meshes"][0]["primitives"][0];
+    assert_eq!(prim["mode"], 4);
+    let attrs = &prim["attributes"];
+    let pos_acc_idx = attrs["POSITION"].as_u64().unwrap() as usize;
+    let norm_acc_idx = attrs["NORMAL"].as_u64().unwrap() as usize;
+    let col_acc_idx = attrs["COLOR_0"].as_u64().unwrap() as usize;
+    let idx_acc_idx = prim["indices"].as_u64().unwrap() as usize;
+
+    let accessors = json["accessors"].as_array().unwrap();
+    let buffer_views = json["bufferViews"].as_array().unwrap();
+
+    // Validate POSITION min/max
+    let pos_acc = &accessors[pos_acc_idx];
+    assert_eq!(pos_acc["type"], "VEC3");
+    assert_eq!(pos_acc["componentType"], 5126);
+    assert_eq!(pos_acc["count"], 4);
+    assert_eq!(pos_acc["min"], serde_json::json!([0.0, 0.0, 0.0]));
+    assert_eq!(pos_acc["max"], serde_json::json!([1.0, 1.0, 0.5]));
+
+    // Validate NORMAL
+    let norm_acc = &accessors[norm_acc_idx];
+    assert_eq!(norm_acc["type"], "VEC3");
+    assert_eq!(norm_acc["componentType"], 5126);
+    assert_eq!(norm_acc["count"], 4);
+
+    // Validate COLOR_0 values match ColorMap::map_value
+    let col_acc = &accessors[col_acc_idx];
+    assert_eq!(col_acc["type"], "VEC4");
+    assert_eq!(col_acc["componentType"], 5126);
+    assert_eq!(col_acc["count"], 4);
+    let col_bv = &buffer_views[col_acc["bufferView"].as_u64().unwrap() as usize];
+    let col_off = col_bv["byteOffset"].as_u64().unwrap() as usize;
+    let first_rgba = [
+        f32::from_le_bytes(bin[col_off..col_off + 4].try_into().unwrap()),
+        f32::from_le_bytes(bin[col_off + 4..col_off + 8].try_into().unwrap()),
+        f32::from_le_bytes(bin[col_off + 8..col_off + 12].try_into().unwrap()),
+        f32::from_le_bytes(bin[col_off + 12..col_off + 16].try_into().unwrap()),
+    ];
+    let expected_rgba = cmap.map_value(0.0, (0.0, 1.0));
+    for c in 0..4 {
+        assert!((first_rgba[c] - expected_rgba[c]).abs() < 1e-6);
+    }
+
+    // Validate INDICES
+    let idx_acc = &accessors[idx_acc_idx];
+    assert_eq!(idx_acc["type"], "SCALAR");
+    assert_eq!(idx_acc["componentType"], 5125);
+    assert_eq!(idx_acc["count"], 12); // 2 polys (6) + 1 strip of 4 verts -> 2 tris (6)
+}
+
+fn parse_and_validate_glb(bytes: &[u8]) -> (serde_json::Value, Vec<u8>) {
+    assert!(bytes.len() >= 28, "GLB too short");
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let total_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    assert_eq!(magic, 0x4654_6C67);
+    assert_eq!(version, 2);
+    assert_eq!(total_len, bytes.len());
+    assert_eq!(total_len % 4, 0);
+
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let json_type = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    assert_eq!(json_type, 0x4E4F_534A);
+    assert_eq!(json_len % 4, 0);
+    let json_slice = &bytes[20..20 + json_len];
+    let json: serde_json::Value = serde_json::from_slice(json_slice).unwrap();
+
+    let bin_hdr = 20 + json_len;
+    let bin_len = u32::from_le_bytes(bytes[bin_hdr..bin_hdr + 4].try_into().unwrap()) as usize;
+    let bin_type = u32::from_le_bytes(bytes[bin_hdr + 4..bin_hdr + 8].try_into().unwrap());
+    assert_eq!(bin_type, 0x004E_4942);
+    assert_eq!(bin_len % 4, 0);
+    assert_eq!(bin_hdr + 8 + bin_len, bytes.len());
+    let bin = bytes[bin_hdr + 8..].to_vec();
+
+    assert_eq!(json["asset"]["version"], "2.0");
+    assert_eq!(json["buffers"][0]["byteLength"].as_u64().unwrap() as usize, bin_len);
+
+    for bv in json["bufferViews"].as_array().unwrap() {
+        let off = bv["byteOffset"].as_u64().unwrap() as usize;
+        let len = bv["byteLength"].as_u64().unwrap() as usize;
+        assert_eq!(off % 4, 0, "bufferView byteOffset not 4-byte aligned");
+        assert!(off + len <= bin_len, "bufferView out of bounds");
+    }
+
+    (json, bin)
 }

@@ -1,4 +1,4 @@
-//! VTK XML readers and writers (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`).
+//! VTK XML readers and writers (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvti`, `.pvtu`).
 //!
 //! Supports `ascii`, `binary` (inline base64, `UInt32`/`UInt64` headers), and `appended`
 //! (`raw` `_` offset binary and `base64`), including `vtkZLibDataCompressor` compression.
@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 pub enum VtkXmlFormat {
     Ascii,
     Binary,
+    BinaryZlib,
     BinaryCompressed,
     Appended,
     AppendedCompressed,
@@ -209,6 +210,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
     let mut ugrid = UnstructuredGrid::new();
     let mut multiblock = MultiBlockDataSet::new();
     let mut pvd_entries: Vec<(f64, PathBuf)> = Vec::new();
+    let mut parallel_pieces: Vec<ParallelPiece> = Vec::new();
 
     let mut section = XmlSection::None;
     let mut active_point_attrs: (Option<String>, Option<String>, Option<String>) =
@@ -270,30 +272,12 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                             }
                         }
                     }
-                    "ImageData" => {
-                        let mut ext = [0isize; 6];
-                        let mut origin = [0.0f64; 3];
-                        let mut spacing = [1.0f64; 3];
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            let val = attr.normalized_value(XmlVersion::Implicit1_0)?;
-                            match attr.key.as_ref() {
-                                "WholeExtent" => ext = parse_extent(&val)?,
-                                "Origin" => origin = parse_vec3_f64(&val)?,
-                                "Spacing" => spacing = parse_vec3_f64(&val)?,
-                                _ => {}
-                            }
-                        }
-                        let dims = extent_to_dims(ext);
-                        let adj_origin = [
-                            origin[0] + ext[0] as f64 * spacing[0],
-                            origin[1] + ext[2] as f64 * spacing[1],
-                            origin[2] + ext[4] as f64 * spacing[2],
-                        ];
-                        image_meta = Some((dims, adj_origin, spacing, ext));
-                        image.dimensions = dims;
-                        image.origin = adj_origin;
-                        image.spacing = spacing;
+                    "ImageData" | "PImageData" => {
+                        let meta = parse_image_meta(&e)?;
+                        image_meta = Some(meta);
+                        image.dimensions = meta.0;
+                        image.origin = meta.1;
+                        image.spacing = meta.2;
                     }
                     "RectilinearGrid" | "StructuredGrid" => {
                         for attr in e.attributes() {
@@ -305,31 +289,38 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                         }
                     }
                     "Piece" => {
-                        piece_verts = (None, None);
-                        piece_lines = (None, None);
-                        piece_strips = (None, None);
-                        piece_polys = (None, None);
-                        piece_cells = (None, None, None);
-                        coord_arrays.clear();
-                        piece_point_base = match file_type.as_str() {
-                            "PolyData" => poly.points.len() as u32,
-                            "UnstructuredGrid" => ugrid.points.len() as u32,
-                            _ => 0,
-                        };
-                        for attr in e.attributes() {
-                            let attr = attr?;
-                            let val = attr.normalized_value(XmlVersion::Implicit1_0)?;
-                            if attr.key.as_ref() == "Extent" {
-                                let ext = parse_extent(&val)?;
-                                if file_type == "ImageData" && image_meta.is_none() {
-                                    image.dimensions = extent_to_dims(ext);
-                                } else if file_type == "StructuredGrid" && whole_extent.is_none() {
-                                    whole_extent = Some(ext);
+                        if is_parallel_file_type(&file_type) {
+                            if let Some(pp) = parse_parallel_piece(&e)? {
+                                parallel_pieces.push(pp);
+                            }
+                        } else {
+                            piece_verts = (None, None);
+                            piece_lines = (None, None);
+                            piece_strips = (None, None);
+                            piece_polys = (None, None);
+                            piece_cells = (None, None, None);
+                            coord_arrays.clear();
+                            piece_point_base = match file_type.as_str() {
+                                "PolyData" => poly.points.len() as u32,
+                                "UnstructuredGrid" => ugrid.points.len() as u32,
+                                _ => 0,
+                            };
+                            for attr in e.attributes() {
+                                let attr = attr?;
+                                let val = attr.normalized_value(XmlVersion::Implicit1_0)?;
+                                if attr.key.as_ref() == "Extent" {
+                                    let ext = parse_extent(&val)?;
+                                    if file_type == "ImageData" && image_meta.is_none() {
+                                        image.dimensions = extent_to_dims(ext);
+                                    } else if file_type == "StructuredGrid" && whole_extent.is_none()
+                                    {
+                                        whole_extent = Some(ext);
+                                    }
                                 }
                             }
                         }
                     }
-                    "PointData" => {
+                    "PointData" | "PPointData" => {
                         section = XmlSection::PointData;
                         let (s, v, n) = parse_active_attrs(&e)?;
                         if s.is_some() {
@@ -342,7 +333,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                             active_point_attrs.2 = n;
                         }
                     }
-                    "CellData" => {
+                    "CellData" | "PCellData" => {
                         section = XmlSection::CellData;
                         let (s, v, n) = parse_active_attrs(&e)?;
                         if s.is_some() {
@@ -393,7 +384,14 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
             }
             Event::Empty(e) => {
                 match e.name().as_ref() {
-                    "PointData" => {
+                    "Piece" => {
+                        if is_parallel_file_type(&file_type)
+                            && let Some(pp) = parse_parallel_piece(&e)?
+                        {
+                            parallel_pieces.push(pp);
+                        }
+                    }
+                    "PointData" | "PPointData" => {
                         let (s, v, n) = parse_active_attrs(&e)?;
                         if s.is_some() {
                             active_point_attrs.0 = s;
@@ -405,7 +403,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                             active_point_attrs.2 = n;
                         }
                     }
-                    "CellData" => {
+                    "CellData" | "PCellData" => {
                         let (s, v, n) = parse_active_attrs(&e)?;
                         if s.is_some() {
                             active_cell_attrs.0 = s;
@@ -620,9 +618,452 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
             }
             Ok(DataSet::MultiBlock(mb))
         }
+        "PPolyData" => {
+            read_pvtp(base_dir, &parallel_pieces, active_point_attrs, active_cell_attrs)
+        }
+        "PImageData" => read_pvti(
+            base_dir,
+            &parallel_pieces,
+            image_meta,
+            active_point_attrs,
+            active_cell_attrs,
+        ),
+        "PUnstructuredGrid" => {
+            read_pvtu(base_dir, &parallel_pieces, active_point_attrs, active_cell_attrs)
+        }
         other => Err(IoError::UnsupportedFormat(format!(
             "Unsupported VTK XML type '{other}'"
         ))),
+    }
+}
+
+struct ParallelPiece {
+    source: String,
+    extent: Option<[isize; 6]>,
+}
+
+fn is_parallel_file_type(ft: &str) -> bool {
+    matches!(ft, "PPolyData" | "PImageData" | "PUnstructuredGrid")
+}
+
+type ImageMetaTuple = ([usize; 3], [f64; 3], [f64; 3], [isize; 6]);
+
+fn parse_image_meta(e: &BytesStart<'_>) -> Result<ImageMetaTuple> {
+    let mut ext = [0isize; 6];
+    let mut origin = [0.0f64; 3];
+    let mut spacing = [1.0f64; 3];
+    for attr in e.attributes() {
+        let attr = attr?;
+        let val = attr.normalized_value(XmlVersion::Implicit1_0)?;
+        match attr.key.as_ref() {
+            "WholeExtent" => ext = parse_extent(&val)?,
+            "Origin" => origin = parse_vec3_f64(&val)?,
+            "Spacing" => spacing = parse_vec3_f64(&val)?,
+            _ => {}
+        }
+    }
+    let dims = extent_to_dims(ext);
+    let adj_origin = [
+        origin[0] + ext[0] as f64 * spacing[0],
+        origin[1] + ext[2] as f64 * spacing[1],
+        origin[2] + ext[4] as f64 * spacing[2],
+    ];
+    Ok((dims, adj_origin, spacing, ext))
+}
+
+fn parse_parallel_piece(e: &BytesStart<'_>) -> Result<Option<ParallelPiece>> {
+    let mut source = None;
+    let mut extent = None;
+    for attr in e.attributes() {
+        let attr = attr?;
+        let val = attr.normalized_value(XmlVersion::Implicit1_0)?;
+        match attr.key.as_ref() {
+            "Source" | "source" => source = Some(val.into_owned()),
+            "Extent" => extent = Some(parse_extent(&val)?),
+            _ => {}
+        }
+    }
+    Ok(source.map(|source| ParallelPiece { source, extent }))
+}
+
+fn load_parallel_pieces(base_dir: &Path, pieces: &[ParallelPiece]) -> Result<Vec<DataSet>> {
+    let mut out = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        let path = base_dir.join(&p.source);
+        if !path.exists() {
+            return Err(IoError::MissingFile(path));
+        }
+        out.push(crate::read_dataset(&path)?);
+    }
+    Ok(out)
+}
+
+fn read_pvtp(
+    base_dir: &Path,
+    pieces: &[ParallelPiece],
+    active_point_attrs: (Option<String>, Option<String>, Option<String>),
+    active_cell_attrs: (Option<String>, Option<String>, Option<String>),
+) -> Result<DataSet> {
+    let loaded = load_parallel_pieces(base_dir, pieces)?;
+    let mut polys = Vec::with_capacity(loaded.len());
+    for (idx, ds) in loaded.into_iter().enumerate() {
+        match ds {
+            DataSet::PolyData(p) => polys.push(p),
+            other => {
+                return Err(IoError::InvalidData(format!(
+                    "PVTP piece {idx} expected PolyData, got {}",
+                    other.type_name()
+                )));
+            }
+        }
+    }
+
+    let mut merged = PolyData::new();
+    for p in &polys {
+        let base = merged.points.len() as u32;
+        merged.points.extend_from_slice(&p.points);
+        merged.verts.extend(p.verts.iter().map(|&v| v + base));
+        merged
+            .lines
+            .extend(p.lines.iter().map(|c| c.iter().map(|&v| v + base).collect()));
+        merged
+            .strips
+            .extend(p.strips.iter().map(|c| c.iter().map(|&v| v + base).collect()));
+        merged
+            .polys
+            .extend(p.polys.iter().map(|c| c.iter().map(|&v| v + base).collect()));
+    }
+
+    let pt_fields: Vec<&FieldData> = polys.iter().map(|p| &p.point_data).collect();
+    let cell_fields: Vec<&FieldData> = polys.iter().map(|p| &p.cell_data).collect();
+    merged.point_data = merge_field_data(&pt_fields, active_point_attrs);
+    merged.cell_data = merge_field_data(&cell_fields, active_cell_attrs);
+    if let Some(first) = polys.first() {
+        merged.field_data = first.field_data.clone();
+    }
+
+    Ok(DataSet::PolyData(merged))
+}
+
+fn read_pvtu(
+    base_dir: &Path,
+    pieces: &[ParallelPiece],
+    active_point_attrs: (Option<String>, Option<String>, Option<String>),
+    active_cell_attrs: (Option<String>, Option<String>, Option<String>),
+) -> Result<DataSet> {
+    let loaded = load_parallel_pieces(base_dir, pieces)?;
+    let mut grids = Vec::with_capacity(loaded.len());
+    for (idx, ds) in loaded.into_iter().enumerate() {
+        match ds {
+            DataSet::UnstructuredGrid(u) => grids.push(u),
+            other => {
+                return Err(IoError::InvalidData(format!(
+                    "PVTU piece {idx} expected UnstructuredGrid, got {}",
+                    other.type_name()
+                )));
+            }
+        }
+    }
+
+    let mut merged = UnstructuredGrid::new();
+    for ug in &grids {
+        let base = merged.points.len() as u32;
+        merged.points.extend_from_slice(&ug.points);
+        for c in 0..ug.num_cells() {
+            let shifted: Vec<u32> = ug.cell_points(c).iter().map(|&i| i + base).collect();
+            merged.push_cell(ug.cell_types[c], &shifted);
+        }
+    }
+
+    let pt_fields: Vec<&FieldData> = grids.iter().map(|g| &g.point_data).collect();
+    let cell_fields: Vec<&FieldData> = grids.iter().map(|g| &g.cell_data).collect();
+    merged.point_data = merge_field_data(&pt_fields, active_point_attrs);
+    merged.cell_data = merge_field_data(&cell_fields, active_cell_attrs);
+    if let Some(first) = grids.first() {
+        merged.field_data = first.field_data.clone();
+    }
+
+    Ok(DataSet::UnstructuredGrid(merged))
+}
+
+fn read_pvti(
+    base_dir: &Path,
+    pieces: &[ParallelPiece],
+    image_meta: Option<ImageMetaTuple>,
+    active_point_attrs: (Option<String>, Option<String>, Option<String>),
+    active_cell_attrs: (Option<String>, Option<String>, Option<String>),
+) -> Result<DataSet> {
+    let loaded = load_parallel_pieces(base_dir, pieces)?;
+    if let Some((whole_dims, adj_origin, spacing, whole_ext)) = image_meta
+        && let Some(merged) = try_merge_pvti_images(
+            pieces,
+            &loaded,
+            whole_dims,
+            adj_origin,
+            spacing,
+            whole_ext,
+            &active_point_attrs,
+            &active_cell_attrs,
+        )
+    {
+        return Ok(DataSet::ImageData(merged));
+    }
+
+    let mut mb = MultiBlockDataSet::new();
+    for (idx, ds) in loaded.into_iter().enumerate() {
+        let label = pieces
+            .get(idx)
+            .map(|p| p.source.clone())
+            .unwrap_or_else(|| format!("piece_{idx}"));
+        mb.add_block(label, ds);
+    }
+    Ok(DataSet::MultiBlock(mb))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_merge_pvti_images(
+    pieces: &[ParallelPiece],
+    loaded: &[DataSet],
+    whole_dims: [usize; 3],
+    adj_origin: [f64; 3],
+    spacing: [f64; 3],
+    whole_ext: [isize; 6],
+    active_point_attrs: &(Option<String>, Option<String>, Option<String>),
+    active_cell_attrs: &(Option<String>, Option<String>, Option<String>),
+) -> Option<ImageData> {
+    if loaded.is_empty() || whole_dims.contains(&0) {
+        return None;
+    }
+
+    let raw_origin = [
+        adj_origin[0] - whole_ext[0] as f64 * spacing[0],
+        adj_origin[1] - whole_ext[2] as f64 * spacing[1],
+        adj_origin[2] - whole_ext[4] as f64 * spacing[2],
+    ];
+
+    let mut piece_images = Vec::with_capacity(loaded.len());
+    let mut piece_exts = Vec::with_capacity(loaded.len());
+
+    for (idx, ds) in loaded.iter().enumerate() {
+        let DataSet::ImageData(img) = ds else {
+            return None;
+        };
+        let ext = match pieces.get(idx).and_then(|p| p.extent) {
+            Some(e) => e,
+            None => {
+                let mut e = [0isize; 6];
+                for axis in 0..3 {
+                    let sp = spacing[axis];
+                    if sp.abs() < 1e-15 {
+                        return None;
+                    }
+                    let start = ((img.origin[axis] - raw_origin[axis]) / sp).round() as isize;
+                    e[2 * axis] = start;
+                    e[2 * axis + 1] = start + img.dimensions[axis] as isize - 1;
+                }
+                e
+            }
+        };
+        if ext[0] < whole_ext[0]
+            || ext[1] > whole_ext[1]
+            || ext[2] < whole_ext[2]
+            || ext[3] > whole_ext[3]
+            || ext[4] < whole_ext[4]
+            || ext[5] > whole_ext[5]
+        {
+            return None;
+        }
+        piece_images.push(img);
+        piece_exts.push(ext);
+    }
+
+    let mut merged = ImageData::new(whole_dims, adj_origin, spacing);
+    let pt_fields: Vec<&FieldData> = piece_images.iter().map(|i| &i.point_data).collect();
+    let pt_piece_dims: Vec<[usize; 3]> = piece_exts.iter().map(|&e| extent_to_dims(e)).collect();
+    let pt_offsets: Vec<[usize; 3]> = piece_exts
+        .iter()
+        .map(|e| {
+            [
+                (e[0] - whole_ext[0]) as usize,
+                (e[2] - whole_ext[2]) as usize,
+                (e[4] - whole_ext[4]) as usize,
+            ]
+        })
+        .collect();
+    merged.point_data = scatter_image_field(
+        &pt_fields,
+        &pt_piece_dims,
+        &pt_offsets,
+        whole_dims,
+        active_point_attrs.clone(),
+    )?;
+
+    let whole_cell_dims = [
+        (whole_ext[1] - whole_ext[0]).max(1) as usize,
+        (whole_ext[3] - whole_ext[2]).max(1) as usize,
+        (whole_ext[5] - whole_ext[4]).max(1) as usize,
+    ];
+    let cell_fields: Vec<&FieldData> = piece_images.iter().map(|i| &i.cell_data).collect();
+    let cell_piece_dims: Vec<[usize; 3]> = piece_exts
+        .iter()
+        .map(|e| {
+            [
+                (e[1] - e[0]).max(1) as usize,
+                (e[3] - e[2]).max(1) as usize,
+                (e[5] - e[4]).max(1) as usize,
+            ]
+        })
+        .collect();
+    merged.cell_data = scatter_image_field(
+        &cell_fields,
+        &cell_piece_dims,
+        &pt_offsets,
+        whole_cell_dims,
+        active_cell_attrs.clone(),
+    )?;
+
+    if let Some(first) = piece_images.first() {
+        merged.field_data = first.field_data.clone();
+    }
+    Some(merged)
+}
+
+fn scatter_image_field(
+    fields: &[&FieldData],
+    piece_dims: &[[usize; 3]],
+    piece_offsets: &[[usize; 3]],
+    whole_dims: [usize; 3],
+    active_override: (Option<String>, Option<String>, Option<String>),
+) -> Option<FieldData> {
+    let mut names: Vec<String> = Vec::new();
+    for f in fields {
+        for a in f.arrays() {
+            if !names.contains(&a.name) {
+                names.push(a.name.clone());
+            }
+        }
+    }
+
+    let mut out = FieldData::new();
+    if let Some(first) = fields.first() {
+        out.active_scalars = first.active_scalars.clone();
+        out.active_vectors = first.active_vectors.clone();
+        out.active_normals = first.active_normals.clone();
+    }
+    apply_active_attrs(&mut out, active_override);
+
+    let total_tuples = whole_dims[0] * whole_dims[1] * whole_dims[2];
+    for name in names {
+        let proto = fields.iter().find_map(|f| f.get(&name))?;
+        let nc = proto.num_components;
+        let mut buf = allocate_zeroed_array_data(proto.data.scalar_type(), total_tuples * nc);
+
+        for (p_idx, f) in fields.iter().enumerate() {
+            let Some(arr) = f.get(&name) else {
+                continue;
+            };
+            let [pnx, pny, pnz] = piece_dims[p_idx];
+            if arr.num_tuples() != pnx * pny * pnz || arr.num_components != nc {
+                return None;
+            }
+            let [ox, oy, oz] = piece_offsets[p_idx];
+            for lk in 0..pnz {
+                for lj in 0..pny {
+                    for li in 0..pnx {
+                        let src_t = li + pnx * (lj + pny * lk);
+                        let dst_t = (ox + li) + whole_dims[0] * ((oy + lj) + whole_dims[1] * (oz + lk));
+                        copy_tuple(&mut buf, dst_t, &arr.data, src_t, nc);
+                    }
+                }
+            }
+        }
+        out.add_array(DataArray::new(name, nc, buf));
+    }
+
+    Some(out)
+}
+
+fn merge_field_data(
+    fields: &[&FieldData],
+    active_override: (Option<String>, Option<String>, Option<String>),
+) -> FieldData {
+    let mut names: Vec<String> = Vec::new();
+    for f in fields {
+        for a in f.arrays() {
+            if !names.contains(&a.name) {
+                names.push(a.name.clone());
+            }
+        }
+    }
+
+    let mut out = FieldData::new();
+    if let Some(first) = fields.first() {
+        out.active_scalars = first.active_scalars.clone();
+        out.active_vectors = first.active_vectors.clone();
+        out.active_normals = first.active_normals.clone();
+    }
+    apply_active_attrs(&mut out, active_override);
+
+    for name in names {
+        let Some(proto) = fields.iter().find_map(|f| f.get(&name)) else {
+            continue;
+        };
+        let nc = proto.num_components;
+        let mut merged_data = allocate_zeroed_array_data(proto.data.scalar_type(), 0);
+        for f in fields {
+            if let Some(arr) = f.get(&name) {
+                append_array_data(&mut merged_data, &arr.data);
+            }
+        }
+        out.add_array(DataArray::new(name, nc, merged_data));
+    }
+    out
+}
+
+fn allocate_zeroed_array_data(st: ScalarType, len: usize) -> ArrayData {
+    match st {
+        ScalarType::F32 => ArrayData::F32(vec![0.0; len]),
+        ScalarType::F64 => ArrayData::F64(vec![0.0; len]),
+        ScalarType::I32 => ArrayData::I32(vec![0; len]),
+        ScalarType::U32 => ArrayData::U32(vec![0; len]),
+        ScalarType::I64 => ArrayData::I64(vec![0; len]),
+        ScalarType::U8 => ArrayData::U8(vec![0; len]),
+    }
+}
+
+fn append_array_data(dst: &mut ArrayData, src: &ArrayData) {
+    match (dst, src) {
+        (ArrayData::F32(d), ArrayData::F32(s)) => d.extend_from_slice(s),
+        (ArrayData::F64(d), ArrayData::F64(s)) => d.extend_from_slice(s),
+        (ArrayData::I32(d), ArrayData::I32(s)) => d.extend_from_slice(s),
+        (ArrayData::U32(d), ArrayData::U32(s)) => d.extend_from_slice(s),
+        (ArrayData::I64(d), ArrayData::I64(s)) => d.extend_from_slice(s),
+        (ArrayData::U8(d), ArrayData::U8(s)) => d.extend_from_slice(s),
+        (dst_any, src_any) => {
+            let mut promoted = dst_any.to_f64_vec();
+            promoted.extend(src_any.to_f64_vec());
+            *dst_any = ArrayData::F64(promoted);
+        }
+    }
+}
+
+fn copy_tuple(dst: &mut ArrayData, dst_t: usize, src: &ArrayData, src_t: usize, nc: usize) {
+    let db = dst_t * nc;
+    let sb = src_t * nc;
+    match (dst, src) {
+        (ArrayData::F32(d), ArrayData::F32(s)) => d[db..db + nc].copy_from_slice(&s[sb..sb + nc]),
+        (ArrayData::F64(d), ArrayData::F64(s)) => d[db..db + nc].copy_from_slice(&s[sb..sb + nc]),
+        (ArrayData::I32(d), ArrayData::I32(s)) => d[db..db + nc].copy_from_slice(&s[sb..sb + nc]),
+        (ArrayData::U32(d), ArrayData::U32(s)) => d[db..db + nc].copy_from_slice(&s[sb..sb + nc]),
+        (ArrayData::I64(d), ArrayData::I64(s)) => d[db..db + nc].copy_from_slice(&s[sb..sb + nc]),
+        (ArrayData::U8(d), ArrayData::U8(s)) => d[db..db + nc].copy_from_slice(&s[sb..sb + nc]),
+        (dst_any, src_any) => {
+            let mut promoted = dst_any.to_f64_vec();
+            for c in 0..nc {
+                promoted[db + c] = src_any.get_f64(sb + c);
+            }
+            *dst_any = ArrayData::F64(promoted);
+        }
     }
 }
 
@@ -1465,7 +1906,7 @@ pub fn write_vtk_xml_with_format(
     let mut appended_buf: Vec<u8> = Vec::new();
     let is_compressed = matches!(
         format,
-        VtkXmlFormat::BinaryCompressed | VtkXmlFormat::AppendedCompressed
+        VtkXmlFormat::BinaryZlib | VtkXmlFormat::BinaryCompressed | VtkXmlFormat::AppendedCompressed
     );
     let is_appended = matches!(
         format,
@@ -1834,8 +2275,11 @@ fn write_xml_data_array(
             writeln!(w)?;
             writeln!(w, "{indent}</DataArray>")?;
         }
-        VtkXmlFormat::Binary | VtkXmlFormat::BinaryCompressed => {
-            let compressed = format == VtkXmlFormat::BinaryCompressed;
+        VtkXmlFormat::Binary | VtkXmlFormat::BinaryZlib | VtkXmlFormat::BinaryCompressed => {
+            let compressed = matches!(
+                format,
+                VtkXmlFormat::BinaryZlib | VtkXmlFormat::BinaryCompressed
+            );
             let block = encode_vtk_binary_block(&array_data_to_le_bytes(&arr.data), compressed)?;
             let b64 = BASE64.encode(&block);
             writeln!(

@@ -2,18 +2,27 @@
 //!
 //! Provides readers, writers, and pipeline [`Source`] implementations for:
 //! - Legacy VTK (`.vtk`, ASCII and Big-Endian Binary)
-//! - VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, ASCII / Base64 Binary / Appended / Zlib)
+//! - VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvti`, `.pvtu`, ASCII / Base64 Binary / Appended / Zlib)
+//! - Raw binary 3D volumes (`.raw`)
+//! - Binary glTF 2.0 export (`.glb`)
 //! - Mesh formats (`.stl` ASCII & Binary, `.obj`, `.ply` ASCII & Binary LE/BE)
 //! - Delimited point clouds (`.csv`, `.tsv`)
 
 pub mod csv;
 pub mod error;
+pub mod gltf;
 pub mod mesh;
+pub mod raw_volume;
 pub mod vtk_legacy;
 pub mod vtk_xml;
 
 pub use error::{IoError, Result};
+pub use gltf::write_glb;
 pub use mesh::PlyFormat;
+pub use raw_volume::{
+    read_raw_volume, read_raw_volume_i16, read_raw_volume_u16, read_raw_volume_with_type,
+    RawEndian, RawScalarType, RawVolumeDescriptor,
+};
 pub use vtk_legacy::VtkLegacyFormat;
 pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
 
@@ -47,7 +56,9 @@ pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
                 vtk_legacy::read_vtk_legacy(path)
             }
         }
-        "vtp" | "vti" | "vtu" | "vtr" | "vts" | "vtm" | "pvd" => vtk_xml::read_vtk_xml(path),
+        "vtp" | "vti" | "vtu" | "vtr" | "vts" | "vtm" | "pvd" | "pvtp" | "pvti" | "pvtu" => {
+            vtk_xml::read_vtk_xml(path)
+        }
         "stl" => Ok(DataSet::PolyData(mesh::read_stl(path)?)),
         "obj" => Ok(DataSet::PolyData(mesh::read_obj(path)?)),
         "ply" => Ok(DataSet::PolyData(mesh::read_ply(path)?)),
@@ -108,6 +119,13 @@ pub fn write_dataset(path: impl AsRef<Path>, dataset: &DataSet) -> Result<()> {
             DataSet::PolyData(p) => csv::write_csv(path, p),
             other => Err(IoError::UnsupportedFormat(format!(
                 "CSV writer requires PolyData, got {}",
+                other.type_name()
+            ))),
+        },
+        "glb" => match dataset {
+            DataSet::PolyData(p) => gltf::write_glb(path, p, None, None),
+            other => Err(IoError::UnsupportedFormat(format!(
+                "GLB writer requires PolyData, got {}",
                 other.type_name()
             ))),
         },
