@@ -23,7 +23,7 @@ pub(super) fn build_cached_geometry(
 ) -> CachedGeometry {
     match style.representation {
         Representation::Surface => {
-            let prep = mesh_prep::prepare_surface_indexed(dataset, &style.color_by);
+            let prep = mesh_prep::prepare_surface_indexed_with_style(dataset, style);
             if prep.indices.is_empty() || prep.geom_vertices.is_empty() {
                 return CachedGeometry::Empty;
             }
@@ -53,7 +53,7 @@ pub(super) fn build_cached_geometry(
             }
         }
         Representation::SurfaceWithEdges => {
-            let prep = mesh_prep::prepare_surface(dataset, &style.color_by);
+            let prep = mesh_prep::prepare_surface_with_style(dataset, style);
             if prep.vertices.is_empty() {
                 return CachedGeometry::Empty;
             }
@@ -69,7 +69,7 @@ pub(super) fn build_cached_geometry(
             }
         }
         Representation::Wireframe => {
-            let prep = mesh_prep::prepare_wireframe(dataset, &style.color_by);
+            let prep = mesh_prep::prepare_wireframe_with_style(dataset, style);
             if prep.vertices.is_empty() {
                 return CachedGeometry::Empty;
             }
@@ -85,7 +85,7 @@ pub(super) fn build_cached_geometry(
             }
         }
         Representation::Outline => {
-            let verts = mesh_prep::prepare_outline(&dataset.bounds());
+            let verts = mesh_prep::prepare_outline(&style.dataset_bounds(dataset));
             if verts.is_empty() {
                 return CachedGeometry::Empty;
             }
@@ -101,7 +101,7 @@ pub(super) fn build_cached_geometry(
             }
         }
         Representation::Points | Representation::PointGaussian => {
-            let prep = mesh_prep::prepare_points(dataset, &style.color_by);
+            let prep = mesh_prep::prepare_points_with_style(dataset, style);
             if prep.instances.is_empty() {
                 return CachedGeometry::Empty;
             }
@@ -117,7 +117,7 @@ pub(super) fn build_cached_geometry(
             }
         }
         Representation::Volume => {
-            let Some(vol) = mesh_prep::prepare_volume(dataset, &style.color_by) else {
+            let Some(vol) = mesh_prep::prepare_volume_with_style(dataset, style) else {
                 return CachedGeometry::Empty;
             };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -552,6 +552,11 @@ pub(super) fn create_pipelines(
                 offset: 12,
                 shader_location: 1,
             },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 24,
+                shader_location: 4,
+            },
         ],
     };
     let surface_scalar_vbl = wgpu::VertexBufferLayout {
@@ -586,6 +591,11 @@ pub(super) fn create_pipelines(
                 format: wgpu::VertexFormat::Float32x3,
                 offset: 28,
                 shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 40,
+                shader_location: 4,
             },
         ],
     };
@@ -667,14 +677,24 @@ pub(super) fn create_pipelines(
                         shader_location: 1,
                     },
                     wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
+                        format: wgpu::VertexFormat::Float32x4,
                         offset: 16,
+                        shader_location: 4,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 32,
                         shader_location: 2,
                     },
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32,
-                        offset: 28,
+                        offset: 44,
                         shader_location: 3,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 48,
+                        shader_location: 5,
                     },
                 ],
             })],
@@ -736,6 +756,11 @@ pub(super) fn create_pipelines(
                             format: wgpu::VertexFormat::Float32,
                             offset: 12,
                             shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 3,
                         },
                     ],
                 }),

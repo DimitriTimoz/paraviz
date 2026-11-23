@@ -643,8 +643,11 @@ impl WebGpuRenderer {
         }
         drop(mapped);
         staging.unmap();
-        if scene.settings.show_scalar_bar {
-            crate::legend::composite_scalar_bar(scene, &mut rgba, width, height);
+        if scene.settings.show_scalar_bar
+            || scene.settings.show_time_annotation
+            || scene.settings.annotations.iter().any(|a| a.visible)
+        {
+            crate::legend::composite_viewport_overlays(scene, &mut rgba, width, height);
         }
         Ok(rgba)
     }
@@ -813,16 +816,16 @@ impl WebGpuRenderer {
                     let frac = i as f32 / n_ticks as f32;
                     // X-axis ticks along bottom-front edge
                     let x = bb.min.x + (bb.max.x - bb.min.x) * frac;
-                    line_verts.push(mesh_prep::LineVertex { position: [x, bb.min.y, bb.min.z], scalar: 0.0 });
-                    line_verts.push(mesh_prep::LineVertex { position: [x, bb.min.y - tick_len, bb.min.z], scalar: 0.0 });
+                    line_verts.push(mesh_prep::LineVertex { position: [x, bb.min.y, bb.min.z], scalar: 0.0, color_override: mesh_prep::NO_COLOR_OVERRIDE });
+                    line_verts.push(mesh_prep::LineVertex { position: [x, bb.min.y - tick_len, bb.min.z], scalar: 0.0, color_override: mesh_prep::NO_COLOR_OVERRIDE });
                     // Y-axis ticks along left-front edge
                     let y = bb.min.y + (bb.max.y - bb.min.y) * frac;
-                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x, y, bb.min.z], scalar: 0.0 });
-                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x - tick_len, y, bb.min.z], scalar: 0.0 });
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x, y, bb.min.z], scalar: 0.0, color_override: mesh_prep::NO_COLOR_OVERRIDE });
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x - tick_len, y, bb.min.z], scalar: 0.0, color_override: mesh_prep::NO_COLOR_OVERRIDE });
                     // Z-axis ticks along bottom-left edge
                     let z = bb.min.z + (bb.max.z - bb.min.z) * frac;
-                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x, bb.min.y, z], scalar: 0.0 });
-                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x - tick_len, bb.min.y, z], scalar: 0.0 });
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x, bb.min.y, z], scalar: 0.0, color_override: mesh_prep::NO_COLOR_OVERRIDE });
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x - tick_len, bb.min.y, z], scalar: 0.0, color_override: mesh_prep::NO_COLOR_OVERRIDE });
                 }
             }
             self.bbox_vertex_count = line_verts.len() as u32;
@@ -1105,7 +1108,7 @@ impl WebGpuRenderer {
                 .enumerate()
                 .filter(|(_, a)| a.style.visible && a.style.opacity < 0.999)
                 .map(|(idx, a)| {
-                    let c = a.dataset.bounds().center();
+                    let c = a.style.dataset_bounds(&a.dataset).center();
                     let dist2 = (c - scene.camera.position).length_squared();
                     (idx, dist2)
                 })
@@ -1302,11 +1305,15 @@ impl WebGpuRenderer {
     }
 
     fn sync_actor_cache(&mut self, actor: &SceneActor) {
+        let style_hash = actor_style_hash(&actor.style);
         let mut scalar_only_update = false;
         let needs_rebuild = match self.actor_cache.get(&actor.id) {
             Some(c) => {
                 if !Arc::ptr_eq(&c.dataset, &actor.dataset)
                     || c.representation != actor.style.representation
+                    || c.actor_style_hash != style_hash
+                    || c.hidden_blocks != actor.style.hidden_blocks
+                    || c.block_colors != actor.style.block_colors
                 {
                     true
                 } else if c.color_by != actor.style.color_by {
@@ -1357,7 +1364,7 @@ impl WebGpuRenderer {
             }
         }
 
-        if needs_rebuild {
+        if needs_rebuild || scalar_only_update {
             let geometry = build_cached_geometry(&self.device, &self.queue, &actor.dataset, &actor.style);
             let lut_texture = create_lut_texture(
                 &self.device,
@@ -1433,6 +1440,9 @@ impl WebGpuRenderer {
                     dataset: Arc::clone(&actor.dataset),
                     representation: actor.style.representation,
                     color_by: actor.style.color_by.clone(),
+                    actor_style_hash: style_hash,
+                    hidden_blocks: actor.style.hidden_blocks.clone(),
+                    block_colors: actor.style.block_colors.clone(),
                     geometry,
                     colormap: actor.style.colormap.clone(),
                     lut_texture,

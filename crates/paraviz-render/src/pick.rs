@@ -28,6 +28,7 @@ struct PickTriMesh {
 struct CachedPickEntry {
     actor_id: u64,
     dataset_weak: Weak<DataSet>,
+    block_path: Option<String>,
     color_by: ColorBy,
     mesh: Arc<PickTriMesh>,
 }
@@ -69,32 +70,40 @@ fn build_pick_trimesh(dataset: &DataSet, color_by: &ColorBy) -> PickTriMesh {
     }
 }
 
-fn get_or_build_pick_trimesh(actor: &SceneActor) -> Arc<PickTriMesh> {
+fn get_or_build_pick_trimesh(
+    actor_id: u64,
+    root_dataset: &Arc<DataSet>,
+    leaf_dataset: &DataSet,
+    block_path: Option<&str>,
+    color_by: &ColorBy,
+) -> Arc<PickTriMesh> {
     let cache = PICK_SURFACE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(mut entries) = cache.lock() {
         entries.retain(|e| e.dataset_weak.strong_count() > 0);
         if let Some(found) = entries.iter().find(|e| {
-            e.actor_id == actor.id
-                && e.color_by == actor.style.color_by
+            e.actor_id == actor_id
+                && e.block_path.as_deref() == block_path
+                && e.color_by == *color_by
                 && e.dataset_weak
                     .upgrade()
-                    .is_some_and(|d| Arc::ptr_eq(&d, &actor.dataset))
+                    .is_some_and(|d| Arc::ptr_eq(&d, root_dataset))
         }) {
             return Arc::clone(&found.mesh);
         }
-        let mesh = Arc::new(build_pick_trimesh(&actor.dataset, &actor.style.color_by));
+        let mesh = Arc::new(build_pick_trimesh(leaf_dataset, color_by));
         if entries.len() >= MAX_PICK_CACHE_ENTRIES {
             entries.remove(0);
         }
         entries.push(CachedPickEntry {
-            actor_id: actor.id,
-            dataset_weak: Arc::downgrade(&actor.dataset),
-            color_by: actor.style.color_by.clone(),
+            actor_id,
+            dataset_weak: Arc::downgrade(root_dataset),
+            block_path: block_path.map(str::to_string),
+            color_by: color_by.clone(),
             mesh: Arc::clone(&mesh),
         });
         mesh
     } else {
-        Arc::new(build_pick_trimesh(&actor.dataset, &actor.style.color_by))
+        Arc::new(build_pick_trimesh(leaf_dataset, color_by))
     }
 }
 
@@ -103,6 +112,8 @@ fn get_or_build_pick_trimesh(actor: &SceneActor) -> Arc<PickTriMesh> {
 pub struct PickResult {
     pub actor_id: u64,
     pub actor_name: String,
+    /// Slash-joined MultiBlock child path when picking into a `MultiBlockDataSet`, or `None`.
+    pub block_path: Option<String>,
     pub world_pos: [f32; 3],
     pub distance: f32,
     pub point_index: Option<usize>,
@@ -148,6 +159,22 @@ pub fn pick_scene(
     best
 }
 
+fn aabb_pad_for_style(style: &ActorStyle, bounds: &BoundingBox, ray_origin: Vec3, pixel_world_scale: f32, orthographic: bool) -> f32 {
+    match style.representation {
+        Representation::Points | Representation::PointGaussian => {
+            let approx_dist = (bounds.center() - ray_origin).length().max(1.0);
+            let scale = if orthographic { 1.0 } else { approx_dist };
+            style.point_size.max(4.0) * scale * pixel_world_scale + bounds.diagonal() * 0.02
+        }
+        Representation::Wireframe | Representation::Outline => {
+            let approx_dist = (bounds.center() - ray_origin).length().max(1.0);
+            let scale = if orthographic { 1.0 } else { approx_dist };
+            style.line_width.max(2.0) * 2.0 * scale * pixel_world_scale + bounds.diagonal() * 0.02
+        }
+        Representation::Surface | Representation::SurfaceWithEdges | Representation::Volume => 1e-4,
+    }
+}
+
 fn pick_actor(
     actor: &SceneActor,
     ray_origin: Vec3,
@@ -156,26 +183,105 @@ fn pick_actor(
     orthographic: bool,
     max_t: f32,
 ) -> Option<PickResult> {
-    let bounds = actor.dataset.bounds();
+    let bounds = actor.style.dataset_bounds(&actor.dataset);
     if !bounds.is_valid() {
         return None;
     }
 
-    // Pad AABB for point/wireframe representations so grazing picks on boundary points still pass pre-cull.
-    let aabb_pad = match actor.style.representation {
-        Representation::Points | Representation::PointGaussian => {
-            let approx_dist = (bounds.center() - ray_origin).length().max(1.0);
-            let scale = if orthographic { 1.0 } else { approx_dist };
-            actor.style.point_size.max(4.0) * scale * pixel_world_scale + bounds.diagonal() * 0.02
-        }
-        Representation::Wireframe | Representation::Outline => {
-            let approx_dist = (bounds.center() - ray_origin).length().max(1.0);
-            let scale = if orthographic { 1.0 } else { approx_dist };
-            actor.style.line_width.max(2.0) * 2.0 * scale * pixel_world_scale + bounds.diagonal() * 0.02
-        }
-        Representation::Surface | Representation::SurfaceWithEdges | Representation::Volume => 1e-4,
-    };
+    let aabb_pad = aabb_pad_for_style(&actor.style, &bounds, ray_origin, pixel_world_scale, orthographic);
+    let padded = BoundingBox::new(
+        bounds.min - Vec3::splat(aabb_pad),
+        bounds.max + Vec3::splat(aabb_pad),
+    );
+    let (t_enter, t_exit) = ray_aabb_intersect(ray_origin, ray_dir, &padded)?;
+    if t_exit < 0.0 || t_enter > max_t {
+        return None;
+    }
 
+    if actor.style.representation == Representation::Outline {
+        let outline = mesh_prep::prepare_outline(&bounds);
+        let mut best_t = max_t;
+        let mut best_pos = None;
+        for seg in outline.as_chunks::<2>().0 {
+            let a = Vec3::from_array(seg[0].position);
+            let b = Vec3::from_array(seg[1].position);
+            if let Some((t, hit_pos)) =
+                ray_segment_hit(ray_origin, ray_dir, a, b, actor.style.line_width, pixel_world_scale, orthographic)
+                && t < best_t
+            {
+                best_t = t;
+                best_pos = Some(hit_pos);
+            }
+        }
+        return best_pos.map(|p| PickResult {
+            actor_id: actor.id,
+            actor_name: actor.name.clone(),
+            block_path: None,
+            world_pos: p.to_array(),
+            distance: best_t,
+            point_index: None,
+            cell_index: None,
+            scalar_value: None,
+        });
+    }
+
+    pick_dataset(
+        actor,
+        &actor.dataset,
+        None,
+        ray_origin,
+        ray_dir,
+        pixel_world_scale,
+        orthographic,
+        max_t,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_dataset(
+    actor: &SceneActor,
+    dataset: &DataSet,
+    block_path: Option<&str>,
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    pixel_world_scale: f32,
+    orthographic: bool,
+    max_t: f32,
+) -> Option<PickResult> {
+    if let DataSet::MultiBlock(mb) = dataset {
+        let mut best_t = max_t;
+        let mut best: Option<PickResult> = None;
+        for (name, child) in &mb.blocks {
+            let child_path = match block_path {
+                Some(p) if !p.is_empty() => format!("{p}/{name}"),
+                _ => name.clone(),
+            };
+            if !actor.style.is_block_visible(&child_path, name) {
+                continue;
+            }
+            if let Some(hit) = pick_dataset(
+                actor,
+                child,
+                Some(&child_path),
+                ray_origin,
+                ray_dir,
+                pixel_world_scale,
+                orthographic,
+                best_t,
+            ) && hit.distance < best_t
+            {
+                best_t = hit.distance;
+                best = Some(hit);
+            }
+        }
+        return best;
+    }
+
+    let bounds = dataset.bounds();
+    if !bounds.is_valid() {
+        return None;
+    }
+    let aabb_pad = aabb_pad_for_style(&actor.style, &bounds, ray_origin, pixel_world_scale, orthographic);
     let padded = BoundingBox::new(
         bounds.min - Vec3::splat(aabb_pad),
         bounds.max + Vec3::splat(aabb_pad),
@@ -187,49 +293,29 @@ fn pick_actor(
 
     match actor.style.representation {
         Representation::Surface | Representation::SurfaceWithEdges => {
-            pick_surface(actor, ray_origin, ray_dir, max_t)
+            pick_surface(actor, dataset, block_path, ray_origin, ray_dir, max_t)
         }
         Representation::Points | Representation::PointGaussian => {
-            pick_points(actor, ray_origin, ray_dir, pixel_world_scale, orthographic, max_t)
+            pick_points(actor, dataset, block_path, ray_origin, ray_dir, pixel_world_scale, orthographic, max_t)
         }
         Representation::Wireframe => {
-            pick_wireframe(actor, ray_origin, ray_dir, pixel_world_scale, orthographic, max_t)
+            pick_wireframe(actor, dataset, block_path, ray_origin, ray_dir, pixel_world_scale, orthographic, max_t)
         }
-        Representation::Outline => {
-            let outline = mesh_prep::prepare_outline(&bounds);
-            let mut best_t = max_t;
-            let mut best_pos = None;
-            for seg in outline.as_chunks::<2>().0 {
-                let a = Vec3::from_array(seg[0].position);
-                let b = Vec3::from_array(seg[1].position);
-                if let Some((t, hit_pos)) =
-                    ray_segment_hit(ray_origin, ray_dir, a, b, actor.style.line_width, pixel_world_scale, orthographic)
-                    && t < best_t
-                {
-                    best_t = t;
-                    best_pos = Some(hit_pos);
-                }
-            }
-            best_pos.map(|p| PickResult {
-                actor_id: actor.id,
-                actor_name: actor.name.clone(),
-                world_pos: p.to_array(),
-                distance: best_t,
-                point_index: None,
-                cell_index: None,
-                scalar_value: None,
-            })
-        }
+        Representation::Outline => None,
         Representation::Volume => {
+            let DataSet::ImageData(img) = dataset else {
+                return None;
+            };
             let t = t_enter.max(0.0);
             if t >= max_t {
                 return None;
             }
             let world_pos = ray_origin + ray_dir * t;
-            let scalar_value = sample_volume_scalar(&actor.dataset, &actor.style, world_pos);
+            let scalar_value = sample_volume_scalar(img, &actor.style, world_pos);
             Some(PickResult {
                 actor_id: actor.id,
                 actor_name: actor.name.clone(),
+                block_path: block_path.map(str::to_string),
                 world_pos: world_pos.to_array(),
                 distance: t,
                 point_index: None,
@@ -242,16 +328,24 @@ fn pick_actor(
 
 fn pick_surface(
     actor: &SceneActor,
+    dataset: &DataSet,
+    block_path: Option<&str>,
     ray_origin: Vec3,
     ray_dir: Vec3,
     max_t: f32,
 ) -> Option<PickResult> {
-    if let DataSet::PolyData(poly) = actor.dataset.as_ref() {
-        return pick_polydata_surface(actor, poly, ray_origin, ray_dir, max_t);
+    if let DataSet::PolyData(poly) = dataset {
+        return pick_polydata_surface(actor, poly, block_path, ray_origin, ray_dir, max_t);
     }
 
     // Cached indexed boundary surface with chunk AABB pre-filtering + Rayon parallel ray intersection.
-    let mesh = get_or_build_pick_trimesh(actor);
+    let mesh = get_or_build_pick_trimesh(
+        actor.id,
+        &actor.dataset,
+        dataset,
+        block_path,
+        &actor.style.color_by,
+    );
     if mesh.tris.is_empty() {
         return None;
     }
@@ -313,6 +407,7 @@ fn pick_surface(
     best_hit.map(|(best_t, _, pos, best_scalar)| PickResult {
         actor_id: actor.id,
         actor_name: actor.name.clone(),
+        block_path: block_path.map(str::to_string),
         world_pos: pos.to_array(),
         distance: best_t,
         point_index: None,
@@ -333,6 +428,7 @@ struct PolyTriHit {
 fn pick_polydata_surface(
     actor: &SceneActor,
     poly: &PolyData,
+    block_path: Option<&str>,
     ray_origin: Vec3,
     ray_dir: Vec3,
     max_t: f32,
@@ -493,6 +589,7 @@ fn pick_polydata_surface(
     Some(PickResult {
         actor_id: actor.id,
         actor_name: actor.name.clone(),
+        block_path: block_path.map(str::to_string),
         world_pos: hit.pos.to_array(),
         distance: hit.t,
         point_index: Some(hit.point_index),
@@ -501,15 +598,18 @@ fn pick_polydata_surface(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pick_points(
     actor: &SceneActor,
+    dataset: &DataSet,
+    block_path: Option<&str>,
     ray_origin: Vec3,
     ray_dir: Vec3,
     pixel_world_scale: f32,
     orthographic: bool,
     max_t: f32,
 ) -> Option<PickResult> {
-    let prep = mesh_prep::prepare_points(&actor.dataset, &actor.style.color_by);
+    let prep = mesh_prep::prepare_points(dataset, &actor.style.color_by);
     let mut best_t = max_t;
     let mut best_hit: Option<(Vec3, usize, f32)> = None;
 
@@ -534,8 +634,7 @@ fn pick_points(
     let scalar_value = if !matches!(actor.style.color_by, ColorBy::Solid(_)) {
         Some(scalar as f64)
     } else {
-        actor
-            .dataset
+        dataset
             .point_data()
             .and_then(|pd| pd.active_scalars_array())
             .filter(|a| idx < a.num_tuples())
@@ -545,6 +644,7 @@ fn pick_points(
     Some(PickResult {
         actor_id: actor.id,
         actor_name: actor.name.clone(),
+        block_path: block_path.map(str::to_string),
         world_pos: pos.to_array(),
         distance: best_t,
         point_index: Some(idx),
@@ -553,15 +653,18 @@ fn pick_points(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pick_wireframe(
     actor: &SceneActor,
+    dataset: &DataSet,
+    block_path: Option<&str>,
     ray_origin: Vec3,
     ray_dir: Vec3,
     pixel_world_scale: f32,
     orthographic: bool,
     max_t: f32,
 ) -> Option<PickResult> {
-    let prep = mesh_prep::prepare_wireframe(&actor.dataset, &actor.style.color_by);
+    let prep = mesh_prep::prepare_wireframe(dataset, &actor.style.color_by);
     let mut best_t = max_t;
     let mut best_hit: Option<(Vec3, f32)> = None;
 
@@ -594,6 +697,7 @@ fn pick_wireframe(
     Some(PickResult {
         actor_id: actor.id,
         actor_name: actor.name.clone(),
+        block_path: block_path.map(str::to_string),
         world_pos: pos.to_array(),
         distance: best_t,
         point_index: None,
@@ -664,12 +768,7 @@ fn resolve_triangle_scalar(
     }
 }
 
-fn sample_volume_scalar(dataset: &DataSet, style: &ActorStyle, world_pos: Vec3) -> Option<f64> {
-    let img = match dataset {
-        DataSet::ImageData(img) => img,
-        DataSet::MultiBlock(mb) => mb.blocks.iter().find_map(|(_, b)| b.as_image_data())?,
-        _ => return None,
-    };
+fn sample_volume_scalar(img: &paraviz_core::ImageData, style: &ActorStyle, world_pos: Vec3) -> Option<f64> {
     let (name, comp) = match &style.color_by {
         ColorBy::PointScalar { array, component } => (array.as_str(), *component),
         ColorBy::Solid(_) | ColorBy::CellScalar { .. } => ("", None),

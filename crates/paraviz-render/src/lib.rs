@@ -20,5 +20,6 @@ pub use compute::GpuContourEngine;
 pub use pick::{pick_scene, PickResult};
 pub use renderer::{RenderError, WebGpuRenderer};
 pub use scene::{
-    ActorStyle, ColorBy, RenderScene, Representation, SceneActor, SceneSettings, ViewportWidget,
+    ActorStyle, ColorBy, RenderScene, Representation, ScalarBarConfig, SceneActor, SceneSettings,
+    ViewportAnnotation, ViewportWidget,
 };

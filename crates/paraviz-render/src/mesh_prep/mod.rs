@@ -1,7 +1,7 @@
 //! Self-contained mesh, line, point, outline, and 3D volume extraction from `paraviz-core` datasets.
 
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::scene::{ColorBy, ViewportWidget};
+use crate::scene::{ActorStyle, ColorBy, ViewportWidget};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use paraviz_core::{
@@ -12,11 +12,23 @@ use rayon::prelude::*;
 
 const PARALLEL_THRESHOLD: usize = 4096;
 
+/// Sentinel `color_override` indicating per-actor uniform / scalar colormap should be used.
+pub const NO_COLOR_OVERRIDE: [f32; 4] = [-1.0, -1.0, -1.0, -1.0];
+/// Neutral fallback solid color when a block has no matching scalar array.
+pub const DEFAULT_FALLBACK_SOLID: [f32; 4] = [0.82, 0.84, 0.88, 1.0];
+
 mod surface;
 mod wireframe_points;
 
-pub use surface::{extract_indexed_surface_scalars, prepare_surface, prepare_surface_indexed};
-pub use wireframe_points::{build_axes_gizmo_mesh, prepare_points, prepare_volume, prepare_widgets, prepare_wireframe, GizmoVertex, PreparedWidgets, WidgetVertex};
+pub use surface::{
+    extract_indexed_surface_scalars, prepare_surface, prepare_surface_indexed,
+    prepare_surface_indexed_with_style, prepare_surface_with_style,
+};
+pub use wireframe_points::{
+    build_axes_gizmo_mesh, prepare_points, prepare_points_with_style, prepare_volume,
+    prepare_volume_with_style, prepare_widgets, prepare_wireframe, prepare_wireframe_with_style,
+    GizmoVertex, PreparedWidgets, WidgetVertex,
+};
 
 /// Non-indexed triangle vertex for SurfaceWithEdges rendering.
 #[repr(C)]
@@ -26,14 +38,16 @@ pub struct SurfaceVertex {
     pub normal: [f32; 3],
     pub scalar: f32,
     pub barycentric: [f32; 3],
+    pub color_override: [f32; 4],
 }
 
-/// Geometry-only vertex (position + normal) for indexed Surface rendering with split scalar slot.
+/// Geometry-only vertex (position + normal + optional per-block color override) for indexed Surface rendering.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SurfaceGeomVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub color_override: [f32; 4],
 }
 
 /// Describes how an indexed surface's vertices map back to dataset point scalars for fast re-coloring.
@@ -63,6 +77,7 @@ pub struct PreparedIndexedSurface {
 pub struct LineVertex {
     pub position: [f32; 3],
     pub scalar: f32,
+    pub color_override: [f32; 4],
 }
 
 /// Per-point instance for sphere-impostor point rendering.
@@ -71,6 +86,7 @@ pub struct LineVertex {
 pub struct PointInstance {
     pub position: [f32; 3],
     pub scalar: f32,
+    pub color_override: [f32; 4],
 }
 
 /// Prepared 3D volume payload for `R32Float` texture upload.
@@ -115,6 +131,33 @@ pub(super) fn resolve_array<'a>(field: &'a FieldData, name: &str) -> Option<&'a 
 
 pub(super) fn extract_scalars(field: &FieldData, name: &str, component: Option<usize>) -> Option<Vec<f32>> {
     resolve_array(field, name).map(|arr| arr.to_scalar_f32(component))
+}
+
+pub(super) fn join_block_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else if name.is_empty() {
+        parent.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+pub(super) fn resolve_block_coloring(
+    point_data: &FieldData,
+    cell_data: &FieldData,
+    color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
+) -> (Option<Vec<f32>>, bool, [f32; 4]) {
+    if let Some(rgba) = block_override {
+        return (None, false, [rgba[0], rgba[1], rgba[2], rgba[3].max(0.0)]);
+    }
+    let (scalars, is_cell) = surface::scalar_lookup(point_data, cell_data, color_by);
+    if scalars.is_none() && !matches!(color_by, ColorBy::Solid(_)) {
+        (None, false, DEFAULT_FALLBACK_SOLID)
+    } else {
+        (scalars, is_cell, NO_COLOR_OVERRIDE)
+    }
 }
 
 pub(super) fn compute_finite_range(values: &[f32]) -> Option<(f64, f64)> {
@@ -167,8 +210,16 @@ pub fn prepare_outline(bounds: &BoundingBox) -> Vec<LineVertex> {
     ];
     let mut out = Vec::with_capacity(24);
     for (a, b) in edges {
-        out.push(LineVertex { position: corners[a], scalar: 0.0 });
-        out.push(LineVertex { position: corners[b], scalar: 0.0 });
+        out.push(LineVertex {
+            position: corners[a],
+            scalar: 0.0,
+            color_override: NO_COLOR_OVERRIDE,
+        });
+        out.push(LineVertex {
+            position: corners[b],
+            scalar: 0.0,
+            color_override: NO_COLOR_OVERRIDE,
+        });
     }
     out
 }

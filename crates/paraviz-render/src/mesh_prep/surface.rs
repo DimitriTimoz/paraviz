@@ -3,14 +3,28 @@ use super::*;
 /// Extracts indexed surface triangles (position+normal, split scalar stream, and `u32` indices)
 /// from any [`DataSet`] for `Representation::Surface` without barycentric overhead.
 pub fn prepare_surface_indexed(dataset: &DataSet, color_by: &ColorBy) -> PreparedIndexedSurface {
+    let style = ActorStyle {
+        color_by: color_by.clone(),
+        ..Default::default()
+    };
+    prepare_surface_indexed_with_style(dataset, &style)
+}
+
+/// Style-aware variant of [`prepare_surface_indexed`] honoring MultiBlock `hidden_blocks` and `block_colors`.
+pub fn prepare_surface_indexed_with_style(
+    dataset: &DataSet,
+    style: &ActorStyle,
+) -> PreparedIndexedSurface {
     let mut geom_vertices = Vec::new();
     let mut scalars = Vec::new();
     let mut indices = Vec::new();
     let mut range = None;
     let is_multiblock = matches!(dataset, DataSet::MultiBlock(_));
+    let has_block_overrides = !style.hidden_blocks.is_empty() || !style.block_colors.is_empty();
     let mut point_map: Option<Vec<u32>> = if !is_multiblock
+        && !has_block_overrides
         && !matches!(dataset, DataSet::PolyData(_))
-        && !matches!(color_by, ColorBy::CellScalar { .. })
+        && !matches!(style.color_by, ColorBy::CellScalar { .. })
     {
         Some(Vec::new())
     } else {
@@ -19,7 +33,9 @@ pub fn prepare_surface_indexed(dataset: &DataSet, color_by: &ColorBy) -> Prepare
 
     append_indexed_dataset(
         dataset,
-        color_by,
+        style,
+        "",
+        None,
         &mut geom_vertices,
         &mut scalars,
         &mut indices,
@@ -27,7 +43,10 @@ pub fn prepare_surface_indexed(dataset: &DataSet, color_by: &ColorBy) -> Prepare
         &mut range,
     );
 
-    let scalar_source = if is_multiblock || matches!(color_by, ColorBy::CellScalar { .. }) {
+    let scalar_source = if is_multiblock
+        || has_block_overrides
+        || matches!(style.color_by, ColorBy::CellScalar { .. })
+    {
         SurfaceScalarSource::RebuildRequired
     } else if matches!(dataset, DataSet::PolyData(_)) {
         SurfaceScalarSource::PointDirect
@@ -62,7 +81,7 @@ pub fn extract_indexed_surface_scalars(
     match source {
         SurfaceScalarSource::PointDirect => {
             if let ColorBy::PointScalar { array, component } = color_by {
-                let mut sc = extract_scalars(pd, array, *component).unwrap_or_default();
+                let mut sc = extract_scalars(pd, array, *component)?;
                 let range = compute_finite_range(&sc).unwrap_or((0.0, 1.0));
                 sc.resize(vertex_count, 0.0);
                 Some((sc, range))
@@ -72,21 +91,18 @@ pub fn extract_indexed_surface_scalars(
         }
         SurfaceScalarSource::PointMapped(map) => {
             if let ColorBy::PointScalar { array, component } = color_by {
-                if let Some(sc) = extract_scalars(pd, array, *component) {
-                    let range = compute_finite_range(&sc).unwrap_or((0.0, 1.0));
-                    let mapped: Vec<f32> = if map.len() >= PARALLEL_THRESHOLD {
-                        map.par_iter()
-                            .map(|&pi| sc.get(pi as usize).copied().unwrap_or(0.0))
-                            .collect()
-                    } else {
-                        map.iter()
-                            .map(|&pi| sc.get(pi as usize).copied().unwrap_or(0.0))
-                            .collect()
-                    };
-                    Some((mapped, range))
+                let sc = extract_scalars(pd, array, *component)?;
+                let range = compute_finite_range(&sc).unwrap_or((0.0, 1.0));
+                let mapped: Vec<f32> = if map.len() >= PARALLEL_THRESHOLD {
+                    map.par_iter()
+                        .map(|&pi| sc.get(pi as usize).copied().unwrap_or(0.0))
+                        .collect()
                 } else {
-                    Some((vec![0.0; vertex_count], (0.0, 1.0)))
-                }
+                    map.iter()
+                        .map(|&pi| sc.get(pi as usize).copied().unwrap_or(0.0))
+                        .collect()
+                };
+                Some((mapped, range))
             } else {
                 Some((vec![0.0; vertex_count], (0.0, 1.0)))
             }
@@ -95,9 +111,12 @@ pub fn extract_indexed_surface_scalars(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_indexed_dataset(
     dataset: &DataSet,
-    color_by: &ColorBy,
+    style: &ActorStyle,
+    block_path: &str,
+    inherited_override: Option<[f32; 4]>,
     geom: &mut Vec<SurfaceGeomVertex>,
     scalars: &mut Vec<f32>,
     indices: &mut Vec<u32>,
@@ -106,14 +125,23 @@ fn append_indexed_dataset(
 ) {
     match dataset {
         DataSet::PolyData(poly) => {
-            append_indexed_poly(poly, color_by, geom, scalars, indices, range);
+            append_indexed_poly(
+                poly,
+                &style.color_by,
+                inherited_override,
+                geom,
+                scalars,
+                indices,
+                range,
+            );
         }
         DataSet::ImageData(img) => {
             append_indexed_structured(
                 img.dimensions,
                 &img.point_data,
                 &img.cell_data,
-                color_by,
+                &style.color_by,
+                inherited_override,
                 |i, j, k| img.point_coords(i, j, k),
                 |i, j, k| img.point_index(i, j, k),
                 true,
@@ -129,7 +157,8 @@ fn append_indexed_dataset(
                 rect.dimensions(),
                 &rect.point_data,
                 &rect.cell_data,
-                color_by,
+                &style.color_by,
+                inherited_override,
                 |i, j, k| rect.point_coords(i, j, k),
                 |i, j, k| rect.point_index(i, j, k),
                 true,
@@ -146,7 +175,8 @@ fn append_indexed_dataset(
                     grid.dimensions,
                     &grid.point_data,
                     &grid.cell_data,
-                    color_by,
+                    &style.color_by,
+                    inherited_override,
                     |i, j, k| grid.point_coords(i, j, k),
                     |i, j, k| grid.point_index(i, j, k),
                     false,
@@ -159,11 +189,37 @@ fn append_indexed_dataset(
             }
         }
         DataSet::UnstructuredGrid(ug) => {
-            append_indexed_unstructured(ug, color_by, geom, scalars, indices, point_map, range);
+            append_indexed_unstructured(
+                ug,
+                &style.color_by,
+                inherited_override,
+                geom,
+                scalars,
+                indices,
+                point_map,
+                range,
+            );
         }
         DataSet::MultiBlock(mb) => {
-            for (_, block) in &mb.blocks {
-                append_indexed_dataset(block, color_by, geom, scalars, indices, point_map, range);
+            for (name, block) in &mb.blocks {
+                let child_path = join_block_path(block_path, name);
+                if !style.is_block_visible(&child_path, name) {
+                    continue;
+                }
+                let child_override = style
+                    .block_color_override(&child_path, name)
+                    .or(inherited_override);
+                append_indexed_dataset(
+                    block,
+                    style,
+                    &child_path,
+                    child_override,
+                    geom,
+                    scalars,
+                    indices,
+                    point_map,
+                    range,
+                );
             }
         }
     }
@@ -220,6 +276,7 @@ pub(super) fn resolve_poly_normals(poly: &PolyData, tris_with_cell: &[([u32; 3],
 fn append_indexed_poly(
     poly: &PolyData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     geom: &mut Vec<SurfaceGeomVertex>,
     scalars_out: &mut Vec<f32>,
     indices: &mut Vec<u32>,
@@ -231,7 +288,8 @@ fn append_indexed_poly(
     }
 
     let normals = resolve_poly_normals(poly, &tris_with_cell);
-    let (scalars, is_cell) = scalar_lookup(&poly.point_data, &poly.cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(&poly.point_data, &poly.cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -244,13 +302,21 @@ fn append_indexed_poly(
                 .points
                 .par_iter()
                 .zip(normals.par_iter())
-                .map(|(&position, &normal)| SurfaceGeomVertex { position, normal })
+                .map(|(&position, &normal)| SurfaceGeomVertex {
+                    position,
+                    normal,
+                    color_override,
+                })
                 .collect();
             geom.extend(new_geom);
         } else {
             geom.reserve(n_pts);
             for (&position, &normal) in poly.points.iter().zip(normals.iter()) {
-                geom.push(SurfaceGeomVertex { position, normal });
+                geom.push(SurfaceGeomVertex {
+                    position,
+                    normal,
+                    color_override,
+                });
             }
         }
         if let Some(sc) = &scalars {
@@ -290,6 +356,7 @@ fn append_indexed_poly(
             geom.push(SurfaceGeomVertex {
                 position: poly.points[i],
                 normal: normals[i],
+                color_override,
             });
             scalars_out.push(cell_s);
         }
@@ -315,6 +382,7 @@ fn append_indexed_poly(
             geom.push(SurfaceGeomVertex {
                 position: poly.points[i],
                 normal: normals[i],
+                color_override,
             });
             scalars_out.push(cell_s);
         }
@@ -338,6 +406,7 @@ fn append_indexed_structured<FCoord, FPointIdx>(
     point_data: &FieldData,
     cell_data: &FieldData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     coord: FCoord,
     point_idx: FPointIdx,
     planar_faces: bool,
@@ -354,7 +423,8 @@ fn append_indexed_structured<FCoord, FPointIdx>(
     if nx == 0 || ny == 0 || nz == 0 {
         return;
     }
-    let (scalars, is_cell) = scalar_lookup(point_data, cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(point_data, cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -396,6 +466,7 @@ fn append_indexed_structured<FCoord, FPointIdx>(
                     geom.push(SurfaceGeomVertex {
                         position: coord(i, j, k),
                         normal: n,
+                        color_override,
                     });
                     let s = scalars
                         .as_ref()
@@ -469,6 +540,7 @@ fn append_indexed_structured<FCoord, FPointIdx>(
             geom.push(SurfaceGeomVertex {
                 position: coord(i, j, k),
                 normal: n,
+                color_override,
             });
             let s = match &scalars {
                 Some(sc) if is_cell => sc.get(cidx).copied().unwrap_or(0.0),
@@ -488,16 +560,19 @@ fn append_indexed_structured<FCoord, FPointIdx>(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_indexed_unstructured(
     ug: &UnstructuredGrid,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     geom: &mut Vec<SurfaceGeomVertex>,
     scalars_out: &mut Vec<f32>,
     indices: &mut Vec<u32>,
     point_map: &mut Option<Vec<u32>>,
     range: &mut Option<(f64, f64)>,
 ) {
-    let (scalars, is_cell) = scalar_lookup(&ug.point_data, &ug.cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(&ug.point_data, &ug.cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -519,6 +594,7 @@ fn append_indexed_unstructured(
             geom.push(SurfaceGeomVertex {
                 position: ug.points[idx],
                 normal: n,
+                color_override,
             });
             let s = match &scalars {
                 Some(sc) if is_cell => sc.get(cell_idx).copied().unwrap_or(0.0),
@@ -540,9 +616,18 @@ fn append_indexed_unstructured(
 
 /// Extracts non-indexed surface triangles (with normals and barycentric coordinates) from any [`DataSet`].
 pub fn prepare_surface(dataset: &DataSet, color_by: &ColorBy) -> PreparedSurface {
+    let style = ActorStyle {
+        color_by: color_by.clone(),
+        ..Default::default()
+    };
+    prepare_surface_with_style(dataset, &style)
+}
+
+/// Style-aware variant of [`prepare_surface`] honoring MultiBlock `hidden_blocks` and `block_colors`.
+pub fn prepare_surface_with_style(dataset: &DataSet, style: &ActorStyle) -> PreparedSurface {
     let mut vertices = Vec::new();
     let mut range = None;
-    append_surface_dataset(dataset, color_by, &mut vertices, &mut range);
+    append_surface_dataset(dataset, style, "", None, &mut vertices, &mut range);
     PreparedSurface {
         vertices,
         scalar_range: range.unwrap_or((0.0, 1.0)),
@@ -551,19 +636,38 @@ pub fn prepare_surface(dataset: &DataSet, color_by: &ColorBy) -> PreparedSurface
 
 fn append_surface_dataset(
     dataset: &DataSet,
-    color_by: &ColorBy,
+    style: &ActorStyle,
+    block_path: &str,
+    inherited_override: Option<[f32; 4]>,
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
     match dataset {
-        DataSet::PolyData(poly) => append_surface_poly(poly, color_by, out, range),
-        DataSet::ImageData(img) => append_surface_image(img, color_by, out, range),
-        DataSet::RectilinearGrid(rect) => append_surface_rectilinear(rect, color_by, out, range),
-        DataSet::StructuredGrid(grid) => append_surface_structured(grid, color_by, out, range),
-        DataSet::UnstructuredGrid(ug) => append_surface_unstructured(ug, color_by, out, range),
+        DataSet::PolyData(poly) => {
+            append_surface_poly(poly, &style.color_by, inherited_override, out, range);
+        }
+        DataSet::ImageData(img) => {
+            append_surface_image(img, &style.color_by, inherited_override, out, range);
+        }
+        DataSet::RectilinearGrid(rect) => {
+            append_surface_rectilinear(rect, &style.color_by, inherited_override, out, range);
+        }
+        DataSet::StructuredGrid(grid) => {
+            append_surface_structured(grid, &style.color_by, inherited_override, out, range);
+        }
+        DataSet::UnstructuredGrid(ug) => {
+            append_surface_unstructured(ug, &style.color_by, inherited_override, out, range);
+        }
         DataSet::MultiBlock(mb) => {
-            for (_, block) in &mb.blocks {
-                append_surface_dataset(block, color_by, out, range);
+            for (name, block) in &mb.blocks {
+                let child_path = join_block_path(block_path, name);
+                if !style.is_block_visible(&child_path, name) {
+                    continue;
+                }
+                let child_override = style
+                    .block_color_override(&child_path, name)
+                    .or(inherited_override);
+                append_surface_dataset(block, style, &child_path, child_override, out, range);
             }
         }
     }
@@ -585,6 +689,7 @@ pub(super) fn scalar_lookup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_triangle(
     points: &[[f32; 3]],
     normals: Option<&[[f32; 3]]>,
@@ -592,6 +697,7 @@ fn emit_triangle(
     is_cell_scalar: bool,
     cell_idx: usize,
     tri: [u32; 3],
+    color_override: [f32; 4],
     out: &mut Vec<SurfaceVertex>,
 ) {
     let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
@@ -617,6 +723,7 @@ fn emit_triangle(
             normal,
             scalar,
             barycentric: bary[k],
+            color_override,
         });
     }
 }
@@ -671,6 +778,7 @@ fn compute_smooth_normals(points: &[[f32; 3]], tris: &[([u32; 3], usize)]) -> Ve
 fn append_surface_poly(
     poly: &PolyData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
@@ -680,7 +788,8 @@ fn append_surface_poly(
     }
 
     let normals = resolve_poly_normals(poly, &tris_with_cell);
-    let (scalars, is_cell) = scalar_lookup(&poly.point_data, &poly.cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(&poly.point_data, &poly.cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -715,6 +824,7 @@ fn append_surface_poly(
                             normal,
                             scalar,
                             barycentric: bary[k],
+                            color_override,
                         };
                     }
                     3
@@ -735,6 +845,7 @@ fn append_surface_poly(
                 is_cell,
                 cell_idx,
                 tri,
+                color_override,
                 out,
             );
         }
@@ -745,14 +856,33 @@ fn emit_quad(
     p: [[f32; 3]; 4],
     s: [f32; 4],
     normal: [f32; 3],
+    color_override: [f32; 4],
     out: &mut Vec<SurfaceVertex>,
 ) {
     let tris = [(0, 1, 2), (0, 2, 3)];
     let bary = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     for (a, b, c) in tris {
-        out.push(SurfaceVertex { position: p[a], normal, scalar: s[a], barycentric: bary[0] });
-        out.push(SurfaceVertex { position: p[b], normal, scalar: s[b], barycentric: bary[1] });
-        out.push(SurfaceVertex { position: p[c], normal, scalar: s[c], barycentric: bary[2] });
+        out.push(SurfaceVertex {
+            position: p[a],
+            normal,
+            scalar: s[a],
+            barycentric: bary[0],
+            color_override,
+        });
+        out.push(SurfaceVertex {
+            position: p[b],
+            normal,
+            scalar: s[b],
+            barycentric: bary[1],
+            color_override,
+        });
+        out.push(SurfaceVertex {
+            position: p[c],
+            normal,
+            scalar: s[c],
+            barycentric: bary[2],
+            color_override,
+        });
     }
 }
 
@@ -832,6 +962,7 @@ fn append_structured_boundary<FCoord, FPointIdx>(
     point_data: &FieldData,
     cell_data: &FieldData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     coord: FCoord,
     point_idx: FPointIdx,
     out: &mut Vec<SurfaceVertex>,
@@ -844,7 +975,8 @@ fn append_structured_boundary<FCoord, FPointIdx>(
     if nx == 0 || ny == 0 || nz == 0 {
         return;
     }
-    let (scalars, is_cell) = scalar_lookup(point_data, cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(point_data, cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -879,13 +1011,14 @@ fn append_structured_boundary<FCoord, FPointIdx>(
             pt_s(q[2].0, q[2].1, q[2].2, ci, cj, ck),
             pt_s(q[3].0, q[3].1, q[3].2, ci, cj, ck),
         ];
-        emit_quad(pts, sv, n, out);
+        emit_quad(pts, sv, n, color_override, out);
     });
 }
 
 fn append_surface_image(
     img: &ImageData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
@@ -894,6 +1027,7 @@ fn append_surface_image(
         &img.point_data,
         &img.cell_data,
         color_by,
+        block_override,
         |i, j, k| img.point_coords(i, j, k),
         |i, j, k| img.point_index(i, j, k),
         out,
@@ -904,6 +1038,7 @@ fn append_surface_image(
 fn append_surface_rectilinear(
     rect: &RectilinearGrid,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
@@ -912,6 +1047,7 @@ fn append_surface_rectilinear(
         &rect.point_data,
         &rect.cell_data,
         color_by,
+        block_override,
         |i, j, k| rect.point_coords(i, j, k),
         |i, j, k| rect.point_index(i, j, k),
         out,
@@ -922,6 +1058,7 @@ fn append_surface_rectilinear(
 fn append_surface_structured(
     grid: &StructuredGrid,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
@@ -933,6 +1070,7 @@ fn append_surface_structured(
         &grid.point_data,
         &grid.cell_data,
         color_by,
+        block_override,
         |i, j, k| grid.point_coords(i, j, k),
         |i, j, k| grid.point_index(i, j, k),
         out,
@@ -1132,10 +1270,12 @@ fn extract_unstructured_boundary_faces(ug: &UnstructuredGrid) -> Vec<(SmallFace,
 fn append_surface_unstructured(
     ug: &UnstructuredGrid,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
-    let (scalars, is_cell) = scalar_lookup(&ug.point_data, &ug.cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(&ug.point_data, &ug.cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -1162,6 +1302,7 @@ fn append_surface_unstructured(
             is_cell,
             cell_idx,
             tri,
+            color_override,
             out,
         );
     }

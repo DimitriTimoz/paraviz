@@ -3,6 +3,7 @@
 use crate::camera::Camera;
 use paraviz_core::{BoundingBox, ColorMap, DataSet, TransferFunction};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Geometric / volumetric visual representation of an actor (matching ParaView's Representation dropdown).
@@ -62,6 +63,12 @@ pub struct ActorStyle {
     /// Optional live 3D clipping plane `(origin, normal)` applied during volume raymarching.
     #[serde(default)]
     pub volume_clip_plane: Option<([f32; 3], [f32; 3])>,
+    /// Hidden MultiBlock block names or slash-joined paths (e.g. `"wall"` or `"Base/per1"`).
+    #[serde(default)]
+    pub hidden_blocks: BTreeSet<String>,
+    /// Per-block solid RGBA overrides keyed by block name or slash-joined path.
+    #[serde(default)]
+    pub block_colors: BTreeMap<String, [f32; 4]>,
 }
 
 impl Default for ActorStyle {
@@ -86,6 +93,74 @@ impl Default for ActorStyle {
             volume_step_size: 0.5,
             volume_shading: true,
             volume_clip_plane: None,
+            hidden_blocks: BTreeSet::new(),
+            block_colors: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorStyle {
+    /// Returns `true` if a MultiBlock child with `path` (e.g. `"Base/per1"`) and `name` (`"per1"`)
+    /// is visible according to [`Self::hidden_blocks`].
+    pub fn is_block_visible(&self, path: &str, name: &str) -> bool {
+        if self.hidden_blocks.is_empty() {
+            return true;
+        }
+        if !path.is_empty() && self.hidden_blocks.contains(path) {
+            return false;
+        }
+        if !name.is_empty() && self.hidden_blocks.contains(name) {
+            return false;
+        }
+        true
+    }
+
+    /// Returns an explicit per-block RGBA color override matching `path` or `name` (path wins).
+    pub fn block_color_override(&self, path: &str, name: &str) -> Option<[f32; 4]> {
+        if self.block_colors.is_empty() {
+            return None;
+        }
+        if !path.is_empty()
+            && let Some(&rgba) = self.block_colors.get(path)
+        {
+            return Some(rgba);
+        }
+        if !name.is_empty()
+            && let Some(&rgba) = self.block_colors.get(name)
+        {
+            return Some(rgba);
+        }
+        None
+    }
+
+    /// Computes the world-space bounding box of `dataset`, excluding blocks listed in [`Self::hidden_blocks`].
+    pub fn dataset_bounds(&self, dataset: &DataSet) -> BoundingBox {
+        if self.hidden_blocks.is_empty() {
+            return dataset.bounds();
+        }
+        self.dataset_bounds_inner(dataset, "")
+    }
+
+    fn dataset_bounds_inner(&self, dataset: &DataSet, parent_path: &str) -> BoundingBox {
+        match dataset {
+            DataSet::MultiBlock(mb) => {
+                let mut bb = BoundingBox::EMPTY;
+                for (name, block) in &mb.blocks {
+                    let child_path = if parent_path.is_empty() {
+                        name.clone()
+                    } else if name.is_empty() {
+                        parent_path.to_string()
+                    } else {
+                        format!("{parent_path}/{name}")
+                    };
+                    if !self.is_block_visible(&child_path, name) {
+                        continue;
+                    }
+                    bb.union(self.dataset_bounds_inner(block, &child_path));
+                }
+                bb
+            }
+            _ => dataset.bounds(),
         }
     }
 }
@@ -111,6 +186,63 @@ impl SceneActor {
     }
 }
 
+/// Configuration for the movable, resizable viewport Scalar Color Bar legend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScalarBarConfig {
+    /// Normalized top-left position `[0.0..=1.0]` in the viewport (`None` defaults to bottom-right).
+    pub pos: Option<[f32; 2]>,
+    /// Logical card size `[width, height]` at 720p reference resolution.
+    pub size: [f32; 2],
+    /// Optional custom title overriding the scalar array name.
+    pub custom_title: Option<String>,
+    /// Number of tick labels along the bar (clamped to `2..=7`).
+    pub num_labels: usize,
+    /// Font scale multiplier (default `1.0`).
+    pub font_scale: f32,
+    /// Horizontal orientation instead of vertical (default `false`).
+    pub horizontal: bool,
+}
+
+impl Default for ScalarBarConfig {
+    fn default() -> Self {
+        Self {
+            pos: None,
+            size: [160.0, 220.0],
+            custom_title: None,
+            num_labels: 3,
+            font_scale: 1.0,
+            horizontal: false,
+        }
+    }
+}
+
+/// Custom 2D text annotation badge positioned in normalized viewport coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewportAnnotation {
+    pub id: u64,
+    pub text: String,
+    /// Normalized top-left position `[0.0..=1.0]` in the viewport.
+    pub pos: [f32; 2],
+    pub font_size: f32,
+    pub color: [f32; 4],
+    pub visible: bool,
+}
+
+impl Default for ViewportAnnotation {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            text: String::new(),
+            pos: [0.05, 0.05],
+            font_size: 16.0,
+            color: [0.94, 0.96, 1.0, 1.0],
+            visible: true,
+        }
+    }
+}
+
 /// Global viewport rendering settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SceneSettings {
@@ -126,6 +258,18 @@ pub struct SceneSettings {
     /// Composite a ParaView-style Scalar Color Bar with min/mid/max labels onto headless/screenshot outputs.
     #[serde(default)]
     pub show_scalar_bar: bool,
+    /// Layout and appearance settings for the Scalar Color Bar.
+    #[serde(default)]
+    pub scalar_bar: ScalarBarConfig,
+    /// Composite a `Time: ...` pill badge when [`Self::time_label`] is set.
+    #[serde(default)]
+    pub show_time_annotation: bool,
+    /// Formatted time value displayed in the time annotation badge.
+    #[serde(default)]
+    pub time_label: Option<String>,
+    /// User-defined 2D viewport text annotations.
+    #[serde(default)]
+    pub annotations: Vec<ViewportAnnotation>,
     pub edl_enabled: bool,
     pub edl_strength: f32,
     pub msaa_samples: u32,
@@ -141,6 +285,10 @@ impl Default for SceneSettings {
             show_axes_grid: false,
             transparent_background: false,
             show_scalar_bar: false,
+            scalar_bar: ScalarBarConfig::default(),
+            show_time_annotation: false,
+            time_label: None,
+            annotations: Vec::new(),
             edl_enabled: false,
             edl_strength: 1.0,
             msaa_samples: 1,
@@ -196,11 +344,11 @@ impl RenderScene {
     pub fn bounds(&self) -> BoundingBox {
         let mut bb = BoundingBox::EMPTY;
         for actor in self.actors.iter().filter(|a| a.style.visible) {
-            bb.union(actor.dataset.bounds());
+            bb.union(actor.style.dataset_bounds(&actor.dataset));
         }
         if !bb.is_valid() {
             for actor in &self.actors {
-                bb.union(actor.dataset.bounds());
+                bb.union(actor.style.dataset_bounds(&actor.dataset));
             }
         }
         bb

@@ -1,11 +1,12 @@
 use glam::Vec3;
 use paraviz_core::{
-    BoundingBox, ColorMap, ColorMapPreset, DataArray, DataSet, ImageData, OpacityPoint, PolyData,
-    TransferFunction,
+    BoundingBox, ColorMap, ColorMapPreset, DataArray, DataSet, ImageData, MultiBlockDataSet,
+    OpacityPoint, PolyData, TransferFunction,
 };
 use paraviz_render::{
-    pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, RenderScene,
-    Representation, SceneActor, ViewportWidget, WebGpuRenderer,
+    legend::composite_viewport_overlays, pick_scene, ActorStyle, Camera, CameraPreset, ColorBy,
+    GpuContourEngine, RenderScene, Representation, ScalarBarConfig, SceneActor, SceneSettings,
+    ViewportAnnotation, ViewportWidget, WebGpuRenderer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -646,4 +647,255 @@ fn unstructured_prep_compute_cache_and_parallel_picking() {
     let ug_hit1 = pick_scene(&ug_scene, 100.0, 100.0, 200, 200).expect("first ug pick");
     let ug_hit2 = pick_scene(&ug_scene, 100.0, 100.0, 200, 200).expect("cached ug pick");
     assert_eq!(ug_hit1, ug_hit2);
+}
+
+fn make_quad_poly(x0: f32, x1: f32, y0: f32, y1: f32, z: f32, scalar: Option<f32>) -> DataSet {
+    let points = vec![
+        [x0, y0, z],
+        [x1, y0, z],
+        [x1, y1, z],
+        [x0, y1, z],
+    ];
+    let mut poly = PolyData {
+        points,
+        polys: vec![vec![0, 1, 2, 3]],
+        ..Default::default()
+    };
+    if let Some(s) = scalar {
+        poly.point_data
+            .set_scalars(DataArray::scalars_f32("pressure", vec![s; 4]));
+    }
+    DataSet::PolyData(poly)
+}
+
+fn region_non_bg_count(rgba: &[u8], w: u32, rx: std::ops::Range<u32>, ry: std::ops::Range<u32>, bg: [u8; 3]) -> usize {
+    let mut count = 0;
+    for y in ry {
+        for x in rx.clone() {
+            let idx = ((y * w + x) * 4) as usize;
+            if rgba[idx] != bg[0] || rgba[idx + 1] != bg[1] || rgba[idx + 2] != bg[2] {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn multiblock_hidden_blocks_color_overrides_and_picking() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+
+    let left_wall = make_quad_poly(-2.5, -0.5, -1.0, 1.0, 0.0, Some(0.1));
+    let right_per1 = make_quad_poly(0.5, 2.5, -1.0, 1.0, 0.0, Some(0.9));
+    let top_no_scalar = make_quad_poly(-0.4, 0.4, 1.1, 2.0, 0.0, None);
+
+    let mut base_mb = MultiBlockDataSet::new();
+    base_mb.add_block("per1", right_per1);
+    base_mb.add_block("per2", top_no_scalar);
+
+    let mut root_mb = MultiBlockDataSet::new();
+    root_mb.add_block("wall", left_wall);
+    root_mb.add_block("Base", DataSet::MultiBlock(base_mb));
+
+    let ds = Arc::new(DataSet::MultiBlock(root_mb));
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = false;
+    scene.settings.bg_top = [0.0, 0.0, 0.0];
+    scene.settings.bg_bottom = [0.0, 0.0, 0.0];
+
+    let mut actor = SceneActor::new(301, "mb_actor", ds);
+    actor.style.color_by = ColorBy::PointScalar {
+        array: "pressure".into(),
+        component: None,
+    };
+    actor.style.colormap = ColorMap::from_preset(ColorMapPreset::Viridis);
+    scene.add_actor(actor);
+
+    scene.camera.position = Vec3::new(0.0, 0.0, 8.0);
+    scene.camera.target = Vec3::new(0.0, 0.0, 0.0);
+    scene.camera.up = Vec3::Y;
+
+    // Verify helper methods
+    assert!(scene.actors[0].style.is_block_visible("wall", "wall"));
+    assert!(scene.actors[0].style.is_block_visible("Base/per1", "per1"));
+
+    let (w, h) = (200u32, 200u32);
+    let rgba_all = renderer.render_to_rgba(&scene, w, h).expect("render all blocks");
+    let left_all = region_non_bg_count(&rgba_all, w, 20..80, 70..130, [0, 0, 0]);
+    let right_all = region_non_bg_count(&rgba_all, w, 120..180, 70..130, [0, 0, 0]);
+    assert!(left_all > 200, "left wall should be visible, got {left_all}");
+    assert!(right_all > 200, "right Base/per1 should be visible, got {right_all}");
+
+    // Picking left vs right reports distinct block_path
+    let pick_left = pick_scene(&scene, 50.0, 100.0, w, h).expect("should hit wall");
+    assert_eq!(pick_left.block_path.as_deref(), Some("wall"));
+    let pick_right = pick_scene(&scene, 150.0, 100.0, w, h).expect("should hit Base/per1");
+    assert_eq!(pick_right.block_path.as_deref(), Some("Base/per1"));
+
+    // Hide "wall" -> left region becomes empty and pick_scene ignores "wall"
+    scene.actors[0].style.hidden_blocks.insert("wall".into());
+    assert!(!scene.actors[0].style.is_block_visible("wall", "wall"));
+    let rgba_no_wall = renderer.render_to_rgba(&scene, w, h).expect("render hidden wall");
+    let left_hidden = region_non_bg_count(&rgba_no_wall, w, 20..80, 70..130, [0, 0, 0]);
+    let right_still = region_non_bg_count(&rgba_no_wall, w, 120..180, 70..130, [0, 0, 0]);
+    assert_eq!(left_hidden, 0, "hidden wall should produce zero pixels");
+    assert!(right_still > 200, "Base/per1 should remain visible");
+    assert!(
+        pick_scene(&scene, 50.0, 100.0, w, h).is_none(),
+        "hidden wall must not be picked"
+    );
+    assert_eq!(
+        pick_scene(&scene, 150.0, 100.0, w, h)
+            .and_then(|p| p.block_path),
+        Some("Base/per1".into())
+    );
+
+    // Override "Base/per1" to solid bright red across Surface, SurfaceWithEdges, Wireframe, and Points
+    scene.actors[0].style.hidden_blocks.clear();
+    scene.actors[0]
+        .style
+        .block_colors
+        .insert("Base/per1".into(), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        scene.actors[0]
+            .style
+            .block_color_override("Base/per1", "per1"),
+        Some([1.0, 0.0, 0.0, 1.0])
+    );
+
+    for repr in [
+        Representation::Surface,
+        Representation::SurfaceWithEdges,
+        Representation::Wireframe,
+        Representation::Points,
+    ] {
+        scene.actors[0].style.representation = repr;
+        scene.actors[0].style.point_size = 14.0;
+        scene.actors[0].style.line_width = 4.0;
+        scene.actors[0]
+            .style
+            .block_colors
+            .insert("Base/per1".into(), [1.0, 0.0, 0.0, 1.0]);
+        let rgba_red = renderer.render_to_rgba(&scene, w, h).expect("render red override");
+
+        scene.actors[0]
+            .style
+            .block_colors
+            .insert("Base/per1".into(), [0.0, 0.0, 1.0, 1.0]);
+        let rgba_blue = renderer.render_to_rgba(&scene, w, h).expect("render blue override");
+
+        assert_ne!(
+            rgba_red, rgba_blue,
+            "recoloring Base/per1 under {repr:?} should immediately refresh GPU buffers"
+        );
+    }
+
+    // Also test hiding nested path "Base/per1"
+    scene.actors[0].style.representation = Representation::Surface;
+    scene.actors[0].style.hidden_blocks.insert("Base/per1".into());
+    let rgba_no_per1 = renderer.render_to_rgba(&scene, w, h).expect("render hidden Base/per1");
+    assert_eq!(
+        region_non_bg_count(&rgba_no_per1, w, 120..180, 70..130, [0, 0, 0]),
+        0
+    );
+    assert!(pick_scene(&scene, 150.0, 100.0, w, h).is_none());
+}
+
+#[test]
+fn viewport_overlays_scalar_bar_time_and_annotations() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let dataset = Arc::new(make_box_polydata());
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = false;
+    scene.settings.bg_top = [0.0, 0.0, 0.0];
+    scene.settings.bg_bottom = [0.0, 0.0, 0.0];
+
+    let mut actor = SceneActor::new(401, "box", dataset);
+    actor.style.color_by = ColorBy::PointScalar {
+        array: "elevation".into(),
+        component: None,
+    };
+    actor.style.colormap = ColorMap::from_preset(ColorMapPreset::Plasma);
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::Isometric, &scene.bounds());
+
+    let (w, h) = (480u32, 320u32);
+    let base_rgba = renderer.render_to_rgba(&scene, w, h).expect("base render");
+
+    // Hidden annotation alone must not modify pixels
+    scene.settings.annotations.push(ViewportAnnotation {
+        id: 1,
+        text: "HIDDEN".into(),
+        pos: [0.05, 0.05],
+        font_size: 16.0,
+        color: [1.0, 0.0, 0.0, 1.0],
+        visible: false,
+    });
+    let hidden_only = renderer.render_to_rgba(&scene, w, h).expect("hidden annotation render");
+    assert_eq!(base_rgba, hidden_only);
+
+    // Enable horizontal top-left Scalar Color Bar, top-right Time badge, and visible annotation with punctuation
+    scene.settings.show_scalar_bar = true;
+    scene.settings.scalar_bar = ScalarBarConfig {
+        pos: Some([0.03, 0.04]),
+        size: [240.0, 76.0],
+        custom_title: Some("P=100% (Pa)".into()),
+        num_labels: 5,
+        font_scale: 1.0,
+        horizontal: true,
+    };
+    scene.settings.show_time_annotation = true;
+    scene.settings.time_label = Some("0.25 s".into());
+    scene.settings.annotations.push(ViewportAnnotation {
+        id: 2,
+        text: "T=300°K, #1 @wall *!".into(),
+        pos: [0.04, 0.78],
+        font_size: 14.0,
+        color: [1.0, 0.9, 0.2, 1.0],
+        visible: true,
+    });
+
+    let overlay_rgba = renderer.render_to_rgba(&scene, w, h).expect("overlay render");
+    assert_ne!(base_rgba, overlay_rgba);
+
+    // Top-left quadrant has horizontal scalar bar pixels
+    let top_left_lit = region_non_bg_count(&overlay_rgba, w, 14..180, 12..75, [0, 0, 0]);
+    assert!(top_left_lit > 500, "expected horizontal scalar bar in top-left, got {top_left_lit}");
+
+    // Top-right corner has Time: 0.25 s badge pixels
+    let top_right_lit = region_non_bg_count(&overlay_rgba, w, 350..470, 10..40, [0, 0, 0]);
+    assert!(top_right_lit > 100, "expected time badge in top-right, got {top_right_lit}");
+
+    // Bottom-left region has visible annotation pixels
+    let bottom_left_lit = region_non_bg_count(&overlay_rgba, w, 18..200, 240..285, [0, 0, 0]);
+    assert!(bottom_left_lit > 100, "expected annotation badge in bottom-left, got {bottom_left_lit}");
+
+    // Direct software compositor smoke check (default vertical bottom-right bar with 7 labels)
+    let mut canvas = vec![0u8; (w * h * 4) as usize];
+    scene.settings.scalar_bar = ScalarBarConfig {
+        pos: None,
+        size: [160.0, 220.0],
+        custom_title: None,
+        num_labels: 7,
+        font_scale: 1.0,
+        horizontal: false,
+    };
+    composite_viewport_overlays(&scene, &mut canvas, w, h);
+    let bottom_right_lit = region_non_bg_count(&canvas, w, 320..475, 120..315, [0, 0, 0]);
+    assert!(bottom_right_lit > 500, "expected vertical scalar bar in bottom-right, got {bottom_right_lit}");
+
+    let default_style = ActorStyle::default();
+    assert!(default_style.hidden_blocks.is_empty());
+    assert!(default_style.block_colors.is_empty());
+
+    let default_settings = SceneSettings::default();
+    assert!(!default_settings.show_time_annotation);
+    assert!(default_settings.time_label.is_none());
+    assert!(default_settings.annotations.is_empty());
+    assert_eq!(default_settings.scalar_bar.num_labels, 3);
+    assert_eq!(default_settings.scalar_bar.size, [160.0, 220.0]);
+    assert!((default_settings.scalar_bar.font_scale - 1.0).abs() < 1e-6);
+    assert!(!default_settings.scalar_bar.horizontal);
 }

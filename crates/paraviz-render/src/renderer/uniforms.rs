@@ -264,10 +264,16 @@ pub(super) enum CachedGeometry {
     Empty,
 }
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+
 pub(super) struct CachedActor {
     pub(super) dataset: Arc<DataSet>,
     pub(super) representation: Representation,
     pub(super) color_by: ColorBy,
+    pub(super) actor_style_hash: u64,
+    pub(super) hidden_blocks: BTreeSet<String>,
+    pub(super) block_colors: BTreeMap<String, [f32; 4]>,
     pub(super) geometry: CachedGeometry,
     pub(super) colormap: ColorMap,
     pub(super) lut_texture: wgpu::Texture,
@@ -277,6 +283,22 @@ pub(super) struct CachedActor {
     pub(super) volume_bind_group: Option<wgpu::BindGroup>,
     pub(super) uniform_buffer: wgpu::Buffer,
     pub(super) uniform_bind_group: wgpu::BindGroup,
+}
+
+pub(super) fn actor_style_hash(style: &ActorStyle) -> u64 {
+    let mut h = crate::fxhash::FxHasher::default();
+    style.hidden_blocks.len().hash(&mut h);
+    for b in &style.hidden_blocks {
+        b.hash(&mut h);
+    }
+    style.block_colors.len().hash(&mut h);
+    for (k, v) in &style.block_colors {
+        k.hash(&mut h);
+        for c in v {
+            c.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 

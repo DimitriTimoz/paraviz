@@ -1,11 +1,20 @@
 use super::*;
-use surface::{for_each_structured_boundary_quad, scalar_lookup};
+use surface::for_each_structured_boundary_quad;
 
 /// Extracts wireframe line segments from any [`DataSet`].
 pub fn prepare_wireframe(dataset: &DataSet, color_by: &ColorBy) -> PreparedLines {
+    let style = ActorStyle {
+        color_by: color_by.clone(),
+        ..Default::default()
+    };
+    prepare_wireframe_with_style(dataset, &style)
+}
+
+/// Style-aware variant of [`prepare_wireframe`] honoring MultiBlock `hidden_blocks` and `block_colors`.
+pub fn prepare_wireframe_with_style(dataset: &DataSet, style: &ActorStyle) -> PreparedLines {
     let mut vertices = Vec::new();
     let mut range = None;
-    append_wireframe_dataset(dataset, color_by, &mut vertices, &mut range);
+    append_wireframe_dataset(dataset, style, "", None, &mut vertices, &mut range);
     PreparedLines {
         vertices,
         scalar_range: range.unwrap_or((0.0, 1.0)),
@@ -27,6 +36,7 @@ fn append_structured_wireframe<FCoord, FPointIdx>(
     point_data: &FieldData,
     cell_data: &FieldData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     coord: FCoord,
     point_idx: FPointIdx,
     out: &mut Vec<LineVertex>,
@@ -39,7 +49,8 @@ fn append_structured_wireframe<FCoord, FPointIdx>(
     if nx == 0 || ny == 0 || nz == 0 {
         return;
     }
-    let (scalars, is_cell) = scalar_lookup(point_data, cell_data, color_by);
+    let (scalars, is_cell, color_override) =
+        resolve_block_coloring(point_data, cell_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -68,10 +79,12 @@ fn append_structured_wireframe<FCoord, FPointIdx>(
                 out.push(LineVertex {
                     position: coord(va.0, va.1, va.2),
                     scalar: sa,
+                    color_override,
                 });
                 out.push(LineVertex {
                     position: coord(vb.0, vb.1, vb.2),
                     scalar: sb,
+                    color_override,
                 });
             }
         }
@@ -80,13 +93,20 @@ fn append_structured_wireframe<FCoord, FPointIdx>(
 
 fn append_wireframe_dataset(
     dataset: &DataSet,
-    color_by: &ColorBy,
+    style: &ActorStyle,
+    block_path: &str,
+    inherited_override: Option<[f32; 4]>,
     out: &mut Vec<LineVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
     match dataset {
         DataSet::PolyData(poly) => {
-            let (scalars, is_cell) = scalar_lookup(&poly.point_data, &poly.cell_data, color_by);
+            let (scalars, is_cell, color_override) = resolve_block_coloring(
+                &poly.point_data,
+                &poly.cell_data,
+                &style.color_by,
+                inherited_override,
+            );
             if let Some(sc) = &scalars {
                 merge_range(range, compute_finite_range(sc));
             }
@@ -108,8 +128,16 @@ fn append_wireframe_dataset(
                         Some(sc) => sc.get(ib).copied().unwrap_or(0.0),
                         None => 0.0,
                     };
-                    out.push(LineVertex { position: poly.points[ia], scalar: sa });
-                    out.push(LineVertex { position: poly.points[ib], scalar: sb });
+                    out.push(LineVertex {
+                        position: poly.points[ia],
+                        scalar: sa,
+                        color_override,
+                    });
+                    out.push(LineVertex {
+                        position: poly.points[ib],
+                        scalar: sb,
+                        color_override,
+                    });
                 }
             };
 
@@ -139,7 +167,12 @@ fn append_wireframe_dataset(
             }
         }
         DataSet::UnstructuredGrid(ug) => {
-            let (scalars, is_cell) = scalar_lookup(&ug.point_data, &ug.cell_data, color_by);
+            let (scalars, is_cell, color_override) = resolve_block_coloring(
+                &ug.point_data,
+                &ug.cell_data,
+                &style.color_by,
+                inherited_override,
+            );
             if let Some(sc) = &scalars {
                 merge_range(range, compute_finite_range(sc));
             }
@@ -161,8 +194,16 @@ fn append_wireframe_dataset(
                         Some(sc) => sc.get(ib).copied().unwrap_or(0.0),
                         None => 0.0,
                     };
-                    out.push(LineVertex { position: ug.points[ia], scalar: sa });
-                    out.push(LineVertex { position: ug.points[ib], scalar: sb });
+                    out.push(LineVertex {
+                        position: ug.points[ia],
+                        scalar: sa,
+                        color_override,
+                    });
+                    out.push(LineVertex {
+                        position: ug.points[ib],
+                        scalar: sb,
+                        color_override,
+                    });
                 }
             };
             for cell_idx in 0..ug.num_cells() {
@@ -186,7 +227,8 @@ fn append_wireframe_dataset(
                 img.dimensions,
                 &img.point_data,
                 &img.cell_data,
-                color_by,
+                &style.color_by,
+                inherited_override,
                 |i, j, k| img.point_coords(i, j, k),
                 |i, j, k| img.point_index(i, j, k),
                 out,
@@ -198,7 +240,8 @@ fn append_wireframe_dataset(
                 rect.dimensions(),
                 &rect.point_data,
                 &rect.cell_data,
-                color_by,
+                &style.color_by,
+                inherited_override,
                 |i, j, k| rect.point_coords(i, j, k),
                 |i, j, k| rect.point_index(i, j, k),
                 out,
@@ -211,7 +254,8 @@ fn append_wireframe_dataset(
                     grid.dimensions,
                     &grid.point_data,
                     &grid.cell_data,
-                    color_by,
+                    &style.color_by,
+                    inherited_override,
                     |i, j, k| grid.point_coords(i, j, k),
                     |i, j, k| grid.point_index(i, j, k),
                     out,
@@ -220,8 +264,15 @@ fn append_wireframe_dataset(
             }
         }
         DataSet::MultiBlock(mb) => {
-            for (_, block) in &mb.blocks {
-                append_wireframe_dataset(block, color_by, out, range);
+            for (name, block) in &mb.blocks {
+                let child_path = join_block_path(block_path, name);
+                if !style.is_block_visible(&child_path, name) {
+                    continue;
+                }
+                let child_override = style
+                    .block_color_override(&child_path, name)
+                    .or(inherited_override);
+                append_wireframe_dataset(block, style, &child_path, child_override, out, range);
             }
         }
     }
@@ -229,12 +280,43 @@ fn append_wireframe_dataset(
 
 /// Extracts point cloud instances from any [`DataSet`].
 pub fn prepare_points(dataset: &DataSet, color_by: &ColorBy) -> PreparedPoints {
+    let style = ActorStyle {
+        color_by: color_by.clone(),
+        ..Default::default()
+    };
+    prepare_points_with_style(dataset, &style)
+}
+
+/// Style-aware variant of [`prepare_points`] honoring MultiBlock `hidden_blocks` and `block_colors`.
+pub fn prepare_points_with_style(dataset: &DataSet, style: &ActorStyle) -> PreparedPoints {
     let mut instances = Vec::new();
     let mut range = None;
-    append_points_dataset(dataset, color_by, &mut instances, &mut range);
+    append_points_dataset(dataset, style, "", None, &mut instances, &mut range);
     PreparedPoints {
         instances,
         scalar_range: range.unwrap_or((0.0, 1.0)),
+    }
+}
+
+fn resolve_point_block_coloring(
+    point_data: &FieldData,
+    color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
+) -> (Option<Vec<f32>>, [f32; 4]) {
+    if let Some(rgba) = block_override {
+        return (None, [rgba[0], rgba[1], rgba[2], rgba[3].max(0.0)]);
+    }
+    match color_by {
+        ColorBy::PointScalar { array, component } => {
+            let sc = extract_scalars(point_data, array, *component);
+            if sc.is_some() {
+                (sc, NO_COLOR_OVERRIDE)
+            } else {
+                (None, DEFAULT_FALLBACK_SOLID)
+            }
+        }
+        ColorBy::CellScalar { .. } => (None, DEFAULT_FALLBACK_SOLID),
+        ColorBy::Solid(_) => (None, NO_COLOR_OVERRIDE),
     }
 }
 
@@ -242,13 +324,12 @@ fn append_points_slice(
     points: &[[f32; 3]],
     point_data: &FieldData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     out: &mut Vec<PointInstance>,
     range: &mut Option<(f64, f64)>,
 ) {
-    let scalars = match color_by {
-        ColorBy::PointScalar { array, component } => extract_scalars(point_data, array, *component),
-        _ => None,
-    };
+    let (scalars, color_override) =
+        resolve_point_block_coloring(point_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -260,6 +341,7 @@ fn append_points_slice(
             .map(|(i, &position)| PointInstance {
                 position,
                 scalar: sc_ref.and_then(|s| s.get(i).copied()).unwrap_or(0.0),
+                color_override,
             })
             .collect();
         out.extend(built);
@@ -267,7 +349,11 @@ fn append_points_slice(
         out.reserve(points.len());
         for (i, &pos) in points.iter().enumerate() {
             let scalar = scalars.as_ref().and_then(|s| s.get(i).copied()).unwrap_or(0.0);
-            out.push(PointInstance { position: pos, scalar });
+            out.push(PointInstance {
+                position: pos,
+                scalar,
+                color_override,
+            });
         }
     }
 }
@@ -276,6 +362,7 @@ fn append_points_grid<FCoord>(
     dims: [usize; 3],
     point_data: &FieldData,
     color_by: &ColorBy,
+    block_override: Option<[f32; 4]>,
     coord: FCoord,
     out: &mut Vec<PointInstance>,
     range: &mut Option<(f64, f64)>,
@@ -287,10 +374,8 @@ fn append_points_grid<FCoord>(
     if total == 0 {
         return;
     }
-    let scalars = match color_by {
-        ColorBy::PointScalar { array, component } => extract_scalars(point_data, array, *component),
-        _ => None,
-    };
+    let (scalars, color_override) =
+        resolve_point_block_coloring(point_data, color_by, block_override);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
@@ -306,6 +391,7 @@ fn append_points_grid<FCoord>(
                 PointInstance {
                     position: coord(i, j, k),
                     scalar: sc_ref.and_then(|s| s.get(idx).copied()).unwrap_or(0.0),
+                    color_override,
                 }
             })
             .collect();
@@ -320,6 +406,7 @@ fn append_points_grid<FCoord>(
                     out.push(PointInstance {
                         position: coord(i, j, k),
                         scalar,
+                        color_override,
                     });
                 }
             }
@@ -329,19 +416,29 @@ fn append_points_grid<FCoord>(
 
 fn append_points_dataset(
     dataset: &DataSet,
-    color_by: &ColorBy,
+    style: &ActorStyle,
+    block_path: &str,
+    inherited_override: Option<[f32; 4]>,
     out: &mut Vec<PointInstance>,
     range: &mut Option<(f64, f64)>,
 ) {
     match dataset {
         DataSet::PolyData(poly) => {
-            append_points_slice(&poly.points, &poly.point_data, color_by, out, range);
+            append_points_slice(
+                &poly.points,
+                &poly.point_data,
+                &style.color_by,
+                inherited_override,
+                out,
+                range,
+            );
         }
         DataSet::ImageData(img) => {
             append_points_grid(
                 img.dimensions,
                 &img.point_data,
-                color_by,
+                &style.color_by,
+                inherited_override,
                 |i, j, k| img.point_coords(i, j, k),
                 out,
                 range,
@@ -351,21 +448,43 @@ fn append_points_dataset(
             append_points_grid(
                 rect.dimensions(),
                 &rect.point_data,
-                color_by,
+                &style.color_by,
+                inherited_override,
                 |i, j, k| rect.point_coords(i, j, k),
                 out,
                 range,
             );
         }
         DataSet::StructuredGrid(grid) => {
-            append_points_slice(&grid.points, &grid.point_data, color_by, out, range);
+            append_points_slice(
+                &grid.points,
+                &grid.point_data,
+                &style.color_by,
+                inherited_override,
+                out,
+                range,
+            );
         }
         DataSet::UnstructuredGrid(ug) => {
-            append_points_slice(&ug.points, &ug.point_data, color_by, out, range);
+            append_points_slice(
+                &ug.points,
+                &ug.point_data,
+                &style.color_by,
+                inherited_override,
+                out,
+                range,
+            );
         }
         DataSet::MultiBlock(mb) => {
-            for (_, block) in &mb.blocks {
-                append_points_dataset(block, color_by, out, range);
+            for (name, block) in &mb.blocks {
+                let child_path = join_block_path(block_path, name);
+                if !style.is_block_visible(&child_path, name) {
+                    continue;
+                }
+                let child_override = style
+                    .block_color_override(&child_path, name)
+                    .or(inherited_override);
+                append_points_dataset(block, style, &child_path, child_override, out, range);
             }
         }
     }
@@ -373,20 +492,29 @@ fn append_points_dataset(
 
 /// Extracts a 3D `R32Float` volume payload from an [`ImageData`] (or first ImageData block in a MultiBlock).
 pub fn prepare_volume(dataset: &DataSet, color_by: &ColorBy) -> Option<PreparedVolume> {
-    let img = find_image_data(dataset)?;
+    let style = ActorStyle {
+        color_by: color_by.clone(),
+        ..Default::default()
+    };
+    prepare_volume_with_style(dataset, &style)
+}
+
+/// Style-aware variant of [`prepare_volume`] honoring MultiBlock `hidden_blocks`.
+pub fn prepare_volume_with_style(dataset: &DataSet, style: &ActorStyle) -> Option<PreparedVolume> {
+    let img = find_image_data(dataset, style, "")?;
     let [nx, ny, nz] = img.dimensions;
     if nx == 0 || ny == 0 || nz == 0 {
         return None;
     }
 
-    let arr = match color_by {
+    let arr = match &style.color_by {
         ColorBy::PointScalar { array, .. } => resolve_array(&img.point_data, array),
         ColorBy::CellScalar { array, .. } => resolve_array(&img.cell_data, array)
             .or_else(|| img.point_data.active_scalars_array()),
         ColorBy::Solid(_) => img.point_data.active_scalars_array(),
     }?;
 
-    let component = match color_by {
+    let component = match &style.color_by {
         ColorBy::PointScalar { component, .. } | ColorBy::CellScalar { component, .. } => *component,
         ColorBy::Solid(_) => None,
     };
@@ -419,10 +547,20 @@ pub fn prepare_volume(dataset: &DataSet, color_by: &ColorBy) -> Option<PreparedV
     })
 }
 
-fn find_image_data(dataset: &DataSet) -> Option<&ImageData> {
+fn find_image_data<'a>(
+    dataset: &'a DataSet,
+    style: &ActorStyle,
+    block_path: &str,
+) -> Option<&'a ImageData> {
     match dataset {
         DataSet::ImageData(img) => Some(img),
-        DataSet::MultiBlock(mb) => mb.blocks.iter().find_map(|(_, d)| find_image_data(d)),
+        DataSet::MultiBlock(mb) => mb.blocks.iter().find_map(|(name, d)| {
+            let child_path = join_block_path(block_path, name);
+            if !style.is_block_visible(&child_path, name) {
+                return None;
+            }
+            find_image_data(d, style, &child_path)
+        }),
         _ => None,
     }
 }

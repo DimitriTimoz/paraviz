@@ -80,12 +80,14 @@ struct VsIn {
     @location(1) normal: vec3<f32>,
     @location(2) scalar: f32,
     @location(3) barycentric: vec3<f32>,
+    @location(4) color_override: vec4<f32>,
 };
 
 struct VsInIndexed {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) scalar: f32,
+    @location(4) color_override: vec4<f32>,
 };
 
 struct VsOut {
@@ -94,6 +96,7 @@ struct VsOut {
     @location(1) normal: vec3<f32>,
     @location(2) scalar: f32,
     @location(3) barycentric: vec3<f32>,
+    @location(4) color_override: vec4<f32>,
 };
 
 @vertex
@@ -105,6 +108,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal = (u.model * vec4<f32>(in.normal, 0.0)).xyz;
     out.scalar = in.scalar;
     out.barycentric = in.barycentric;
+    out.color_override = in.color_override;
     return out;
 }
 
@@ -117,6 +121,7 @@ fn vs_indexed(in: VsInIndexed) -> VsOut {
     out.normal = (u.model * vec4<f32>(in.normal, 0.0)).xyz;
     out.scalar = in.scalar;
     out.barycentric = vec3<f32>(1.0, 1.0, 1.0);
+    out.color_override = in.color_override;
     return out;
 }
 
@@ -141,7 +146,9 @@ fn map_scalar(s: f32) -> vec4<f32> {
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     var base_rgba = u.solid_color;
-    if (u.use_colormap != 0u) {
+    if (in.color_override.a >= 0.0) {
+        base_rgba = in.color_override;
+    } else if (u.use_colormap != 0u) {
         base_rgba = map_scalar(in.scalar);
     }
 
@@ -228,13 +235,16 @@ var lut_sampler: sampler;
 struct VsIn {
     @location(0) pos_a: vec3<f32>,
     @location(1) scalar_a: f32,
+    @location(4) color_a: vec4<f32>,
     @location(2) pos_b: vec3<f32>,
     @location(3) scalar_b: f32,
+    @location(5) color_b: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) scalar: f32,
+    @location(1) color_override: vec4<f32>,
 };
 
 @vertex
@@ -244,31 +254,38 @@ fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
     var clip_b = u.view_proj * vec4<f32>(in.pos_b, 1.0);
     var sa = in.scalar_a;
     var sb = in.scalar_b;
+    var ca = in.color_a;
+    var cb = in.color_b;
 
     // Guard against endpoints behind the near plane (clip.z < 0 or clip.w <= 0).
     let eps: f32 = 1e-5;
     if ((clip_a.w <= eps || clip_a.z < 0.0) && (clip_b.w <= eps || clip_b.z < 0.0)) {
         out.clip_pos = vec4<f32>(0.0, 0.0, -2.0, 1.0);
         out.scalar = sa;
+        out.color_override = ca;
         return out;
     }
     if (clip_a.z < 0.0) {
         let t = clamp(clip_a.z / (clip_a.z - clip_b.z), 0.0, 1.0);
         clip_a = mix(clip_a, clip_b, t);
         sa = mix(sa, sb, t);
+        ca = mix(ca, cb, t);
     } else if (clip_b.z < 0.0) {
         let t = clamp(clip_b.z / (clip_b.z - clip_a.z), 0.0, 1.0);
         clip_b = mix(clip_b, clip_a, t);
         sb = mix(sb, sa, t);
+        cb = mix(cb, ca, t);
     }
     if (clip_a.w <= eps) {
         let t = clamp((eps - clip_a.w) / max(clip_b.w - clip_a.w, eps), 0.0, 1.0);
         clip_a = mix(clip_a, clip_b, t);
         sa = mix(sa, sb, t);
+        ca = mix(ca, cb, t);
     } else if (clip_b.w <= eps) {
         let t = clamp((eps - clip_b.w) / max(clip_a.w - clip_b.w, eps), 0.0, 1.0);
         clip_b = mix(clip_b, clip_a, t);
         sb = mix(sb, sa, t);
+        cb = mix(cb, ca, t);
     }
 
     let half_vp = 0.5 * max(u.viewport_size, vec2<f32>(1.0));
@@ -303,13 +320,16 @@ fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
         base_clip.w,
     );
     out.scalar = mix(sa, sb, end_t);
+    out.color_override = mix(ca, cb, end_t);
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var rgba = u.solid_color;
-    if (u.use_colormap != 0u) {
+    if (in.color_override.a >= 0.0) {
+        rgba = in.color_override;
+    } else if (u.use_colormap != 0u) {
         let s = in.scalar;
         if (s != s || abs(s) > 1e37) {
             rgba = u.nan_color;
@@ -359,12 +379,14 @@ struct VsIn {
     @location(0) quad_uv: vec2<f32>,
     @location(1) position: vec3<f32>,
     @location(2) scalar: f32,
+    @location(3) color_override: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) quad_uv: vec2<f32>,
     @location(1) scalar: f32,
+    @location(2) color_override: vec4<f32>,
 };
 
 @vertex
@@ -383,6 +405,7 @@ fn vs_main(in: VsIn) -> VsOut {
     );
     out.quad_uv = in.quad_uv;
     out.scalar = in.scalar;
+    out.color_override = in.color_override;
     return out;
 }
 
@@ -394,7 +417,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     var base_rgba = u.solid_color;
-    if (u.use_colormap != 0u) {
+    if (in.color_override.a >= 0.0) {
+        base_rgba = in.color_override;
+    } else if (u.use_colormap != 0u) {
         let s = in.scalar;
         if (s != s || abs(s) > 1e37) {
             base_rgba = u.nan_color;
