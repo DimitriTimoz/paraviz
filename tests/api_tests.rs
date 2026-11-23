@@ -77,3 +77,31 @@ fn time_stepping_and_io_export() {
     assert_eq!(reloaded.num_points(), ds1.num_points());
     let _ = fs::remove_file(&out_vti);
 }
+
+#[test]
+fn gpu_compute_contour_picking_and_glb_export() {
+    let mut pv = ParaViz::new();
+    let wav = pv
+        .add_source_cfg("Wavelet", SourceConfig::Wavelet(WaveletSource::with_extent(8)))
+        .unwrap();
+    pv.hide(wav);
+
+    let gpu_iso = pv
+        .gpu_contour("GPU Iso", wav, Some("RTData"), 140.0)
+        .unwrap();
+    pv.show(gpu_iso)
+        .representation(Representation::Surface)
+        .colormap(ColorMapPreset::Viridis)
+        .color_by_point("RTData");
+    pv.settings.msaa_samples = 4;
+    pv.settings.edl_enabled = true;
+    pv.camera_preset(CameraPreset::Isometric).unwrap();
+
+    let hit = pv.pick(160.0, 120.0, 320, 240).unwrap();
+    assert!(hit.is_some(), "Center pick should hit GPU-contoured isosurface");
+
+    let out_glb = std::env::temp_dir().join("paraviz_gpu_iso.glb");
+    pv.export_glb(gpu_iso, &out_glb, true).unwrap();
+    assert!(fs::metadata(&out_glb).unwrap().len() > 100);
+    let _ = fs::remove_file(&out_glb);
+}

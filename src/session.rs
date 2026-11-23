@@ -5,15 +5,21 @@ use paraviz_core::{
     PipelineInfo, Source, TransferFunction,
 };
 use paraviz_filters::{
-    CalculatorFilter, CellDataToPointDataFilter, ClipFilter, ContourFilter, ExtractSurface,
-    GlyphFilter, GradientFilter, PointDataToCellDataFilter, ProbeOverLineFilter, SliceFilter,
-    SmoothFilter, StreamTracerFilter, ThresholdFilter, TransformFilter, TubeFilter,
-    WarpByScalarFilter, WarpByVectorFilter,
+    CalculatorFilter, CellCentersFilter, CellDataToPointDataFilter, ClipFilter,
+    ConnectivityFilter, ContourFilter, ElevationFilter, ExtractSurface, FeatureEdgesFilter,
+    GenerateNormalsFilter, GlyphFilter, GradientFilter, PointDataToCellDataFilter,
+    ProbeOverLineFilter, ReflectFilter, ShrinkFilter, SliceFilter, SmoothFilter,
+    StreamTracerFilter, ThresholdFilter, TransformFilter, TubeFilter, WarpByScalarFilter,
+    WarpByVectorFilter,
 };
-use paraviz_io::{read_dataset, write_dataset, IoError, PvdSeriesSource, VtkFileSource};
+use paraviz_io::{
+    read_dataset, read_raw_volume, write_dataset, write_glb, IoError, PvdSeriesSource,
+    RawVolumeDescriptor, VtkFileSource,
+};
 use paraviz_render::{
-    ActorStyle, Camera, CameraPreset, ColorBy, RenderError, RenderScene, Representation,
-    SceneActor, SceneSettings, WebGpuRenderer,
+    pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,
+    RenderError, RenderScene, Representation, SceneActor, SceneSettings, ViewportWidget,
+    WebGpuRenderer,
 };
 use paraviz_sources::{
     ArrowSource, ConeSource, CubeSource, CylinderSource, DiskSource, GyroidSource, LineSource,
@@ -160,6 +166,13 @@ pub enum FilterConfig {
     CellDataToPointData(CellDataToPointDataFilter),
     PointDataToCellData(PointDataToCellDataFilter),
     ProbeOverLine(ProbeOverLineFilter),
+    FeatureEdges(FeatureEdgesFilter),
+    Connectivity(ConnectivityFilter),
+    Shrink(ShrinkFilter),
+    CellCenters(CellCentersFilter),
+    Reflect(ReflectFilter),
+    GenerateNormals(GenerateNormalsFilter),
+    Elevation(ElevationFilter),
 }
 
 impl FilterConfig {
@@ -183,6 +196,13 @@ impl FilterConfig {
             Self::CellDataToPointData(_) => "CellDataToPointData",
             Self::PointDataToCellData(_) => "PointDataToCellData",
             Self::ProbeOverLine(_) => "ProbeOverLine",
+            Self::FeatureEdges(_) => "FeatureEdges",
+            Self::Connectivity(_) => "Connectivity",
+            Self::Shrink(_) => "Shrink",
+            Self::CellCenters(_) => "CellCenters",
+            Self::Reflect(_) => "Reflect",
+            Self::GenerateNormals(_) => "GenerateNormals",
+            Self::Elevation(_) => "Elevation",
         }
     }
 
@@ -206,6 +226,13 @@ impl FilterConfig {
             Self::CellDataToPointData(f) => Box::new(f.clone()),
             Self::PointDataToCellData(f) => Box::new(f.clone()),
             Self::ProbeOverLine(f) => Box::new(f.clone()),
+            Self::FeatureEdges(f) => Box::new(f.clone()),
+            Self::Connectivity(f) => Box::new(f.clone()),
+            Self::Shrink(f) => Box::new(f.clone()),
+            Self::CellCenters(f) => Box::new(f.clone()),
+            Self::Reflect(f) => Box::new(f.clone()),
+            Self::GenerateNormals(f) => Box::new(f.clone()),
+            Self::Elevation(f) => Box::new(f.clone()),
         }
     }
 }
@@ -380,6 +407,7 @@ pub struct ParaViz {
     nodes: Vec<SessionNode>,
     pub camera: Camera,
     pub settings: SceneSettings,
+    pub widgets: Vec<ViewportWidget>,
     pub time: f64,
     renderer: Option<WebGpuRenderer>,
 }
@@ -398,6 +426,7 @@ impl ParaViz {
             nodes: Vec::new(),
             camera: Camera::default(),
             settings: SceneSettings::default(),
+            widgets: Vec::new(),
             time: 0.0,
             renderer: None,
         }
@@ -671,6 +700,7 @@ impl ParaViz {
             camera: self.camera.clone(),
             actors: Vec::new(),
             settings: self.settings.clone(),
+            widgets: self.widgets.clone(),
         };
         for node in &self.nodes {
             if !node.style.visible {
@@ -740,6 +770,77 @@ impl ParaViz {
         let ds = self.evaluate(id)?;
         write_dataset(path, &ds)?;
         Ok(())
+    }
+
+    /// Exports a `PolyData` node to a binary glTF 2.0 (`.glb`) file with optional scalar vertex colors.
+    pub fn export_glb(
+        &mut self,
+        id: NodeId,
+        path: impl AsRef<Path>,
+        use_node_colormap: bool,
+    ) -> Result<(), SessionError> {
+        let ds = self.evaluate(id)?;
+        let style = self.node(id)?.style.clone();
+        let poly = match ds.as_ref() {
+            DataSet::PolyData(p) => p.clone(),
+            other => paraviz_filters::extract_surface(other)?,
+        };
+        let scalar_name = match &style.color_by {
+            ColorBy::PointScalar { array, .. } => Some(array.clone()),
+            _ => None,
+        };
+        let cmap = if use_node_colormap {
+            Some(&style.colormap)
+        } else {
+            None
+        };
+        write_glb(path, &poly, cmap, scalar_name.as_deref())?;
+        Ok(())
+    }
+
+    /// Loads a raw binary 3D volumetric file as an `ImageData` source node.
+    pub fn open_raw_volume(
+        &mut self,
+        label: impl Into<String>,
+        path: impl AsRef<Path>,
+        desc: &RawVolumeDescriptor,
+    ) -> Result<NodeId, SessionError> {
+        let img = read_raw_volume(path, desc)?;
+        Ok(self.add_dataset(label, DataSet::ImageData(img)))
+    }
+
+    /// Casts a 3D pick ray from pixel `(px, py)` in a `width x height` viewport against visible actors.
+    pub fn pick(
+        &mut self,
+        px: f32,
+        py: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<PickResult>, SessionError> {
+        let scene = self.build_scene()?;
+        Ok(pick_scene(&scene, px, py, width, height))
+    }
+
+    /// Extracts an isosurface directly on the GPU via WebGPU Compute Marching Cubes (`GpuContourEngine`)
+    /// and adds the resulting `PolyData` to the session as a new node.
+    pub fn gpu_contour(
+        &mut self,
+        label: impl Into<String>,
+        input: NodeId,
+        field_name: Option<&str>,
+        iso_value: f64,
+    ) -> Result<NodeId, SessionError> {
+        let ds = self.evaluate(input)?;
+        let img = ds.as_image_data().ok_or_else(|| {
+            PipelineError::ExecutionFailed("GpuContourEngine requires an ImageData dataset".into())
+        })?;
+        let renderer = self.ensure_renderer()?;
+        let engine = GpuContourEngine::from_device(
+            Arc::new(renderer.device().clone()),
+            Arc::new(renderer.queue().clone()),
+        );
+        let poly = engine.contour_imagedata(img, field_name.unwrap_or(""), iso_value)?;
+        Ok(self.add_dataset(label, DataSet::PolyData(poly)))
     }
 
     /// Returns an immutable slice of all pipeline nodes.

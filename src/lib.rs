@@ -63,19 +63,23 @@ pub mod prelude {
     };
     pub use crate::demos::DemoPreset;
     pub use crate::filters::{
-        CalculatorFilter, CellDataToPointDataFilter, ClipFilter, ContourFilter, ExtractSurface,
-        GlyphFilter, GlyphShape, GradientFilter, ImplicitFunction, IntegrationDirection,
-        Integrator, PointDataToCellDataFilter, ProbeOverLineFilter, ScaleMode, SeedSource,
-        SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter, ThresholdFilter,
-        TransformFilter, TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
+        append_datasets, compute_histogram, AppendDatasetsFilter, CalculatorFilter,
+        CellCentersFilter, CellDataToPointDataFilter, ClipFilter, ConnectivityFilter,
+        ContourFilter, ElevationFilter, ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter,
+        GlyphFilter, GlyphShape, GradientFilter, HistogramResult, ImplicitFunction,
+        IntegrationDirection, Integrator, PointDataToCellDataFilter, ProbeOverLineFilter,
+        ReflectFilter, ReflectPlane, ScaleMode, SeedSource, ShrinkFilter, SliceFilter,
+        SmoothFilter, SmoothingMethod, StreamTracerFilter, ThresholdFilter, TransformFilter,
+        TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
     };
     pub use crate::io::{
-        read_dataset, read_pvd_series, write_dataset, write_pvd_series, PvdSeriesSource,
+        read_dataset, read_pvd_series, read_raw_volume, write_dataset, write_glb,
+        write_pvd_series, PvdSeriesSource, RawEndian, RawScalarType, RawVolumeDescriptor,
         VtkFileSource,
     };
     pub use crate::render::{
-        ActorStyle, Camera, CameraPreset, ColorBy, RenderScene, Representation, SceneActor,
-        SceneSettings, WebGpuRenderer,
+        pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,
+        RenderScene, Representation, SceneActor, SceneSettings, ViewportWidget, WebGpuRenderer,
     };
     pub use crate::session::{FilterConfig, ParaViz, SessionError, SourceConfig};
     pub use crate::sources::{
