@@ -23,6 +23,12 @@ pub enum CliCommand {
         edl: bool,
         edl_strength: Option<f32>,
         msaa: Option<u32>,
+        axes_grid: bool,
+        turntable: Option<u32>,
+        filters: Vec<String>,
+        transparent: bool,
+        scalar_bar: bool,
+        gif_delay_ms: Option<u16>,
     },
     Info {
         input: PathBuf,
@@ -45,15 +51,15 @@ USAGE:
     paraviz demo <wavelet|vortex|gyroid|volume|superquadric> -o <out.png> [--width W] [--height H]
     paraviz render <input> -o <out.png> [OPTIONS]
     paraviz info <input>
-    paraviz convert <input> <output>   (supports .vtk, .vtp, .vti, .vtu, .stl, .obj, .ply, .csv, .glb)
+    paraviz convert <input> <output>   (supports .vtk, .vtp, .vti, .vtu, .stl, .obj, .ply, .csv, .glb, .html)
     paraviz --help | -h
     paraviz --version | -V
 
 RENDER OPTIONS:
-    -o, --output <path>       Output PNG path (required for demo/render)
+    -o, --output <path>       Output PNG or animated GIF path (required for demo/render)
     --width <px>              Output image width in pixels (default: 1280)
     --height <px>             Output image height in pixels (default: 720)
-    --repr <mode>             surface | edges | wireframe | points | volume | outline
+    --repr <mode>             surface | edges | wireframe | points | gaussian | volume | outline
     --cmap <preset>           cool_to_warm | viridis | plasma | inferno | magma |
                               turbo | fast | rainbow | grayscale | cividis
     --color-by <array>        Point/cell array name (or 'solid')
@@ -61,6 +67,17 @@ RENDER OPTIONS:
     --edl                     Enable Eye-Dome Lighting post-process
     --edl-strength <val>      Eye-Dome Lighting strength (default: 1.0)
     --msaa <1|4>              Multisample anti-aliasing sample count (default: 1)
+    --axes-grid               Show 3D Cube Axes Grid with tick marks
+    --transparent             Transparent background (alpha=0) for PNG/GIF export
+    --scalar-bar              Composite Scalar Color Bar with min/mid/max labels
+    --turntable <frames>      Render a 360-degree turntable sequence (or animated .gif if -o ends in .gif)
+    --gif-delay <ms>          Frame delay in milliseconds when exporting animated .gif (default: 60)
+    --filter <spec>           Chain filter(s): contour:<v> | decimate:<r> | smooth |
+                              triangulate | normals | edges | resample:<n> | isovolume:<lo>,<hi>
+
+ISSUES & FEEDBACK:
+    Encountering a bug or missing feature? Please open an issue at:
+    https://github.com/DimitriTimoz/paraviz/issues
 "
 }
 
@@ -190,6 +207,12 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
     let mut edl = false;
     let mut edl_strength: Option<f32> = None;
     let mut msaa: Option<u32> = None;
+    let mut axes_grid = false;
+    let mut turntable: Option<u32> = None;
+    let mut filters: Vec<String> = Vec::new();
+    let mut transparent = false;
+    let mut scalar_bar = false;
+    let mut gif_delay_ms: Option<u16> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -263,6 +286,39 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
                 }
                 msaa = Some(samples);
             }
+            "--axes-grid" => {
+                axes_grid = true;
+            }
+            "--transparent" => {
+                transparent = true;
+            }
+            "--scalar-bar" => {
+                scalar_bar = true;
+            }
+            "--gif-delay" => {
+                i += 1;
+                let val = args.get(i).ok_or("Missing milliseconds after --gif-delay")?;
+                let ms = val
+                    .parse::<u16>()
+                    .map_err(|_| format!("Invalid --gif-delay '{val}'"))?;
+                gif_delay_ms = Some(ms.max(10));
+            }
+            "--turntable" => {
+                i += 1;
+                let val = args.get(i).ok_or("Missing frame count after --turntable")?;
+                let frames = val
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid turntable frame count '{val}'"))?;
+                if frames == 0 {
+                    return Err("Turntable frame count must be >= 1".into());
+                }
+                turntable = Some(frames);
+            }
+            "--filter" => {
+                i += 1;
+                let val = args.get(i).ok_or("Missing filter spec after --filter")?;
+                filters.push(val.clone());
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("Unknown option '{flag}' for render subcommand"));
             }
@@ -295,6 +351,12 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
         edl,
         edl_strength,
         msaa,
+        axes_grid,
+        turntable,
+        filters,
+        transparent,
+        scalar_bar,
+        gif_delay_ms,
     })
 }
 
@@ -306,10 +368,11 @@ pub fn parse_representation(s: &str) -> Result<Representation, String> {
         }
         "wireframe" | "wire" => Ok(Representation::Wireframe),
         "points" | "point" => Ok(Representation::Points),
+        "gaussian" | "pointgaussian" | "point_gaussian" => Ok(Representation::PointGaussian),
         "volume" | "vol" => Ok(Representation::Volume),
         "outline" => Ok(Representation::Outline),
         _ => Err(format!(
-            "Unknown representation '{s}'. Expected: surface, edges, wireframe, points, volume, outline"
+            "Unknown representation '{s}'. Expected: surface, edges, wireframe, points, gaussian, volume, outline"
         )),
     }
 }
@@ -454,6 +517,12 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             edl,
             edl_strength,
             msaa,
+            axes_grid,
+            turntable,
+            filters,
+            transparent,
+            scalar_bar,
+            gif_delay_ms,
         } => {
             let ext = input
                 .extension()
@@ -466,9 +535,14 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
                 ParaViz::load_state_json(&json)?
             } else {
                 let mut session = ParaViz::new();
-                let id = session.open(&input)?;
-                let ds = session.evaluate(id)?;
-                let handle = session.show(id);
+                let mut active_id = session.open(&input)?;
+                for spec in &filters {
+                    let cfg = parse_cli_filter(spec)?;
+                    session.hide(active_id);
+                    active_id = session.add_filter_cfg(cfg.default_label(), active_id, cfg)?;
+                }
+                let ds = session.evaluate(active_id)?;
+                let handle = session.show(active_id);
                 let handle = if let Some(r) = repr {
                     handle.representation(r)
                 } else {
@@ -509,15 +583,63 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             if let Some(samples) = msaa {
                 pv.settings.msaa_samples = samples;
             }
+            if axes_grid {
+                pv.settings.show_axes_grid = true;
+            }
+            if transparent {
+                pv.settings.transparent_background = true;
+            }
+            if scalar_bar {
+                pv.settings.show_scalar_bar = true;
+            }
 
-            pv.render_png(&output, width, height)?;
-            println!(
-                "Rendered '{}' ({}x{}) -> {}",
-                input.display(),
-                width,
-                height,
-                output.display()
-            );
+            let is_gif = output
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+
+            if is_gif {
+                if let Some(frames) = turntable {
+                    let delay = gif_delay_ms.unwrap_or(60);
+                    pv.render_turntable_gif(&output, width, height, frames, delay)?;
+                    println!(
+                        "Rendered {frames}-frame turntable GIF ({width}x{height}) -> {}",
+                        output.display()
+                    );
+                } else {
+                    let delay = gif_delay_ms.unwrap_or(100);
+                    pv.render_timeseries_gif(&output, width, height, delay)?;
+                    println!(
+                        "Rendered animated GIF ({width}x{height}) -> {}",
+                        output.display()
+                    );
+                }
+            } else if let Some(frames) = turntable {
+                let stem = output
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("frame");
+                let parent = output.parent().unwrap_or_else(|| Path::new("."));
+                let step_rad = std::f32::consts::TAU / (frames as f32);
+                for f in 0..frames {
+                    let frame_path = parent.join(format!("{stem}_{f:03}.png"));
+                    pv.render_png(&frame_path, width, height)?;
+                    pv.camera.orbit(step_rad, 0.0);
+                }
+                println!(
+                    "Rendered {frames} turntable frames ({width}x{height}) -> {}/{stem}_*.png",
+                    parent.display()
+                );
+            } else {
+                pv.render_png(&output, width, height)?;
+                println!(
+                    "Rendered '{}' ({}x{}) -> {}",
+                    input.display(),
+                    width,
+                    height,
+                    output.display()
+                );
+            }
             Ok(())
         }
         CliCommand::Info { input } => {
@@ -543,6 +665,27 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
                     .map(|a| a.name.clone());
                 let cmap = scalar_name.as_ref().map(|_| ColorMap::default());
                 paraviz::io::write_glb(&output, &poly, cmap.as_ref(), scalar_name.as_deref())?;
+            } else if out_ext == "html" || out_ext == "htm" {
+                let poly = match &ds {
+                    DataSet::PolyData(p) => p.clone(),
+                    other => paraviz::filters::extract_surface(other)?,
+                };
+                let scalar_name = poly
+                    .point_data
+                    .active_scalars_array()
+                    .map(|a| a.name.clone());
+                let cmap = scalar_name.as_ref().map(|_| ColorMap::default());
+                let title = input
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ParaViz");
+                paraviz::io::write_html_viewer(
+                    &output,
+                    &poly,
+                    title,
+                    cmap.as_ref(),
+                    scalar_name.as_deref(),
+                )?;
             } else {
                 write_dataset(&output, &ds)?;
             }
@@ -557,5 +700,57 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             Ok(())
         }
         CliCommand::Gui(_) => Err("Gui command must be launched via eframe".into()),
+    }
+}
+
+fn parse_cli_filter(spec: &str) -> Result<FilterConfig, String> {
+    let (kind, arg) = spec.split_once(':').unwrap_or((spec, ""));
+    match kind.to_ascii_lowercase().as_str() {
+        "contour" => {
+            let vals: Vec<f64> = arg
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<f64>().map_err(|_| format!("Invalid isovalue '{s}'")))
+                .collect::<Result<Vec<_>, _>>()?;
+            if vals.is_empty() {
+                return Err("contour filter requires at least one value, e.g. --filter contour:120".into());
+            }
+            Ok(FilterConfig::Contour(ContourFilter {
+                iso_values: vals,
+                ..Default::default()
+            }))
+        }
+        "decimate" => {
+            let r: f32 = if arg.is_empty() {
+                0.5
+            } else {
+                arg.parse().map_err(|_| format!("Invalid decimate ratio '{arg}'"))?
+            };
+            Ok(FilterConfig::Decimate(DecimateFilter::new(r)))
+        }
+        "smooth" => Ok(FilterConfig::Smooth(SmoothFilter::default())),
+        "triangulate" => Ok(FilterConfig::Triangulate(TriangulateFilter::default())),
+        "normals" => Ok(FilterConfig::GenerateNormals(GenerateNormalsFilter::default())),
+        "edges" => Ok(FilterConfig::ExtractEdges(ExtractEdgesFilter)),
+        "surface" => Ok(FilterConfig::ExtractSurface(ExtractSurface::new())),
+        "resample" => {
+            let n: usize = if arg.is_empty() {
+                32
+            } else {
+                arg.parse().map_err(|_| format!("Invalid resample dim '{arg}'"))?
+            };
+            Ok(FilterConfig::ResampleToImage(ResampleToImageFilter::new([n, n, n])))
+        }
+        "isovolume" => {
+            let parts: Vec<f64> = arg
+                .split(',')
+                .filter_map(|s| s.parse::<f64>().ok())
+                .collect();
+            if parts.len() != 2 {
+                return Err("isovolume requires min,max e.g. --filter isovolume:50,150".into());
+            }
+            Ok(FilterConfig::IsoVolume(IsoVolumeFilter::new("", parts[0], parts[1])))
+        }
+        other => Err(format!("Unknown CLI filter '{other}'")),
     }
 }

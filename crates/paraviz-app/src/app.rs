@@ -1,8 +1,8 @@
-use crate::charts::{draw_chart_tab, ChartMode, ChartState};
+use crate::charts::{draw_chart_tab, draw_opacity_tf_editor, ChartMode, ChartState};
 use crate::cli::format_memory_bytes;
 use crate::modals::{
-    draw_modal, is_raw_volume_ext, AppModal, FileBrowserState, GpuContourModalState, ModalAction,
-    RawVolumeModalState, ScreenshotModalState,
+    draw_modal, is_raw_volume_ext, AppModal, ExportSpreadsheetModalState, FileBrowserState,
+    GifModalState, GpuContourModalState, ModalAction, RawVolumeModalState, ScreenshotModalState,
 };
 use crate::theme::{
     apply_theme, node_badge_style, paint_logo_badge, palette, pill_badge, section_card,
@@ -12,7 +12,7 @@ use paraviz::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InspectorTab {
@@ -43,6 +43,32 @@ enum SpreadsheetTarget {
     Field,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickDomain {
+    Point,
+    Cell,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PickedHighlight {
+    node_id: NodeId,
+    domain: PickDomain,
+    element_index: usize,
+    world_pos: Option<[f32; 3]>,
+    scalar_value: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ViewportCacheKey {
+    scene_revision: u64,
+    width: u32,
+    height: u32,
+    camera: Camera,
+    settings: SceneSettings,
+    widgets: Vec<ViewportWidget>,
+    picked_highlight: Option<PickedHighlight>,
+}
+
 struct PipelineTreeRow {
     id: NodeId,
     depth: usize,
@@ -64,11 +90,18 @@ pub struct ParaVizApp {
     egui_renderer: Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>,
     viewport_tex_id: Option<egui::TextureId>,
     viewport_tex_size: (u32, u32),
+    scene_revision: u64,
+    viewport_cache_key: Option<ViewportCacheKey>,
+    cached_scene: Option<RenderScene>,
+    cached_total_points: usize,
+    cached_total_cells: usize,
 
     theme: UiTheme,
     theme_applied: bool,
     selected_node: Option<NodeId>,
     renaming_node: Option<(NodeId, String)>,
+    copied_filter: Option<(String, FilterConfig)>,
+    copied_filter_chain: Vec<(String, FilterConfig)>,
     auto_apply: bool,
     pending_source: Option<(NodeId, SourceConfig)>,
     pending_filter: Option<(NodeId, FilterConfig)>,
@@ -83,11 +116,14 @@ pub struct ParaVizApp {
     spreadsheet_offset: usize,
     spreadsheet_page_size: usize,
     spreadsheet_filter: String,
+    spreadsheet_scroll_to_top: bool,
     show_scalar_bar: bool,
     show_widgets: bool,
 
     viewport_mode: ViewportMode,
     last_pick: Option<PickResult>,
+    picked_highlight: Option<PickedHighlight>,
+    highlight_flash_until: Option<Instant>,
     ruler_points: Vec<[f32; 3]>,
     export_glb_colors: bool,
 
@@ -105,6 +141,7 @@ pub struct ParaVizApp {
     recent_files: Vec<PathBuf>,
     camera_bookmarks: Vec<CameraBookmark>,
     info_stats_cache: HashMap<(NodeId, String, AttributeAssociation), HistogramResult>,
+    volume_tf_hist_cache: HashMap<(NodeId, String, AttributeAssociation, Option<usize>), HistogramResult>,
 
     modal: Option<AppModal>,
     status_message: String,
@@ -137,10 +174,17 @@ impl ParaVizApp {
             egui_renderer,
             viewport_tex_id: None,
             viewport_tex_size: (0, 0),
+            scene_revision: 1,
+            viewport_cache_key: None,
+            cached_scene: None,
+            cached_total_points: 0,
+            cached_total_cells: 0,
             theme,
             theme_applied: true,
             selected_node: None,
             renaming_node: None,
+            copied_filter: None,
+            copied_filter_chain: Vec::new(),
             auto_apply: true,
             pending_source: None,
             pending_filter: None,
@@ -154,10 +198,13 @@ impl ParaVizApp {
             spreadsheet_offset: 0,
             spreadsheet_page_size: 200,
             spreadsheet_filter: String::new(),
+            spreadsheet_scroll_to_top: false,
             show_scalar_bar: true,
             show_widgets: true,
             viewport_mode: ViewportMode::Orbit,
             last_pick: None,
+            picked_highlight: None,
+            highlight_flash_until: None,
             ruler_points: Vec::new(),
             export_glb_colors: true,
             turntable_enabled: false,
@@ -171,6 +218,7 @@ impl ParaVizApp {
             recent_files: Vec::new(),
             camera_bookmarks: Vec::new(),
             info_stats_cache: HashMap::new(),
+            volume_tf_hist_cache: HashMap::new(),
             modal: None,
             status_message: "Ready".into(),
             error_message: None,
@@ -183,6 +231,91 @@ impl ParaVizApp {
         }
 
         app
+    }
+
+    fn invalidate_viewport(&mut self) {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    fn clear_stats_caches(&mut self) {
+        self.info_stats_cache.clear();
+        self.volume_tf_hist_cache.clear();
+    }
+
+    fn clear_stats_caches_for_node(&mut self, node_id: NodeId) {
+        self.info_stats_cache.retain(|(nid, _, _), _| *nid != node_id);
+        self.volume_tf_hist_cache
+            .retain(|(nid, _, _, _), _| *nid != node_id);
+    }
+
+    fn focus_on_world_pos(&mut self, pos: [f32; 3]) {
+        let p = glam::Vec3::from_array(pos);
+        let offset = self.session.camera.position - self.session.camera.target;
+        let dist = offset.length().max(1e-4);
+        let dir = offset.normalize_or(glam::Vec3::Z);
+        let target_dist = self
+            .selected_node
+            .and_then(|id| self.session.node(id).ok())
+            .and_then(|n| n.dataset())
+            .map(|ds| ds.bounds().diagonal() * 0.35)
+            .filter(|d| *d > 1e-4)
+            .map(|d| dist.min(d))
+            .unwrap_or(dist);
+        self.session.camera.target = p;
+        self.session.camera.position = p + dir * target_dist;
+        if self.session.camera.orthographic {
+            self.session.camera.ortho_scale =
+                (self.session.camera.ortho_scale * (target_dist / dist)).max(1e-5);
+        }
+        self.invalidate_viewport();
+    }
+
+    fn reveal_in_spreadsheet(&mut self, node_id: NodeId, domain: PickDomain, element_index: usize) {
+        self.select_node(node_id);
+        self.show_drawer = true;
+        self.drawer_tab = DrawerTab::Spreadsheet;
+        self.spreadsheet_target = match domain {
+            PickDomain::Point => SpreadsheetTarget::Points,
+            PickDomain::Cell => SpreadsheetTarget::Cells,
+        };
+        self.spreadsheet_offset = element_index;
+        self.spreadsheet_scroll_to_top = true;
+        self.highlight_flash_until = Some(Instant::now() + Duration::from_secs(2));
+        self.status_message = match domain {
+            PickDomain::Point => format!("Revealed Point #{element_index} in Spreadsheet"),
+            PickDomain::Cell => format!("Revealed Cell #{element_index} in Spreadsheet"),
+        };
+    }
+
+    fn highlight_from_spreadsheet_row(
+        &mut self,
+        node_id: NodeId,
+        ds: &DataSet,
+        domain: PickDomain,
+        row: usize,
+    ) {
+        let world_pos = match domain {
+            PickDomain::Point => dataset_point_at(ds, row),
+            PickDomain::Cell => dataset_cell_center(ds, row),
+        };
+        let scalar_value = self
+            .session
+            .node(node_id)
+            .ok()
+            .and_then(|n| dataset_element_scalar(ds, &n.style.color_by, domain, row));
+        self.picked_highlight = Some(PickedHighlight {
+            node_id,
+            domain,
+            element_index: row,
+            world_pos,
+            scalar_value,
+        });
+        self.highlight_flash_until = Some(Instant::now() + Duration::from_secs(2));
+        self.status_message = match domain {
+            PickDomain::Point => format!("Highlighted Point #{row}"),
+            PickDomain::Cell => format!("Highlighted Cell #{row}"),
+        };
+        self.invalidate_viewport();
     }
 
     fn push_recent_file(&mut self, path: &Path) {
@@ -202,10 +335,13 @@ impl ParaVizApp {
                 self.pending_filter = None;
                 self.renaming_node = None;
                 self.last_pick = None;
+                self.picked_highlight = None;
+                self.highlight_flash_until = None;
                 self.ruler_points.clear();
-                self.info_stats_cache.clear();
+                self.clear_stats_caches();
                 self.playing = false;
                 self.error_message = None;
+                self.invalidate_viewport();
                 self.status_message = format!("Loaded demo: {}", preset.name());
             }
             Err(e) => {
@@ -240,10 +376,13 @@ impl ParaVizApp {
                     self.pending_filter = None;
                     self.renaming_node = None;
                     self.last_pick = None;
+                    self.picked_highlight = None;
+                    self.highlight_flash_until = None;
                     self.ruler_points.clear();
-                    self.info_stats_cache.clear();
+                    self.clear_stats_caches();
                     self.playing = false;
                     self.error_message = None;
+                    self.invalidate_viewport();
                     self.push_recent_file(path);
                     self.status_message = format!("Loaded state: {}", path.display());
                 }
@@ -265,8 +404,9 @@ impl ParaVizApp {
                     let _ = self.session.reset_camera();
                 }
                 self.select_node(id);
-                self.info_stats_cache.clear();
+                self.clear_stats_caches();
                 self.error_message = None;
+                self.invalidate_viewport();
                 self.push_recent_file(path);
                 self.status_message = format!("Opened '{}'", path.display());
             }
@@ -309,6 +449,7 @@ impl ParaVizApp {
                 }
                 self.select_node(id);
                 self.error_message = None;
+                self.invalidate_viewport();
                 self.push_recent_file(&path);
                 self.status_message = format!(
                     "Imported raw volume '{label}' ({}×{}×{})",
@@ -335,6 +476,7 @@ impl ParaVizApp {
                 }
                 self.select_node(id);
                 self.error_message = None;
+                self.invalidate_viewport();
                 self.status_message = format!("Added source '{label}'");
             }
             Err(e) => {
@@ -466,6 +608,7 @@ impl ParaVizApp {
                     self.status_message = format!("Applied filter '{label}'");
                 }
                 self.select_node(id);
+                self.invalidate_viewport();
                 if is_probe {
                     self.chart_state.mode = ChartMode::XYPlot;
                     self.drawer_tab = DrawerTab::Chart;
@@ -530,6 +673,7 @@ impl ParaVizApp {
                 self.session.show(new_id);
                 self.select_node(new_id);
                 self.error_message = None;
+                self.invalidate_viewport();
                 self.status_message =
                     format!("Applied GPU Compute Contour '{label}' (iso={iso_value:.3})");
             }
@@ -566,6 +710,7 @@ impl ParaVizApp {
                 self.session.show(id);
                 self.select_node(id);
                 self.error_message = None;
+                self.invalidate_viewport();
                 self.status_message = format!("Appended visible datasets -> '{label}'");
             }
             Err(e) => {
@@ -577,6 +722,7 @@ impl ParaVizApp {
     fn focus_selected_node(&mut self) {
         let Some(sel_id) = self.selected_node else {
             let _ = self.session.reset_camera();
+            self.invalidate_viewport();
             return;
         };
         let _ = self.session.evaluate(sel_id);
@@ -586,10 +732,12 @@ impl ParaVizApp {
             let bb = ds.bounds();
             if bb.is_valid() {
                 self.session.camera.fit_bounds(&bb);
+                self.invalidate_viewport();
                 return;
             }
         }
         let _ = self.session.reset_camera();
+        self.invalidate_viewport();
     }
 
     fn duplicate_selected_node(&mut self) {
@@ -616,12 +764,100 @@ impl ParaVizApp {
                 }
                 let _ = self.session.evaluate(new_id);
                 self.select_node(new_id);
+                self.invalidate_viewport();
                 self.status_message = format!("Duplicated node -> '{label}'");
             }
             Err(e) => {
                 self.error_message = Some(format!("Duplicate failed: {e}"));
             }
         }
+    }
+
+    fn copy_filter_from_node(&mut self, id: NodeId) {
+        let Ok(node) = self.session.node(id) else {
+            return;
+        };
+        if let Some(cfg) = &node.filter_config {
+            self.copied_filter = Some((node.name.clone(), cfg.clone()));
+            self.status_message = format!("Copied filter '{}'", node.name);
+        }
+    }
+
+    fn copy_filter_chain_from_node(&mut self, id: NodeId) {
+        let mut chain = Vec::new();
+        let mut cur = Some(id);
+        while let Some(nid) = cur {
+            let Ok(node) = self.session.node(nid) else {
+                break;
+            };
+            if let Some(cfg) = &node.filter_config {
+                chain.push((node.name.clone(), cfg.clone()));
+                cur = node.parent;
+            } else {
+                break;
+            }
+        }
+        chain.reverse();
+        if !chain.is_empty() {
+            self.copied_filter = chain.last().cloned();
+            let count = chain.len();
+            self.copied_filter_chain = chain;
+            self.status_message = format!("Copied {count}-filter chain");
+        }
+    }
+
+    fn paste_filter_to_node(&mut self, target_id: NodeId) {
+        let Some((src_name, cfg)) = self.copied_filter.clone() else {
+            return;
+        };
+        let label = self.unique_label(&src_name);
+        match self.session.add_filter_cfg(label.clone(), target_id, cfg) {
+            Ok(new_id) => {
+                let eval_res = self.session.evaluate(new_id);
+                self.session.show(new_id);
+                if let Err(e) = eval_res {
+                    self.error_message = Some(format!("Paste filter failed: {e}"));
+                } else {
+                    self.error_message = None;
+                    self.status_message = format!("Pasted filter '{label}'");
+                }
+                self.select_node(new_id);
+                self.invalidate_viewport();
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Paste filter failed: {e}"));
+            }
+        }
+    }
+
+    fn paste_filter_chain_to_node(&mut self, mut target_id: NodeId) {
+        if self.copied_filter_chain.is_empty() {
+            self.paste_filter_to_node(target_id);
+            return;
+        }
+        let chain = self.copied_filter_chain.clone();
+        let count = chain.len();
+        for (idx, (src_name, cfg)) in chain.into_iter().enumerate() {
+            let label = self.unique_label(&src_name);
+            match self.session.add_filter_cfg(label, target_id, cfg) {
+                Ok(new_id) => {
+                    if idx + 1 < count {
+                        self.session.hide(new_id);
+                    } else {
+                        self.session.show(new_id);
+                    }
+                    let _ = self.session.evaluate(new_id);
+                    target_id = new_id;
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Paste filter chain failed: {e}"));
+                    return;
+                }
+            }
+        }
+        self.select_node(target_id);
+        self.invalidate_viewport();
+        self.status_message = format!("Pasted {count}-filter chain");
     }
 
     fn solo_selected_node(&mut self) {
@@ -636,6 +872,7 @@ impl ParaVizApp {
                 self.session.hide(id);
             }
         }
+        self.invalidate_viewport();
     }
 
     fn set_all_visibility(&mut self, visible: bool) {
@@ -647,6 +884,7 @@ impl ParaVizApp {
                 self.session.hide(id);
             }
         }
+        self.invalidate_viewport();
     }
 
     fn sync_viewport_widgets(&mut self) {
@@ -777,6 +1015,7 @@ impl ParaVizApp {
             } else {
                 ChartMode::Histogram
             };
+            self.invalidate_viewport();
         }
     }
 
@@ -784,11 +1023,21 @@ impl ParaVizApp {
         if let Some(id) = self.selected_node {
             let removed = self.session.remove_node(id);
             self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
+            self.volume_tf_hist_cache
+                .retain(|(nid, _, _, _), _| !removed.contains(nid));
+            if self
+                .picked_highlight
+                .as_ref()
+                .is_some_and(|h| removed.contains(&h.node_id))
+            {
+                self.picked_highlight = None;
+            }
             if self.selected_node.is_some_and(|s| removed.contains(&s)) {
                 self.selected_node = self.session.nodes().last().map(|n| n.id);
                 self.pending_source = None;
                 self.pending_filter = None;
             }
+            self.invalidate_viewport();
         }
     }
 
@@ -810,7 +1059,8 @@ impl ParaVizApp {
         let next_idx =
             (cur_idx as isize + delta_steps).rem_euclid(steps.len() as isize) as usize;
         self.session.set_time(steps[next_idx]);
-        self.info_stats_cache.clear();
+        self.clear_stats_caches();
+        self.invalidate_viewport();
     }
 
     fn handle_shortcuts_and_drops(&mut self, ctx: &egui::Context) {
@@ -828,6 +1078,7 @@ impl ParaVizApp {
         if !ctx.egui_wants_keyboard_input() && self.modal.is_none() && self.renaming_node.is_none() {
             if ctx.input(|i| i.key_pressed(egui::Key::R)) {
                 let _ = self.session.reset_camera();
+                self.invalidate_viewport();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::F)) {
                 self.focus_selected_node();
@@ -843,9 +1094,11 @@ impl ParaVizApp {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::W)) {
                 self.show_widgets = !self.show_widgets;
+                self.invalidate_viewport();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::E)) {
                 self.session.settings.edl_enabled = !self.session.settings.edl_enabled;
+                self.invalidate_viewport();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::M)) {
                 self.session.settings.msaa_samples = if self.session.settings.msaa_samples >= 4 {
@@ -853,13 +1106,16 @@ impl ParaVizApp {
                 } else {
                     4
                 };
+                self.invalidate_viewport();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::G)) {
                 self.session.settings.show_axes_gizmo = !self.session.settings.show_axes_gizmo;
+                self.invalidate_viewport();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::B)) {
                 self.session.settings.show_bounding_box =
                     !self.session.settings.show_bounding_box;
+                self.invalidate_viewport();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::T)) {
                 self.turntable_enabled = !self.turntable_enabled;
@@ -880,6 +1136,16 @@ impl ParaVizApp {
                 && !self.session.all_time_steps().is_empty()
             {
                 self.playing = !self.playing;
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
+                && let Some(sel) = self.selected_node
+            {
+                self.copy_filter_from_node(sel);
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
+                && let Some(sel) = self.selected_node
+            {
+                self.paste_filter_to_node(sel);
             }
         }
     }
@@ -954,6 +1220,23 @@ impl ParaVizApp {
                         width: w.max(1280),
                         height: h.max(720),
                         use_viewport_size: true,
+                        transparent: self.session.settings.transparent_background,
+                        include_scalar_bar: self.show_scalar_bar,
+                    }));
+                    ui.close();
+                }
+                if ui.button("Export Animation (GIF)...").clicked() {
+                    let (w, h) = self.viewport_tex_size;
+                    let has_ts = !self.session.all_time_steps().is_empty();
+                    self.modal = Some(AppModal::ExportGif(GifModalState {
+                        path: "paraviz_animation.gif".into(),
+                        width: w.clamp(320, 1280),
+                        height: h.clamp(240, 720),
+                        frames: 36,
+                        delay_ms: if has_ts { 120 } else { 60 },
+                        is_turntable: !has_ts,
+                        transparent: self.session.settings.transparent_background,
+                        include_scalar_bar: self.show_scalar_bar,
                     }));
                     ui.close();
                 }
@@ -1091,6 +1374,46 @@ impl ParaVizApp {
                         "Elevation",
                         FilterConfig::Elevation(ElevationFilter::default()),
                     ),
+                    (
+                        "Decimate (QEM)",
+                        FilterConfig::Decimate(DecimateFilter::default()),
+                    ),
+                    (
+                        "Delaunay 2D",
+                        FilterConfig::Delaunay2D(Delaunay2DFilter::default()),
+                    ),
+                    (
+                        "Delaunay 3D",
+                        FilterConfig::Delaunay3D(Delaunay3DFilter::default()),
+                    ),
+                    (
+                        "IsoVolume",
+                        FilterConfig::IsoVolume(IsoVolumeFilter::default()),
+                    ),
+                    (
+                        "Resample To Image",
+                        FilterConfig::ResampleToImage(ResampleToImageFilter::default()),
+                    ),
+                    (
+                        "Integrate Variables",
+                        FilterConfig::IntegrateVariables(IntegrateVariablesFilter::default()),
+                    ),
+                    (
+                        "Extract Block",
+                        FilterConfig::ExtractBlock(ExtractBlockFilter::default()),
+                    ),
+                    (
+                        "Temporal Statistics",
+                        FilterConfig::TemporalStatistics(TemporalStatisticsFilter::default()),
+                    ),
+                    (
+                        "Add TimeSteps",
+                        FilterConfig::AddTimeSteps(AddTimeStepsFilter::default()),
+                    ),
+                    (
+                        "Append Datasets",
+                        FilterConfig::AppendDatasets(AppendDatasetsFilter::default()),
+                    ),
                 ];
                 for (name, cfg) in entries {
                     if ui.add_enabled(enabled, egui::Button::new(name)).clicked() {
@@ -1141,27 +1464,52 @@ impl ParaVizApp {
                 ui.checkbox(&mut self.zen_mode, "Zen Mode (Full Viewport)");
                 ui.separator();
                 ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
-                ui.checkbox(&mut self.show_widgets, "3D Filter Widgets (W)");
-                ui.checkbox(&mut self.session.settings.show_axes_gizmo, "Axes Gizmo (G)");
-                ui.checkbox(
-                    &mut self.session.settings.show_bounding_box,
-                    "Bounding Box (B)",
-                );
+                if ui
+                    .checkbox(&mut self.show_widgets, "3D Filter Widgets (W)")
+                    .changed()
+                {
+                    self.invalidate_viewport();
+                }
+                if ui
+                    .checkbox(&mut self.session.settings.show_axes_gizmo, "Axes Gizmo (G)")
+                    .changed()
+                {
+                    self.invalidate_viewport();
+                }
+                if ui
+                    .checkbox(
+                        &mut self.session.settings.show_bounding_box,
+                        "Bounding Box (B)",
+                    )
+                    .changed()
+                {
+                    self.invalidate_viewport();
+                }
                 ui.checkbox(&mut self.turntable_enabled, "Turntable Spin (T)");
                 ui.separator();
                 let mut msaa_4x = self.session.settings.msaa_samples >= 4;
                 if ui.checkbox(&mut msaa_4x, "4x MSAA (M)").changed() {
                     self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+                    self.invalidate_viewport();
                 }
-                ui.checkbox(
-                    &mut self.session.settings.edl_enabled,
-                    "Eye-Dome Lighting (E)",
-                );
-                if self.session.settings.edl_enabled {
-                    ui.add(
-                        egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
-                            .text("EDL Strength"),
-                    );
+                if ui
+                    .checkbox(
+                        &mut self.session.settings.edl_enabled,
+                        "Eye-Dome Lighting (E)",
+                    )
+                    .changed()
+                {
+                    self.invalidate_viewport();
+                }
+                if self.session.settings.edl_enabled
+                    && ui
+                        .add(
+                            egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
+                                .text("EDL Strength"),
+                        )
+                        .changed()
+                {
+                    self.invalidate_viewport();
                 }
                 ui.separator();
                 ui.menu_button("UI Theme", |ui| {
@@ -1191,6 +1539,17 @@ impl ParaVizApp {
                 }
                 if ui.button("Demo Gallery").clicked() {
                     self.modal = Some(AppModal::DemoGallery);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button("Report an Issue / Bug...")
+                    .on_hover_text("Open GitHub Issues to report a bug or request a feature")
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://github.com/DimitriTimoz/paraviz/issues/new/choose",
+                    ));
                     ui.close();
                 }
             });
@@ -1233,6 +1592,7 @@ impl ParaVizApp {
                     ui.horizontal(|ui| {
                         if ui.small_button("Reset").on_hover_text("Reset camera (R)").clicked() {
                             let _ = self.session.reset_camera();
+                            self.invalidate_viewport();
                         }
                         if ui.small_button("Fit").on_hover_text("Focus selected node (F)").clicked() {
                             self.focus_selected_node();
@@ -1248,9 +1608,15 @@ impl ParaVizApp {
                         ] {
                             if ui.small_button(label).clicked() {
                                 let _ = self.session.camera_preset(preset);
+                                self.invalidate_viewport();
                             }
                         }
-                        ui.toggle_value(&mut self.session.camera.orthographic, "Ortho");
+                        if ui
+                            .toggle_value(&mut self.session.camera.orthographic, "Ortho")
+                            .changed()
+                        {
+                            self.invalidate_viewport();
+                        }
                         ui.toggle_value(&mut self.turntable_enabled, "Spin")
                             .on_hover_text("Turntable orbit spin (T)");
                     });
@@ -1272,6 +1638,7 @@ impl ParaVizApp {
                             .on_hover_text("2-Point Distance Ruler (3)");
                         if !self.ruler_points.is_empty() && ui.small_button("Clear").clicked() {
                             self.ruler_points.clear();
+                            self.invalidate_viewport();
                         }
                     });
                 });
@@ -1284,24 +1651,46 @@ impl ParaVizApp {
                 .inner_margin(egui::Margin::symmetric(6, 3))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes");
-                        ui.toggle_value(&mut self.session.settings.show_bounding_box, "Bounds");
-                        ui.toggle_value(&mut self.show_widgets, "Widgets");
+                        if ui
+                            .toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes")
+                            .changed()
+                        {
+                            self.invalidate_viewport();
+                        }
+                        if ui
+                            .toggle_value(&mut self.session.settings.show_bounding_box, "Bounds")
+                            .changed()
+                        {
+                            self.invalidate_viewport();
+                        }
+                        if ui.toggle_value(&mut self.show_widgets, "Widgets").changed() {
+                            self.invalidate_viewport();
+                        }
                         ui.toggle_value(&mut self.show_scalar_bar, "ColorBar");
                         let mut msaa_4x = self.session.settings.msaa_samples >= 4;
                         if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
                             self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+                            self.invalidate_viewport();
                         }
-                        ui.toggle_value(&mut self.session.settings.edl_enabled, "EDL");
-                        if self.session.settings.edl_enabled {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.session.settings.edl_strength,
-                                    0.0..=4.0,
+                        if ui
+                            .toggle_value(&mut self.session.settings.edl_enabled, "EDL")
+                            .changed()
+                        {
+                            self.invalidate_viewport();
+                        }
+                        if self.session.settings.edl_enabled
+                            && ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.session.settings.edl_strength,
+                                        0.0..=4.0,
+                                    )
+                                    .max_decimals(2)
+                                    .show_value(true),
                                 )
-                                .max_decimals(2)
-                                .show_value(true),
-                            );
+                                .changed()
+                        {
+                            self.invalidate_viewport();
                         }
                     });
                 });
@@ -1332,6 +1721,8 @@ impl ParaVizApp {
                             ui.label("Time:");
                             if ui.small_button("|<").clicked() {
                                 self.session.set_time(steps[0]);
+                                self.clear_stats_caches();
+                                self.invalidate_viewport();
                             }
                             if ui.small_button("<").clicked() {
                                 self.step_time(-1);
@@ -1345,6 +1736,8 @@ impl ParaVizApp {
                             }
                             if ui.small_button(">|").clicked() {
                                 self.session.set_time(*steps.last().unwrap());
+                                self.clear_stats_caches();
+                                self.invalidate_viewport();
                             }
                             let min_t = steps[0];
                             let max_t = *steps.last().unwrap();
@@ -1359,7 +1752,8 @@ impl ParaVizApp {
                                     .changed()
                                 {
                                     self.session.set_time(t);
-                                    self.info_stats_cache.clear();
+                                    self.clear_stats_caches();
+                                    self.invalidate_viewport();
                                 }
                             } else {
                                 ui.label(format!("{t:.3}"));
@@ -1391,6 +1785,29 @@ impl ParaVizApp {
                     .clicked()
                 {
                     self.duplicate_selected_node();
+                }
+                let can_copy = self
+                    .selected_node
+                    .and_then(|id| self.session.node(id).ok())
+                    .is_some_and(|n| n.filter_config.is_some());
+                if ui
+                    .add_enabled(can_copy, egui::Button::new("Copy").small())
+                    .on_hover_text("Copy selected filter (Ctrl/Cmd+C)")
+                    .clicked()
+                    && let Some(sel) = self.selected_node
+                {
+                    self.copy_filter_from_node(sel);
+                }
+                if ui
+                    .add_enabled(
+                        has_sel && self.copied_filter.is_some(),
+                        egui::Button::new("Paste").small(),
+                    )
+                    .on_hover_text("Paste copied filter onto selected node (Ctrl/Cmd+V)")
+                    .clicked()
+                    && let Some(sel) = self.selected_node
+                {
+                    self.paste_filter_to_node(sel);
                 }
                 if ui
                     .add_enabled(has_sel, egui::Button::new("Rename").small())
@@ -1430,6 +1847,8 @@ impl ParaVizApp {
         let mut toggle_vis: Option<(NodeId, bool)> = None;
         let mut to_select: Option<NodeId> = None;
         let mut to_delete: Option<NodeId> = None;
+        let mut to_copy: Option<(NodeId, bool)> = None;
+        let mut to_paste: Option<(NodeId, bool)> = None;
         let mut commit_rename: Option<(NodeId, String)> = None;
         let mut cancel_rename = false;
 
@@ -1503,6 +1922,51 @@ impl ParaVizApp {
                                             if lbl.double_clicked() {
                                                 self.renaming_node = Some((id, name.clone()));
                                             }
+                                            let is_filter = self
+                                                .session
+                                                .node(id)
+                                                .is_ok_and(|n| n.filter_config.is_some());
+                                            let has_copied = self.copied_filter.is_some();
+                                            let has_chain = !self.copied_filter_chain.is_empty();
+                                            lbl.context_menu(|ui| {
+                                                if ui
+                                                    .add_enabled(is_filter, egui::Button::new("Copy Filter"))
+                                                    .clicked()
+                                                {
+                                                    to_copy = Some((id, false));
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add_enabled(is_filter, egui::Button::new("Copy Filter Chain"))
+                                                    .clicked()
+                                                {
+                                                    to_copy = Some((id, true));
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add_enabled(has_copied, egui::Button::new("Paste Filter Here"))
+                                                    .clicked()
+                                                {
+                                                    to_paste = Some((id, false));
+                                                    ui.close();
+                                                }
+                                                if ui
+                                                    .add_enabled(has_chain, egui::Button::new("Paste Filter Chain Here"))
+                                                    .clicked()
+                                                {
+                                                    to_paste = Some((id, true));
+                                                    ui.close();
+                                                }
+                                                ui.separator();
+                                                if ui.button("Rename").clicked() {
+                                                    self.renaming_node = Some((id, name.clone()));
+                                                    ui.close();
+                                                }
+                                                if ui.button("Delete").clicked() {
+                                                    to_delete = Some(id);
+                                                    ui.close();
+                                                }
+                                            });
                                         }
 
                                         ui.with_layout(
@@ -1540,18 +2004,43 @@ impl ParaVizApp {
             } else {
                 self.session.hide(id);
             }
+            self.invalidate_viewport();
         }
         if let Some(id) = to_select {
             self.select_node(id);
         }
+        if let Some((id, is_chain)) = to_copy {
+            if is_chain {
+                self.copy_filter_chain_from_node(id);
+            } else {
+                self.copy_filter_from_node(id);
+            }
+        }
+        if let Some((id, is_chain)) = to_paste {
+            if is_chain {
+                self.paste_filter_chain_to_node(id);
+            } else {
+                self.paste_filter_to_node(id);
+            }
+        }
         if let Some(id) = to_delete {
             let removed = self.session.remove_node(id);
             self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
+            self.volume_tf_hist_cache
+                .retain(|(nid, _, _, _), _| !removed.contains(nid));
+            if self
+                .picked_highlight
+                .as_ref()
+                .is_some_and(|h| removed.contains(&h.node_id))
+            {
+                self.picked_highlight = None;
+            }
             if self.selected_node.is_some_and(|s| removed.contains(&s)) {
                 self.selected_node = self.session.nodes().last().map(|n| n.id);
                 self.pending_source = None;
                 self.pending_filter = None;
             }
+            self.invalidate_viewport();
         }
 
         ui.add_space(6.0);
@@ -1650,6 +2139,7 @@ impl ParaVizApp {
         if discard_clicked {
             self.pending_source = None;
             self.pending_filter = None;
+            self.invalidate_viewport();
         }
 
         if let Some(orig_src) = src_cfg {
@@ -1668,7 +2158,8 @@ impl ParaVizApp {
                     } else {
                         self.pending_source = None;
                         self.error_message = None;
-                        self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
+                        self.clear_stats_caches_for_node(sel_id);
+                        self.invalidate_viewport();
                     }
                 } else {
                     self.pending_source = Some((sel_id, working));
@@ -1681,7 +2172,8 @@ impl ParaVizApp {
                     self.error_message = Some(format!("Update source error: {e}"));
                 } else {
                     self.error_message = None;
-                    self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
+                    self.clear_stats_caches_for_node(sel_id);
+                    self.invalidate_viewport();
                 }
             }
         } else if let Some(orig_flt) = flt_cfg {
@@ -1700,10 +2192,12 @@ impl ParaVizApp {
                     } else {
                         self.pending_filter = None;
                         self.error_message = None;
-                        self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
+                        self.clear_stats_caches_for_node(sel_id);
+                        self.invalidate_viewport();
                     }
                 } else {
                     self.pending_filter = Some((sel_id, working));
+                    self.invalidate_viewport();
                 }
             } else if apply_clicked
                 && let Some((id, pending)) = self.pending_filter.take()
@@ -1713,7 +2207,8 @@ impl ParaVizApp {
                     self.error_message = Some(format!("Update filter error: {e}"));
                 } else {
                     self.error_message = None;
-                    self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
+                    self.clear_stats_caches_for_node(sel_id);
+                    self.invalidate_viewport();
                 }
             }
         } else {
@@ -1735,11 +2230,51 @@ impl ParaVizApp {
         };
 
         let _ = self.session.evaluate(sel_id);
+
+        // Pre-compute/fetch histogram for the interactive 2D volume transfer function curve editor.
+        let volume_hist: Option<HistogramResult> =
+            if let Ok(node_ro) = self.session.node(sel_id)
+                && node_ro.style.representation == Representation::Volume
+                && let Some(ds) = node_ro.dataset().cloned()
+            {
+                let field_key = match &node_ro.style.color_by {
+                    ColorBy::PointScalar { array, component } => {
+                        Some((array.clone(), AttributeAssociation::Point, *component))
+                    }
+                    ColorBy::CellScalar { array, component } => {
+                        Some((array.clone(), AttributeAssociation::Cell, *component))
+                    }
+                    ColorBy::Solid(_) => ds
+                        .point_data()
+                        .and_then(|p| p.active_scalars_array())
+                        .map(|a| (a.name.clone(), AttributeAssociation::Point, None)),
+                };
+                if let Some((array_name, assoc, comp)) = field_key {
+                    let cache_key = (sel_id, array_name.clone(), assoc, comp);
+                    if let Some(cached) = self.volume_tf_hist_cache.get(&cache_key) {
+                        Some(cached.clone())
+                    } else if let Ok(computed) =
+                        compute_histogram(&ds, &array_name, assoc, comp, 48)
+                    {
+                        self.volume_tf_hist_cache
+                            .insert(cache_key, computed.clone());
+                        Some(computed)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let Ok(node) = self.session.node_mut(sel_id) else {
             return;
         };
 
         let ds_opt = node.cached_dataset.clone();
+        let prev_style = node.style.clone();
         let style = &mut node.style;
 
         section_card(ui, self.theme, "Representation & Coloring", |ui| {
@@ -1764,6 +2299,7 @@ impl ParaVizApp {
                         Representation::SurfaceWithEdges,
                         Representation::Wireframe,
                         Representation::Points,
+                        Representation::PointGaussian,
                         Representation::Volume,
                         Representation::Outline,
                     ] {
@@ -1991,6 +2527,22 @@ impl ParaVizApp {
                     egui::Slider::new(&mut style.volume_step_size, 0.05..=2.0).text("Step Size"),
                 );
                 ui.checkbox(&mut style.volume_shading, "Gradient Shading");
+                let mut vol_clip_on = style.volume_clip_plane.is_some();
+                if ui.checkbox(&mut vol_clip_on, "3D Volume Clip Plane").changed() {
+                    if vol_clip_on {
+                        let center = ds_opt
+                            .as_ref()
+                            .map(|d| d.bounds().center().to_array())
+                            .unwrap_or([0.0, 0.0, 0.0]);
+                        style.volume_clip_plane = Some((center, [1.0, 0.0, 0.0]));
+                    } else {
+                        style.volume_clip_plane = None;
+                    }
+                }
+                if let Some((orig, norm)) = &mut style.volume_clip_plane {
+                    drag_vec3(ui, "Clip Origin", orig, 0.1);
+                    drag_vec3(ui, "Clip Normal", norm, 0.05);
+                }
 
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Presets:");
@@ -2027,43 +2579,52 @@ impl ParaVizApp {
                     }
                 });
 
-                let mut remove_idx: Option<usize> = None;
-                for (idx, pt) in style.volume_tf.opacity_points.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("#{idx}"));
-                        ui.add(
-                            egui::DragValue::new(&mut pt.t)
-                                .speed(0.01)
-                                .range(0.0..=1.0)
-                                .prefix("t="),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut pt.alpha)
-                                .speed(0.01)
-                                .range(0.0..=1.0)
-                                .prefix("a="),
-                        );
-                        if ui.small_button("×").clicked() {
-                            remove_idx = Some(idx);
-                        }
-                    });
-                }
-                if let Some(idx) = remove_idx
-                    && style.volume_tf.opacity_points.len() > 2
-                {
-                    style.volume_tf.opacity_points.remove(idx);
-                }
-                if ui.button("+ Add Opacity Point").clicked() {
-                    style
-                        .volume_tf
-                        .opacity_points
-                        .push(OpacityPoint { t: 0.5, alpha: 0.35 });
-                    style
-                        .volume_tf
-                        .opacity_points
-                        .sort_by(|a, b| a.t.total_cmp(&b.t));
-                }
+                draw_opacity_tf_editor(ui, &mut style.volume_tf, volume_hist.as_ref(), self.theme);
+
+                ui.collapsing("Control Points Table", |ui| {
+                    let mut remove_idx: Option<usize> = None;
+                    for (idx, pt) in style.volume_tf.opacity_points.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("#{idx}"));
+                            ui.add(
+                                egui::DragValue::new(&mut pt.t)
+                                    .speed(0.01)
+                                    .range(0.0..=1.0)
+                                    .prefix("t="),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut pt.alpha)
+                                    .speed(0.01)
+                                    .range(0.0..=1.0)
+                                    .prefix("a="),
+                            );
+                            if ui.small_button("×").clicked() {
+                                remove_idx = Some(idx);
+                            }
+                        });
+                    }
+                    if let Some(idx) = remove_idx
+                        && style.volume_tf.opacity_points.len() > 2
+                    {
+                        style.volume_tf.opacity_points.remove(idx);
+                    }
+                    if ui.button("+ Add Opacity Point").clicked() {
+                        style
+                            .volume_tf
+                            .opacity_points
+                            .push(OpacityPoint { t: 0.5, alpha: 0.35 });
+                        style
+                            .volume_tf
+                            .opacity_points
+                            .sort_by(|a, b| a.t.total_cmp(&b.t));
+                    }
+                });
             });
+        }
+
+        let style_changed = *style != prev_style;
+        if style_changed {
+            self.invalidate_viewport();
         }
     }
 
@@ -2085,6 +2646,38 @@ impl ParaVizApp {
             });
             return;
         };
+
+        if let Some(pick) = self.last_pick.clone() {
+            section_card(ui, self.theme, "Last 3D Pick", |ui| {
+                ui.monospace(format!(
+                    "Actor: {}  Pos: ({:.3}, {:.3}, {:.3})",
+                    pick.actor_name, pick.world_pos[0], pick.world_pos[1], pick.world_pos[2]
+                ));
+                let pt_str = pick.point_index.map_or_else(|| "-".into(), |i| i.to_string());
+                let cell_str = pick.cell_index.map_or_else(|| "-".into(), |i| i.to_string());
+                let scalar_str = pick
+                    .scalar_value
+                    .map_or_else(|| "-".into(), |v| format!("{v:.4}"));
+                ui.monospace(format!("Pt: {pt_str}  Cell: {cell_str}  Scalar: {scalar_str}"));
+                if let Some((domain, idx)) = pick
+                    .point_index
+                    .map(|i| (PickDomain::Point, i))
+                    .or_else(|| pick.cell_index.map(|i| (PickDomain::Cell, i)))
+                {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Reveal in Spreadsheet").clicked() {
+                            self.reveal_in_spreadsheet(NodeId(pick.actor_id), domain, idx);
+                        }
+                        if pick.point_index.is_some()
+                            && let Some(ci) = pick.cell_index
+                            && ui.small_button(format!("Reveal Cell #{ci}")).clicked()
+                        {
+                            self.reveal_in_spreadsheet(NodeId(pick.actor_id), PickDomain::Cell, ci);
+                        }
+                    });
+                }
+            });
+        }
 
         section_card(ui, self.theme, "Dataset Summary", |ui| {
             egui::Grid::new("info_summary_grid")
@@ -2182,6 +2775,10 @@ impl ParaVizApp {
     }
 
     fn draw_scene_tab(&mut self, ui: &mut egui::Ui) {
+        let prev_camera = self.session.camera.clone();
+        let prev_settings = self.session.settings.clone();
+        let prev_widgets = self.show_widgets;
+
         section_card(ui, self.theme, "Viewport Background", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for &preset in ViewportBgPreset::ALL {
@@ -2284,9 +2881,21 @@ impl ParaVizApp {
             }
             ui.checkbox(&mut self.session.settings.show_axes_gizmo, "3D Axes Gizmo");
             ui.checkbox(&mut self.session.settings.show_bounding_box, "Scene Bounding Box");
+            ui.checkbox(&mut self.session.settings.show_axes_grid, "3D Cube Axes Grid");
+            ui.checkbox(
+                &mut self.session.settings.transparent_background,
+                "Transparent Background (Export)",
+            );
             ui.checkbox(&mut self.show_widgets, "3D Filter Widgets");
             ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
         });
+
+        if self.session.camera != prev_camera
+            || self.session.settings != prev_settings
+            || self.show_widgets != prev_widgets
+        {
+            self.invalidate_viewport();
+        }
     }
 
     fn draw_drawer(&mut self, ui: &mut egui::Ui) {
@@ -2386,6 +2995,7 @@ impl ParaVizApp {
         let Ok(node) = self.session.node(sel_id) else {
             return;
         };
+        let node_name = node.name.clone();
         let Some(ds) = node.dataset().cloned() else {
             ui.weak("Dataset not evaluated.");
             return;
@@ -2396,8 +3006,7 @@ impl ParaVizApp {
             SpreadsheetTarget::Cells => ds.num_cells(),
             SpreadsheetTarget::Field => ds
                 .field_data()
-                .and_then(|f| f.arrays().first())
-                .map(|a| a.num_tuples())
+                .map(|f| f.arrays().iter().map(|a| a.num_tuples()).max().unwrap_or(0))
                 .unwrap_or(0),
         };
         let page = self.spreadsheet_page_size.max(1);
@@ -2406,6 +3015,9 @@ impl ParaVizApp {
             self.spreadsheet_offset = 0;
         }
         let end_row = (self.spreadsheet_offset + page).min(total_rows);
+
+        let mut pending_highlight: Option<(PickDomain, usize, bool)> = None;
+        let mut focus_world_pos: Option<[f32; 3]> = None;
 
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
@@ -2447,12 +3059,47 @@ impl ParaVizApp {
                     .hint_text("array name..."),
             );
             if ui.small_button("Export CSV").clicked() {
-                match export_spreadsheet_csv(&ds, Path::new("spreadsheet_export.csv")) {
-                    Ok(msg) => {
-                        self.error_message = None;
-                        self.status_message = msg;
-                    }
-                    Err(err) => self.error_message = Some(err),
+                let (domain_slug, domain_label) = match self.spreadsheet_target {
+                    SpreadsheetTarget::Points => ("points", "Point Data"),
+                    SpreadsheetTarget::Cells => ("cells", "Cell Data"),
+                    SpreadsheetTarget::Field => ("field", "Field Data"),
+                };
+                let stem: String = node_name
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                let stem = stem.trim_matches('_');
+                let default_path = if stem.is_empty() {
+                    format!("spreadsheet_{domain_slug}.csv")
+                } else {
+                    format!("{stem}_{domain_slug}.csv")
+                };
+                self.modal = Some(AppModal::ExportSpreadsheetCsv(ExportSpreadsheetModalState {
+                    path: default_path,
+                    domain_label: domain_label.to_string(),
+                    col_filter: self.spreadsheet_filter.clone(),
+                    row_count: total_rows,
+                }));
+            }
+            if let Some(hl) = &self.picked_highlight
+                && hl.node_id == sel_id
+            {
+                ui.separator();
+                let tag = match hl.domain {
+                    PickDomain::Point => format!("Highlighted Point #{}", hl.element_index),
+                    PickDomain::Cell => format!("Highlighted Cell #{}", hl.element_index),
+                };
+                ui.label(egui::RichText::new(tag).strong().color(palette(self.theme).warning));
+                if let Some(pos) = hl.world_pos
+                    && ui.small_button("Focus").clicked()
+                {
+                    focus_world_pos = Some(pos);
                 }
             }
         });
@@ -2463,115 +3110,156 @@ impl ParaVizApp {
             col_needle.is_empty() || name.to_ascii_lowercase().contains(&col_needle)
         };
 
-        egui::ScrollArea::both()
-            .id_salt("spreadsheet_scroll")
-            .show(ui, |ui| match self.spreadsheet_target {
-                SpreadsheetTarget::Points => {
-                    let arrays: Vec<&DataArray> = ds
-                        .point_data()
-                        .map(|p| {
-                            p.arrays()
-                                .iter()
-                                .filter(|a| matches_col(&a.name))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    egui::Grid::new("spreadsheet_points_grid")
-                        .striped(true)
-                        .min_col_width(80.0)
-                        .show(ui, |ui| {
-                            ui.strong("Point ID");
-                            ui.strong("X");
-                            ui.strong("Y");
-                            ui.strong("Z");
-                            for arr in &arrays {
-                                ui.strong(&arr.name);
-                            }
-                            ui.end_row();
+        let mut scroll = egui::ScrollArea::both().id_salt("spreadsheet_scroll");
+        if self.spreadsheet_scroll_to_top {
+            scroll = scroll.vertical_scroll_offset(0.0);
+            self.spreadsheet_scroll_to_top = false;
+        }
 
-                            for row in self.spreadsheet_offset..end_row {
-                                ui.monospace(format!("{row}"));
-                                if let Some(p) = dataset_point_at(&ds, row) {
-                                    ui.monospace(format!("{:.4}", p[0]));
-                                    ui.monospace(format!("{:.4}", p[1]));
-                                    ui.monospace(format!("{:.4}", p[2]));
-                                } else {
-                                    ui.monospace("-");
-                                    ui.monospace("-");
-                                    ui.monospace("-");
-                                }
-                                for arr in &arrays {
-                                    ui.monospace(format_tuple(arr, row));
-                                }
-                                ui.end_row();
+        let active_hl = self
+            .picked_highlight
+            .as_ref()
+            .filter(|hl| hl.node_id == sel_id)
+            .map(|hl| (hl.domain, hl.element_index));
+
+        scroll.show(ui, |ui| match self.spreadsheet_target {
+            SpreadsheetTarget::Points => {
+                let arrays: Vec<&DataArray> = ds
+                    .point_data()
+                    .map(|p| {
+                        p.arrays()
+                            .iter()
+                            .filter(|a| matches_col(&a.name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                egui::Grid::new("spreadsheet_points_grid")
+                    .striped(true)
+                    .min_col_width(80.0)
+                    .show(ui, |ui| {
+                        ui.strong("Point ID");
+                        ui.strong("X");
+                        ui.strong("Y");
+                        ui.strong("Z");
+                        for arr in &arrays {
+                            ui.strong(&arr.name);
+                        }
+                        ui.end_row();
+
+                        for row in self.spreadsheet_offset..end_row {
+                            let selected = active_hl == Some((PickDomain::Point, row));
+                            let id_resp = ui
+                                .selectable_label(selected, format!("{row}"))
+                                .on_hover_text("Click to highlight in 3D • Double-click to focus");
+                            if id_resp.double_clicked() {
+                                pending_highlight = Some((PickDomain::Point, row, true));
+                            } else if id_resp.clicked() {
+                                pending_highlight = Some((PickDomain::Point, row, false));
                             }
-                        });
-                }
-                SpreadsheetTarget::Cells => {
-                    let arrays: Vec<&DataArray> = ds
-                        .cell_data()
-                        .map(|c| {
-                            c.arrays()
-                                .iter()
-                                .filter(|a| matches_col(&a.name))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if arrays.is_empty() {
-                        ui.weak("Selected dataset has no matching CellData arrays.");
-                        return;
-                    }
-                    egui::Grid::new("spreadsheet_cells_grid")
-                        .striped(true)
-                        .min_col_width(80.0)
-                        .show(ui, |ui| {
-                            ui.strong("Cell ID");
+                            if let Some(p) = dataset_point_at(&ds, row) {
+                                ui.monospace(format!("{:.4}", p[0]));
+                                ui.monospace(format!("{:.4}", p[1]));
+                                ui.monospace(format!("{:.4}", p[2]));
+                            } else {
+                                ui.monospace("-");
+                                ui.monospace("-");
+                                ui.monospace("-");
+                            }
                             for arr in &arrays {
-                                ui.strong(&arr.name);
+                                ui.monospace(format_tuple(arr, row));
                             }
                             ui.end_row();
-                            for row in self.spreadsheet_offset..end_row {
-                                ui.monospace(format!("{row}"));
-                                for arr in &arrays {
-                                    ui.monospace(format_tuple(arr, row));
-                                }
-                                ui.end_row();
-                            }
-                        });
+                        }
+                    });
+            }
+            SpreadsheetTarget::Cells => {
+                let arrays: Vec<&DataArray> = ds
+                    .cell_data()
+                    .map(|c| {
+                        c.arrays()
+                            .iter()
+                            .filter(|a| matches_col(&a.name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if total_rows == 0 {
+                    ui.weak("Selected dataset has no cells.");
+                    return;
                 }
-                SpreadsheetTarget::Field => {
-                    let arrays: Vec<&DataArray> = ds
-                        .field_data()
-                        .map(|f| {
-                            f.arrays()
-                                .iter()
-                                .filter(|a| matches_col(&a.name))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if arrays.is_empty() {
-                        ui.weak("Selected dataset has no FieldData arrays.");
-                        return;
-                    }
-                    egui::Grid::new("spreadsheet_field_grid")
-                        .striped(true)
-                        .min_col_width(80.0)
-                        .show(ui, |ui| {
-                            ui.strong("Tuple");
+                if arrays.is_empty() && !col_needle.is_empty() {
+                    ui.weak("No CellData arrays match the column filter.");
+                    return;
+                }
+                egui::Grid::new("spreadsheet_cells_grid")
+                    .striped(true)
+                    .min_col_width(80.0)
+                    .show(ui, |ui| {
+                        ui.strong("Cell ID");
+                        for arr in &arrays {
+                            ui.strong(&arr.name);
+                        }
+                        ui.end_row();
+                        for row in self.spreadsheet_offset..end_row {
+                            let selected = active_hl == Some((PickDomain::Cell, row));
+                            let id_resp = ui
+                                .selectable_label(selected, format!("{row}"))
+                                .on_hover_text("Click to highlight in 3D • Double-click to focus");
+                            if id_resp.double_clicked() {
+                                pending_highlight = Some((PickDomain::Cell, row, true));
+                            } else if id_resp.clicked() {
+                                pending_highlight = Some((PickDomain::Cell, row, false));
+                            }
                             for arr in &arrays {
-                                ui.strong(&arr.name);
+                                ui.monospace(format_tuple(arr, row));
                             }
                             ui.end_row();
-                            for row in self.spreadsheet_offset..end_row {
-                                ui.monospace(format!("{row}"));
-                                for arr in &arrays {
-                                    ui.monospace(format_tuple(arr, row));
-                                }
-                                ui.end_row();
-                            }
-                        });
+                        }
+                    });
+            }
+            SpreadsheetTarget::Field => {
+                let arrays: Vec<&DataArray> = ds
+                    .field_data()
+                    .map(|f| {
+                        f.arrays()
+                            .iter()
+                            .filter(|a| matches_col(&a.name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if arrays.is_empty() {
+                    ui.weak("Selected dataset has no matching FieldData arrays.");
+                    return;
                 }
-            });
+                egui::Grid::new("spreadsheet_field_grid")
+                    .striped(true)
+                    .min_col_width(80.0)
+                    .show(ui, |ui| {
+                        ui.strong("Tuple");
+                        for arr in &arrays {
+                            ui.strong(&arr.name);
+                        }
+                        ui.end_row();
+                        for row in self.spreadsheet_offset..end_row {
+                            ui.monospace(format!("{row}"));
+                            for arr in &arrays {
+                                ui.monospace(format_tuple(arr, row));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+
+        if let Some((domain, row, also_focus)) = pending_highlight {
+            self.highlight_from_spreadsheet_row(sel_id, &ds, domain, row);
+            if also_focus
+                && let Some(pos) = self.picked_highlight.as_ref().and_then(|h| h.world_pos)
+            {
+                self.focus_on_world_pos(pos);
+            }
+        } else if let Some(pos) = focus_world_pos {
+            self.focus_on_world_pos(pos);
+        }
     }
 
     fn draw_viewport(&mut self, ui: &mut egui::Ui) {
@@ -2583,48 +3271,73 @@ impl ParaVizApp {
 
         self.sync_viewport_widgets();
 
-        let t0 = Instant::now();
-        let scene_res = self.session.build_scene();
-        let mut total_points = 0usize;
-        let mut total_cells = 0usize;
-        if let Ok(scene) = &scene_res {
-            for a in &scene.actors {
-                total_points += a.dataset.num_points();
-                total_cells += a.dataset.num_cells();
-            }
-            match self.renderer.render_to_texture(scene, w, h) {
-                Ok(view) => {
-                    let mut egui_r = self.egui_renderer.write();
-                    match self.viewport_tex_id {
-                        None => {
-                            let id = egui_r.register_native_texture(
-                                &self.device,
-                                view,
-                                wgpu::FilterMode::Linear,
-                            );
-                            self.viewport_tex_id = Some(id);
-                            self.viewport_tex_size = (w, h);
+        let cache_key = ViewportCacheKey {
+            scene_revision: self.scene_revision,
+            width: w,
+            height: h,
+            camera: self.session.camera.clone(),
+            settings: self.session.settings.clone(),
+            widgets: self.session.widgets.clone(),
+            picked_highlight: self.picked_highlight.clone(),
+        };
+        let needs_render = self.viewport_tex_id.is_none()
+            || self.viewport_cache_key.as_ref() != Some(&cache_key);
+
+        if needs_render {
+            let t0 = Instant::now();
+            let scene_res = self.session.build_scene();
+            if let Ok(scene) = scene_res {
+                let mut total_points = 0usize;
+                let mut total_cells = 0usize;
+                for a in &scene.actors {
+                    total_points += a.dataset.num_points();
+                    total_cells += a.dataset.num_cells();
+                }
+                match self.renderer.render_to_texture(&scene, w, h) {
+                    Ok(view) => {
+                        let mut egui_r = self.egui_renderer.write();
+                        match self.viewport_tex_id {
+                            None => {
+                                let id = egui_r.register_native_texture(
+                                    &self.device,
+                                    view,
+                                    wgpu::FilterMode::Linear,
+                                );
+                                self.viewport_tex_id = Some(id);
+                                self.viewport_tex_size = (w, h);
+                            }
+                            Some(id) if self.viewport_tex_size != (w, h) => {
+                                egui_r.update_egui_texture_from_wgpu_texture(
+                                    &self.device,
+                                    view,
+                                    wgpu::FilterMode::Linear,
+                                    id,
+                                );
+                                self.viewport_tex_size = (w, h);
+                            }
+                            Some(_) => {}
                         }
-                        Some(id) if self.viewport_tex_size != (w, h) => {
-                            egui_r.update_egui_texture_from_wgpu_texture(
-                                &self.device,
-                                view,
-                                wgpu::FilterMode::Linear,
-                                id,
-                            );
-                            self.viewport_tex_size = (w, h);
-                        }
-                        Some(_) => {}
+                        self.cached_scene = Some(scene);
+                        self.cached_total_points = total_points;
+                        self.cached_total_cells = total_cells;
+                        self.viewport_cache_key = Some(cache_key);
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Render error: {e}"));
                     }
                 }
-                Err(e) => {
-                    self.error_message = Some(format!("Render error: {e}"));
-                }
+            } else if let Err(e) = scene_res {
+                self.error_message = Some(format!("Pipeline error: {e}"));
+                self.cached_scene = None;
+                self.cached_total_points = 0;
+                self.cached_total_cells = 0;
+                self.viewport_cache_key = Some(cache_key);
             }
-        } else if let Err(e) = &scene_res {
-            self.error_message = Some(format!("Pipeline error: {e}"));
+            self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0;
         }
-        self.last_render_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+        let total_points = self.cached_total_points;
+        let total_cells = self.cached_total_cells;
 
         let rect = ui.available_rect_before_wrap();
         if let Some(tex_id) = self.viewport_tex_id {
@@ -2644,16 +3357,19 @@ impl ParaVizApp {
                 } else {
                     self.session.camera.orbit(-d.x * 0.008, -d.y * 0.008);
                 }
+                self.invalidate_viewport();
                 ui.ctx().request_repaint();
             } else if resp.dragged_by(egui::PointerButton::Middle) {
                 let d = resp.drag_delta();
                 self.session
                     .camera
                     .pan(d.x / avail.y.max(1.0), d.y / avail.y.max(1.0));
+                self.invalidate_viewport();
                 ui.ctx().request_repaint();
             } else if resp.dragged_by(egui::PointerButton::Secondary) {
                 let d = resp.drag_delta();
                 self.session.camera.dolly(-d.y * 0.008);
+                self.invalidate_viewport();
                 ui.ctx().request_repaint();
             }
 
@@ -2661,13 +3377,16 @@ impl ParaVizApp {
                 let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll_y.abs() > 0.01 {
                     self.session.camera.dolly(scroll_y * 0.0025);
+                    self.invalidate_viewport();
                     ui.ctx().request_repaint();
                 }
             }
 
+            let prev_hud_rect = ui.data(|d| d.get_temp::<egui::Rect>(egui::Id::NULL.with("viewport_hud_rect")));
             if resp.clicked_by(egui::PointerButton::Primary)
                 && let Some(pos) = resp.interact_pointer_pos()
-                && let Ok(scene) = &scene_res
+                && prev_hud_rect.is_none_or(|hr| !hr.contains(pos))
+                && let Some(scene) = &self.cached_scene
             {
                 let local = pos - resp.rect.min;
                 let px = local.x * ppp;
@@ -2675,7 +3394,25 @@ impl ParaVizApp {
                 let hit = pick_scene(scene, px, py, w, h);
                 match self.viewport_mode {
                     ViewportMode::Orbit | ViewportMode::Pick => {
+                        self.picked_highlight = hit.as_ref().and_then(|h_res| {
+                            let (domain, element_index) = h_res
+                                .point_index
+                                .map(|i| (PickDomain::Point, i))
+                                .or_else(|| h_res.cell_index.map(|i| (PickDomain::Cell, i)))?;
+                            Some(PickedHighlight {
+                                node_id: NodeId(h_res.actor_id),
+                                domain,
+                                element_index,
+                                world_pos: Some(h_res.world_pos),
+                                scalar_value: h_res.scalar_value,
+                            })
+                        });
+                        if self.picked_highlight.is_some() {
+                            self.highlight_flash_until =
+                                Some(Instant::now() + Duration::from_secs(2));
+                        }
                         self.last_pick = hit;
+                        self.invalidate_viewport();
                     }
                     ViewportMode::Ruler => {
                         if let Some(h_res) = hit {
@@ -2683,8 +3420,20 @@ impl ParaVizApp {
                                 self.ruler_points.clear();
                             }
                             self.ruler_points.push(h_res.world_pos);
+                            self.picked_highlight = h_res
+                                .point_index
+                                .map(|i| (PickDomain::Point, i))
+                                .or_else(|| h_res.cell_index.map(|i| (PickDomain::Cell, i)))
+                                .map(|(domain, element_index)| PickedHighlight {
+                                    node_id: NodeId(h_res.actor_id),
+                                    domain,
+                                    element_index,
+                                    world_pos: Some(h_res.world_pos),
+                                    scalar_value: h_res.scalar_value,
+                                });
                             self.last_pick = Some(h_res);
                             self.sync_viewport_widgets();
+                            self.invalidate_viewport();
                             ui.ctx().request_repaint();
                         }
                     }
@@ -2693,6 +3442,7 @@ impl ParaVizApp {
 
             if resp.double_clicked() && self.viewport_mode == ViewportMode::Orbit {
                 let _ = self.session.reset_camera();
+                self.invalidate_viewport();
                 ui.ctx().request_repaint();
             }
         } else {
@@ -2703,7 +3453,7 @@ impl ParaVizApp {
 
         let painter = ui.painter_at(rect);
 
-        // Screen-space 3D projected Pick reticle & Ruler endpoint pins
+        // Screen-space 3D projected Pick reticle, Spreadsheet Highlight pin & Ruler endpoint pins
         let aspect = rect.width().max(1.0) / rect.height().max(1.0);
         let vp = self.session.camera.view_proj_matrix(aspect);
         if let Some(pick) = &self.last_pick
@@ -2711,6 +3461,39 @@ impl ParaVizApp {
         {
             painter.circle_stroke(sp, 8.0, egui::Stroke::new(1.8, pal.accent));
             painter.circle_filled(sp, 2.5, egui::Color32::WHITE);
+        }
+        let now = Instant::now();
+        let is_flashing = self
+            .highlight_flash_until
+            .is_some_and(|until| now < until);
+        if is_flashing {
+            ui.ctx().request_repaint_after(Duration::from_millis(80));
+        } else {
+            self.highlight_flash_until = None;
+        }
+        if let Some(hl) = &self.picked_highlight
+            && let Some(wpos) = hl.world_pos
+            && let Some(sp) = project_world_to_screen(vp, rect, wpos)
+        {
+            let ring_r = if is_flashing {
+                let phase = ((now.elapsed().as_secs_f32() * 6.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                10.0 + phase * 4.0
+            } else {
+                10.5
+            };
+            painter.circle_stroke(sp, ring_r, egui::Stroke::new(2.0, pal.warning));
+            painter.circle_filled(sp, 3.0, pal.warning);
+            let badge = match hl.domain {
+                PickDomain::Point => format!("Pt #{}", hl.element_index),
+                PickDomain::Cell => format!("Cell #{}", hl.element_index),
+            };
+            painter.text(
+                sp + egui::vec2(12.0, -10.0),
+                egui::Align2::LEFT_BOTTOM,
+                badge,
+                egui::FontId::monospace(11.0),
+                pal.warning,
+            );
         }
         for (idx, pt) in self.ruler_points.iter().enumerate() {
             if let Some(sp) = project_world_to_screen(vp, rect, *pt) {
@@ -2794,6 +3577,19 @@ impl ParaVizApp {
                 scalar_str
             ));
         }
+        if let Some(hl) = &self.picked_highlight {
+            let prefix = match hl.domain {
+                PickDomain::Point => format!("Highlighted Point #{}", hl.element_index),
+                PickDomain::Cell => format!("Highlighted Cell #{}", hl.element_index),
+            };
+            let pos_str = hl
+                .world_pos
+                .map_or_else(String::new, |p| format!("  Pos ({:.3}, {:.3}, {:.3})", p[0], p[1], p[2]));
+            let scalar_str = hl
+                .scalar_value
+                .map_or_else(String::new, |v| format!("  Scalar {v:.4}"));
+            hud_lines.push(format!("{prefix}{pos_str}{scalar_str}"));
+        }
         if self.ruler_points.len() == 1 {
             let p1 = self.ruler_points[0];
             hud_lines.push(format!(
@@ -2817,18 +3613,88 @@ impl ParaVizApp {
             egui::Color32::from_rgb(232, 238, 248),
             f32::INFINITY,
         );
+        let has_pick_actions = self.last_pick.is_some() || self.picked_highlight.is_some();
+        let action_bar_h = if has_pick_actions { 24.0 } else { 0.0 };
         let hud_bg = egui::Rect::from_min_size(
             hud_pos - egui::vec2(8.0, 6.0),
-            galley.size() + egui::vec2(16.0, 12.0),
+            galley.size() + egui::vec2(16.0, 12.0 + action_bar_h),
         );
+        let border_col = if is_flashing {
+            pal.warning
+        } else {
+            pal.hud_border
+        };
         painter.rect_filled(hud_bg, 6.0, pal.hud_bg);
         painter.rect_stroke(
             hud_bg,
             6.0,
-            egui::Stroke::new(1.0, pal.hud_border),
+            egui::Stroke::new(if is_flashing { 1.6 } else { 1.0 }, border_col),
             egui::StrokeKind::Inside,
         );
-        painter.galley(hud_pos, galley, egui::Color32::WHITE);
+        painter.galley(hud_pos, galley.clone(), egui::Color32::WHITE);
+
+        if has_pick_actions {
+            ui.data_mut(|d| d.insert_temp(egui::Id::NULL.with("viewport_hud_rect"), hud_bg));
+            let btn_rect = egui::Rect::from_min_max(
+                egui::pos2(hud_pos.x, hud_pos.y + galley.size().y + 4.0),
+                egui::pos2(hud_bg.right() - 8.0, hud_bg.bottom() - 4.0),
+            );
+            let mut reveal_target: Option<(NodeId, PickDomain, usize)> = None;
+            let mut focus_target: Option<[f32; 3]> = None;
+            let mut clear_pick = false;
+            let pick_clone = self.last_pick.clone();
+            let hl_clone = self.picked_highlight.clone();
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(btn_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            if let Some(pick) = &pick_clone {
+                if let Some((domain, idx)) = pick
+                    .point_index
+                    .map(|i| (PickDomain::Point, i))
+                    .or_else(|| pick.cell_index.map(|i| (PickDomain::Cell, i)))
+                    && child.small_button("Reveal in Spreadsheet").clicked()
+                {
+                    reveal_target = Some((NodeId(pick.actor_id), domain, idx));
+                }
+                if pick.point_index.is_some()
+                    && let Some(ci) = pick.cell_index
+                    && child.small_button(format!("Cell #{ci}")).clicked()
+                {
+                    reveal_target = Some((NodeId(pick.actor_id), PickDomain::Cell, ci));
+                }
+            } else if let Some(hl) = &hl_clone
+                && child.small_button("Reveal in Spreadsheet").clicked()
+            {
+                reveal_target = Some((hl.node_id, hl.domain, hl.element_index));
+            }
+            if let Some(wpos) = hl_clone
+                .as_ref()
+                .and_then(|h| h.world_pos)
+                .or_else(|| pick_clone.as_ref().map(|p| p.world_pos))
+                && child.small_button("Focus").clicked()
+            {
+                focus_target = Some(wpos);
+            }
+            if child.small_button("Clear").clicked() {
+                clear_pick = true;
+            }
+            if let Some((nid, dom, idx)) = reveal_target {
+                self.reveal_in_spreadsheet(nid, dom, idx);
+            }
+            if let Some(pos) = focus_target {
+                self.focus_on_world_pos(pos);
+            }
+            if clear_pick {
+                self.last_pick = None;
+                self.picked_highlight = None;
+                self.highlight_flash_until = None;
+                self.invalidate_viewport();
+            }
+        } else {
+            ui.data_mut(|d| d.remove::<egui::Rect>(egui::Id::NULL.with("viewport_hud_rect")));
+        }
 
         // Empty-state welcome launcher
         if self.session.nodes().is_empty() && self.modal.is_none() {
@@ -2960,12 +3826,15 @@ impl ParaVizApp {
             },
             ModalAction::ExportDataset(p) => {
                 if let Some(id) = self.selected_node {
-                    let is_glb = p
+                    let ext = p
                         .extension()
                         .and_then(|s| s.to_str())
-                        .is_some_and(|e| e.eq_ignore_ascii_case("glb"));
-                    let res = if is_glb {
+                        .map(|e| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let res = if ext == "glb" {
                         self.session.export_glb(id, &p, self.export_glb_colors)
+                    } else if ext == "html" || ext == "htm" {
+                        self.session.export_html(id, &p, self.export_glb_colors)
                     } else {
                         self.session.export_dataset(id, &p)
                     };
@@ -2978,16 +3847,43 @@ impl ParaVizApp {
                     }
                 }
             }
+            ModalAction::ExportSpreadsheetCsv(p) => {
+                if let Some(sel_id) = self.selected_node
+                    && let Ok(node) = self.session.node(sel_id)
+                    && let Some(ds) = node.dataset().cloned()
+                {
+                    match export_spreadsheet_csv(
+                        &ds,
+                        self.spreadsheet_target,
+                        &self.spreadsheet_filter,
+                        &p,
+                    ) {
+                        Ok(msg) => {
+                            self.error_message = None;
+                            self.status_message = msg;
+                        }
+                        Err(err) => self.error_message = Some(err),
+                    }
+                } else {
+                    self.error_message =
+                        Some("No evaluated dataset selected for CSV export.".into());
+                }
+            }
             ModalAction::SaveScreenshot {
                 path,
                 width,
                 height,
+                transparent,
+                include_scalar_bar,
             } => {
-                match self.session.build_scene().and_then(|scene| {
+                let res = self.session.build_scene().and_then(|mut scene| {
+                    scene.settings.transparent_background = transparent;
+                    scene.settings.show_scalar_bar = include_scalar_bar;
                     self.renderer
                         .render_to_png(&scene, width, height, &path)
                         .map_err(SessionError::from)
-                }) {
+                });
+                match res {
                     Ok(()) => {
                         self.error_message = None;
                         self.status_message = format!(
@@ -2996,6 +3892,40 @@ impl ParaVizApp {
                         );
                     }
                     Err(e) => self.error_message = Some(format!("Screenshot failed: {e}")),
+                }
+            }
+            ModalAction::ExportGif {
+                path,
+                width,
+                height,
+                frames,
+                delay_ms,
+                is_turntable,
+                transparent,
+                include_scalar_bar,
+            } => {
+                let prev_trans = self.session.settings.transparent_background;
+                let prev_bar = self.session.settings.show_scalar_bar;
+                self.session.settings.transparent_background = transparent;
+                self.session.settings.show_scalar_bar = include_scalar_bar;
+                let res = if is_turntable {
+                    self.session
+                        .render_turntable_gif(&path, width, height, frames, delay_ms)
+                } else {
+                    self.session
+                        .render_timeseries_gif(&path, width, height, delay_ms)
+                };
+                self.session.settings.transparent_background = prev_trans;
+                self.session.settings.show_scalar_bar = prev_bar;
+                match res {
+                    Ok(()) => {
+                        self.error_message = None;
+                        self.status_message = format!(
+                            "Exported animated GIF ({width}x{height}) -> {}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => self.error_message = Some(format!("GIF export failed: {e}")),
                 }
             }
         }
@@ -3021,6 +3951,7 @@ impl eframe::App for ParaVizApp {
             self.session
                 .camera
                 .orbit((dt as f32) * self.turntable_speed, 0.0);
+            self.invalidate_viewport();
             ui.ctx().request_repaint();
         }
 
@@ -3069,6 +4000,17 @@ impl eframe::App for ParaVizApp {
                         pal.danger,
                     );
                     ui.colored_label(pal.danger, err);
+                    if ui
+                        .small_button("Report Issue")
+                        .on_hover_text(
+                            "Encountered a bug? Open an issue at github.com/DimitriTimoz/paraviz/issues",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/DimitriTimoz/paraviz/issues/new/choose",
+                        ));
+                    }
                     if ui.small_button("Dismiss").clicked() {
                         self.error_message = None;
                     }
@@ -3179,43 +4121,126 @@ fn polydata_surface_area(pd: &PolyData) -> f64 {
     area
 }
 
-fn export_spreadsheet_csv(ds: &DataSet, path: &Path) -> Result<String, String> {
-    let arrays = ds.point_data().map(|p| p.arrays()).unwrap_or(&[]);
-    let n = ds.num_points();
-    let mut csv = String::from("PointID,X,Y,Z");
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn append_array_headers(csv: &mut String, arrays: &[&DataArray]) {
     for arr in arrays {
         if arr.num_components == 1 {
             csv.push(',');
-            csv.push_str(&arr.name);
+            csv.push_str(&csv_escape(&arr.name));
         } else {
             for c in 0..arr.num_components {
-                csv.push_str(&format!(",{}_{}", arr.name, c));
+                csv.push(',');
+                csv.push_str(&csv_escape(&format!("{}_{}", arr.name, c)));
             }
         }
     }
     csv.push('\n');
+}
 
-    for row in 0..n {
-        if let Some(p) = dataset_point_at(ds, row) {
-            csv.push_str(&format!("{row},{},{},{}", p[0], p[1], p[2]));
+fn append_array_row(csv: &mut String, arrays: &[&DataArray], row: usize) {
+    for arr in arrays {
+        if row < arr.num_tuples() {
+            for v in arr.get_tuple(row) {
+                csv.push_str(&format!(",{v}"));
+            }
         } else {
-            csv.push_str(&format!("{row},0,0,0"));
-        }
-        for arr in arrays {
-            if row < arr.num_tuples() {
-                for v in arr.get_tuple(row) {
-                    csv.push_str(&format!(",{v}"));
-                }
-            } else {
-                for _ in 0..arr.num_components {
-                    csv.push_str(",0");
-                }
+            for _ in 0..arr.num_components {
+                csv.push_str(",0");
             }
         }
-        csv.push('\n');
     }
+    csv.push('\n');
+}
+
+fn export_spreadsheet_csv(
+    ds: &DataSet,
+    target: SpreadsheetTarget,
+    col_filter: &str,
+    path: &Path,
+) -> Result<String, String> {
+    let col_needle = col_filter.trim().to_ascii_lowercase();
+    let matches_col = |name: &str| -> bool {
+        col_needle.is_empty() || name.to_ascii_lowercase().contains(&col_needle)
+    };
+
+    let mut csv = String::new();
+    let (domain_label, n) = match target {
+        SpreadsheetTarget::Points => {
+            let arrays: Vec<&DataArray> = ds
+                .point_data()
+                .map(|p| p.arrays().iter().filter(|a| matches_col(&a.name)).collect())
+                .unwrap_or_default();
+            let n = ds.num_points();
+            csv.push_str("PointID,X,Y,Z");
+            append_array_headers(&mut csv, &arrays);
+            for row in 0..n {
+                if let Some(p) = dataset_point_at(ds, row) {
+                    csv.push_str(&format!("{row},{},{},{}", p[0], p[1], p[2]));
+                } else {
+                    csv.push_str(&format!("{row},0,0,0"));
+                }
+                append_array_row(&mut csv, &arrays, row);
+            }
+            ("Point", n)
+        }
+        SpreadsheetTarget::Cells => {
+            let arrays: Vec<&DataArray> = ds
+                .cell_data()
+                .map(|c| c.arrays().iter().filter(|a| matches_col(&a.name)).collect())
+                .unwrap_or_default();
+            let n = ds.num_cells();
+            if n == 0 {
+                return Err("Selected dataset has no cells to export.".into());
+            }
+            if !col_needle.is_empty() && arrays.is_empty() {
+                return Err(format!(
+                    "No CellData columns match filter '{}'.",
+                    col_filter.trim()
+                ));
+            }
+            csv.push_str("CellID");
+            append_array_headers(&mut csv, &arrays);
+            for row in 0..n {
+                csv.push_str(&format!("{row}"));
+                append_array_row(&mut csv, &arrays, row);
+            }
+            ("Cell", n)
+        }
+        SpreadsheetTarget::Field => {
+            let arrays: Vec<&DataArray> = ds
+                .field_data()
+                .map(|f| f.arrays().iter().filter(|a| matches_col(&a.name)).collect())
+                .unwrap_or_default();
+            if arrays.is_empty() {
+                return Err(if col_needle.is_empty() {
+                    "Selected dataset has no FieldData arrays to export.".into()
+                } else {
+                    format!(
+                        "No FieldData columns match filter '{}'.",
+                        col_filter.trim()
+                    )
+                });
+            }
+            let n = arrays.iter().map(|a| a.num_tuples()).max().unwrap_or(0);
+            csv.push_str("Tuple");
+            append_array_headers(&mut csv, &arrays);
+            for row in 0..n {
+                csv.push_str(&format!("{row}"));
+                append_array_row(&mut csv, &arrays, row);
+            }
+            ("Field", n)
+        }
+    };
+
     std::fs::write(path, csv).map_err(|e| format!("Failed to export CSV: {e}"))?;
-    Ok(format!("Exported {n} rows -> {}", path.display()))
+    Ok(format!("Exported {n} {domain_label} rows -> {}", path.display()))
 }
 
 fn drag_vec3(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f32) -> bool {
@@ -4121,6 +5146,9 @@ fn edit_filter_config(
             changed |= ui
                 .checkbox(&mut f.compute_q_criterion, "Compute Q-Criterion")
                 .changed();
+            changed |= ui
+                .checkbox(&mut f.compute_lambda2, "Compute Lambda2-Criterion")
+                .changed();
         }
         FilterConfig::Calculator(f) => {
             ui.label("Expression:");
@@ -4338,6 +5366,113 @@ fn edit_filter_config(
                 changed |= ui.text_edit_singleline(&mut f.scalar_name).changed();
             });
         }
+        FilterConfig::Decimate(f) => {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut f.target_reduction, 0.0..=0.95)
+                        .text("Target Reduction"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut f.preserve_boundaries, "Preserve Boundaries")
+                .changed();
+        }
+        FilterConfig::Delaunay2D(f) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut f.alpha)
+                        .speed(0.05)
+                        .range(0.0..=1e6)
+                        .prefix("Alpha (0 = off): "),
+                )
+                .changed();
+        }
+        FilterConfig::Delaunay3D(f) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut f.alpha)
+                        .speed(0.05)
+                        .range(0.0..=1e6)
+                        .prefix("Alpha (0 = off): "),
+                )
+                .changed();
+        }
+        FilterConfig::IsoVolume(f) => {
+            changed |= array_picker_combo(
+                ui,
+                "isovol_field",
+                "Scalar Field:",
+                &mut f.field_name,
+                parent_ds,
+                AttributeAssociation::Point,
+                false,
+            );
+            changed |= ui
+                .add(egui::DragValue::new(&mut f.min_value).speed(0.1).prefix("Min: "))
+                .changed();
+            changed |= ui
+                .add(egui::DragValue::new(&mut f.max_value).speed(0.1).prefix("Max: "))
+                .changed();
+        }
+        FilterConfig::ResampleToImage(f) => {
+            ui.horizontal(|ui| {
+                ui.label("Dimensions:");
+                for d in &mut f.dimensions {
+                    changed |= ui
+                        .add(egui::DragValue::new(d).range(2..=256))
+                        .changed();
+                }
+            });
+        }
+        FilterConfig::IntegrateVariables(f) => {
+            changed |= ui
+                .checkbox(
+                    &mut f.divide_cell_data_by_volume,
+                    "Divide Cell Data By Volume/Area",
+                )
+                .changed();
+        }
+        FilterConfig::ExtractBlock(f) => {
+            ui.horizontal(|ui| {
+                ui.label("Name Filter:");
+                changed |= ui.text_edit_singleline(&mut f.name_filter).changed();
+            });
+            changed |= ui
+                .checkbox(&mut f.unwrap_single, "Unwrap Single Block")
+                .changed();
+        }
+        FilterConfig::TemporalStatistics(f) => {
+            changed |= ui.checkbox(&mut f.compute_average, "Average").changed();
+            changed |= ui.checkbox(&mut f.compute_minimum, "Minimum").changed();
+            changed |= ui.checkbox(&mut f.compute_maximum, "Maximum").changed();
+            changed |= ui.checkbox(&mut f.compute_stddev, "Std. Deviation").changed();
+        }
+        FilterConfig::AddTimeSteps(f) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut f.num_steps)
+                        .range(1..=200)
+                        .prefix("Steps: "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut f.start_time)
+                        .speed(0.1)
+                        .prefix("Start: "),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut f.end_time)
+                        .speed(0.1)
+                        .prefix("End: "),
+                )
+                .changed();
+        }
+        FilterConfig::AppendDatasets(_) => {
+            ui.weak("Appends all blocks of a MultiBlock input into a single mesh.");
+        }
     }
     changed
 }
@@ -4512,6 +5647,117 @@ fn dataset_point_at(ds: &DataSet, row: usize) -> Option<[f32; 3]> {
     }
 }
 
+fn centroid_from_indices(points: &[[f32; 3]], indices: &[u32]) -> Option<[f32; 3]> {
+    if indices.is_empty() {
+        return None;
+    }
+    let mut sum = glam::Vec3::ZERO;
+    let mut count = 0usize;
+    for &idx in indices {
+        if let Some(&p) = points.get(idx as usize) {
+            sum += glam::Vec3::from_array(p);
+            count += 1;
+        }
+    }
+    (count > 0).then(|| (sum / count as f32).to_array())
+}
+
+fn structured_cell_center(
+    dims: [usize; 3],
+    row: usize,
+    coords_fn: impl Fn(usize, usize, usize) -> [f32; 3],
+) -> Option<[f32; 3]> {
+    let cx = dims[0].saturating_sub(1).max(1);
+    let cy = dims[1].saturating_sub(1).max(1);
+    let cz = dims[2].saturating_sub(1).max(1);
+    if dims.contains(&0) || row >= cx * cy * cz {
+        return None;
+    }
+    let k = row / (cx * cy);
+    let rem = row % (cx * cy);
+    let j = rem / cx;
+    let i = rem % cx;
+    let i1 = (i + 1).min(dims[0] - 1);
+    let j1 = (j + 1).min(dims[1] - 1);
+    let k1 = (k + 1).min(dims[2] - 1);
+    let p0 = glam::Vec3::from_array(coords_fn(i, j, k));
+    let p1 = glam::Vec3::from_array(coords_fn(i1, j1, k1));
+    Some(((p0 + p1) * 0.5).to_array())
+}
+
+fn dataset_cell_center(ds: &DataSet, row: usize) -> Option<[f32; 3]> {
+    match ds {
+        DataSet::PolyData(p) => {
+            if let Some(v) = p.verts.get(row) {
+                return centroid_from_indices(&p.points, std::slice::from_ref(v));
+            }
+            let r1 = row.saturating_sub(p.verts.len());
+            if row >= p.verts.len() && r1 < p.lines.len() {
+                return centroid_from_indices(&p.points, &p.lines[r1]);
+            }
+            let r2 = r1.saturating_sub(p.lines.len());
+            if row >= p.verts.len() + p.lines.len() && r2 < p.polys.len() {
+                return centroid_from_indices(&p.points, &p.polys[r2]);
+            }
+            let r3 = r2.saturating_sub(p.polys.len());
+            if row >= p.verts.len() + p.lines.len() + p.polys.len() && r3 < p.strips.len() {
+                return centroid_from_indices(&p.points, &p.strips[r3]);
+            }
+            None
+        }
+        DataSet::ImageData(i) => structured_cell_center(i.dimensions, row, |ii, jj, kk| {
+            i.point_coords(ii, jj, kk)
+        }),
+        DataSet::RectilinearGrid(r) => {
+            structured_cell_center(r.dimensions(), row, |ii, jj, kk| r.point_coords(ii, jj, kk))
+        }
+        DataSet::StructuredGrid(s) => {
+            structured_cell_center(s.dimensions, row, |ii, jj, kk| s.point_coords(ii, jj, kk))
+        }
+        DataSet::UnstructuredGrid(u) => {
+            if row >= u.num_cells() {
+                return None;
+            }
+            centroid_from_indices(&u.points, u.cell_points(row))
+        }
+        DataSet::MultiBlock(mb) => mb
+            .blocks
+            .first()
+            .and_then(|(_, b)| dataset_cell_center(b, row)),
+    }
+}
+
+fn dataset_element_scalar(
+    ds: &DataSet,
+    color_by: &ColorBy,
+    domain: PickDomain,
+    row: usize,
+) -> Option<f64> {
+    let fd = match domain {
+        PickDomain::Point => ds.point_data()?,
+        PickDomain::Cell => ds.cell_data()?,
+    };
+    let (arr, comp) = match (domain, color_by) {
+        (PickDomain::Point, ColorBy::PointScalar { array, component })
+        | (PickDomain::Cell, ColorBy::CellScalar { array, component }) => {
+            let a = if array.is_empty() {
+                fd.active_scalars_array()?
+            } else {
+                fd.get(array)?
+            };
+            (a, *component)
+        }
+        _ => (fd.active_scalars_array()?, None),
+    };
+    if row >= arr.num_tuples() {
+        return None;
+    }
+    Some(match comp {
+        Some(c) if c < arr.num_components => arr.data.get_f64(row * arr.num_components + c),
+        _ => arr.get_magnitude(row),
+    })
+}
+
 fn format_tuple(arr: &DataArray, row: usize) -> String {
     if row >= arr.num_tuples() {
         return "-".into();
@@ -4522,5 +5768,98 @@ fn format_tuple(arr: &DataArray, row: usize) -> String {
     } else {
         let parts: Vec<String> = vals.iter().map(|v| format!("{v:.3}")).collect();
         format!("({})", parts.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_dataset() -> DataSet {
+        let mut pd = PolyData::from_triangles(
+            vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            vec![[0, 1, 2]],
+        );
+        pd.point_data.add_array(DataArray::scalars_f64("Temp", vec![10.0, 20.0, 30.0]));
+        pd.point_data.add_array(DataArray::scalars_f64("Pressure", vec![1.0, 2.0, 3.0]));
+        pd.cell_data.add_array(DataArray::scalars_f64("CellArea", vec![2.0]));
+        pd.cell_data.add_array(DataArray::scalars_f64("ZoneID", vec![7.0]));
+        pd.field_data.add_array(DataArray::scalars_f64("TimeValue", vec![42.5]));
+        DataSet::PolyData(pd)
+    }
+
+    #[test]
+    fn export_spreadsheet_csv_respects_active_domain_and_filter() {
+        let ds = sample_dataset();
+        let dir = std::env::temp_dir();
+
+        // 1. Points domain with column filter
+        let pts_path = dir.join(format!("paraviz_test_pts_{}.csv", std::process::id()));
+        let msg = export_spreadsheet_csv(&ds, SpreadsheetTarget::Points, "press", &pts_path)
+            .expect("points export");
+        assert!(msg.contains("3 Point rows"));
+        let pts_csv = std::fs::read_to_string(&pts_path).unwrap();
+        assert!(pts_csv.starts_with("PointID,X,Y,Z,Pressure\n"));
+        assert!(!pts_csv.contains("Temp"));
+        let _ = std::fs::remove_file(&pts_path);
+
+        // 2. Cells domain
+        let cells_path = dir.join(format!("paraviz_test_cells_{}.csv", std::process::id()));
+        let msg = export_spreadsheet_csv(&ds, SpreadsheetTarget::Cells, "Zone", &cells_path)
+            .expect("cells export");
+        assert!(msg.contains("1 Cell rows"));
+        let cells_csv = std::fs::read_to_string(&cells_path).unwrap();
+        assert_eq!(cells_csv, "CellID,ZoneID\n0,7\n");
+        let _ = std::fs::remove_file(&cells_path);
+
+        // 3. Field domain
+        let field_path = dir.join(format!("paraviz_test_field_{}.csv", std::process::id()));
+        let msg = export_spreadsheet_csv(&ds, SpreadsheetTarget::Field, "", &field_path)
+            .expect("field export");
+        assert!(msg.contains("1 Field rows"));
+        let field_csv = std::fs::read_to_string(&field_path).unwrap();
+        assert_eq!(field_csv, "Tuple,TimeValue\n0,42.5\n");
+        let _ = std::fs::remove_file(&field_path);
+    }
+
+    #[test]
+    fn viewport_cache_key_detects_mutations_and_stays_equal_when_idle() {
+        let base = ViewportCacheKey {
+            scene_revision: 1,
+            width: 1280,
+            height: 720,
+            camera: Camera::default(),
+            settings: SceneSettings::default(),
+            widgets: Vec::new(),
+            picked_highlight: None,
+        };
+        assert_eq!(base, base.clone());
+
+        let mut resized = base.clone();
+        resized.width = 1281;
+        assert_ne!(base, resized);
+
+        let mut cam_moved = base.clone();
+        cam_moved.camera.fov_y_deg = 55.0;
+        assert_ne!(base, cam_moved);
+
+        let mut hl_changed = base.clone();
+        hl_changed.picked_highlight = Some(PickedHighlight {
+            node_id: NodeId(1),
+            domain: PickDomain::Point,
+            element_index: 4,
+            world_pos: Some([1.0, 2.0, 3.0]),
+            scalar_value: Some(0.5),
+        });
+        assert_ne!(base, hl_changed);
+    }
+
+    #[test]
+    fn dataset_cell_center_computes_triangle_centroid() {
+        let ds = sample_dataset();
+        let c = dataset_cell_center(&ds, 0).expect("triangle centroid");
+        assert!((c[0] - 2.0 / 3.0).abs() < 1e-5);
+        assert!((c[1] - 2.0 / 3.0).abs() < 1e-5);
+        assert!(c[2].abs() < 1e-5);
     }
 }

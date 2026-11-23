@@ -300,3 +300,63 @@ fn cli_convert_to_glb_and_render_edl_msaa() {
     let _ = std::fs::remove_file(&edl_png);
     let _ = std::fs::remove_file(&msaa_png);
 }
+
+#[test]
+fn cli_transparent_scalar_bar_gif_and_html_convert() {
+    let vtp_path = temp_file("vtp");
+    let gif_path = temp_file("gif");
+    let html_path = temp_file("html");
+
+    let sphere = paraviz::sources::SphereSource::default().build();
+    paraviz::io::write_dataset(&vtp_path, &paraviz::core::DataSet::PolyData(sphere))
+        .expect("write vtp");
+
+    // 1. paraviz render --transparent --scalar-bar --turntable 4 -o spin.gif
+    let gif_cmd = Command::new(paraviz_bin())
+        .args([
+            "render",
+            vtp_path.to_str().unwrap(),
+            "-o",
+            gif_path.to_str().unwrap(),
+            "--width",
+            "160",
+            "--height",
+            "120",
+            "--transparent",
+            "--scalar-bar",
+            "--turntable",
+            "4",
+            "--gif-delay",
+            "50",
+        ])
+        .output()
+        .expect("failed to run paraviz render gif");
+    assert!(
+        gif_cmd.status.success(),
+        "render gif failed: {}",
+        String::from_utf8_lossy(&gif_cmd.stderr)
+    );
+    let gif_bytes = std::fs::read(&gif_path).expect("gif should exist");
+    assert_eq!(&gif_bytes[0..6], b"GIF89a");
+
+    // 2. paraviz convert input.vtp viewer.html
+    let html_cmd = Command::new(paraviz_bin())
+        .args([
+            "convert",
+            vtp_path.to_str().unwrap(),
+            html_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run paraviz convert html");
+    assert!(
+        html_cmd.status.success(),
+        "convert html failed: {}",
+        String::from_utf8_lossy(&html_cmd.stderr)
+    );
+    let html = std::fs::read_to_string(&html_path).expect("html should exist");
+    assert!(html.contains("WebGL2") || html.contains("webgl2"));
+
+    let _ = std::fs::remove_file(&vtp_path);
+    let _ = std::fs::remove_file(&gif_path);
+    let _ = std::fs::remove_file(&html_path);
+}

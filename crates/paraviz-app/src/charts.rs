@@ -716,3 +716,374 @@ fn paint_histogram_chart(ui: &mut egui::Ui, hist: &HistogramResult, theme: UiThe
         painter.galley(tip_pos, galley, egui::Color32::WHITE);
     }
 }
+
+fn tf_point_to_screen(t: f32, alpha: f32, rect: egui::Rect) -> egui::Pos2 {
+    let x = egui::lerp(rect.left()..=rect.right(), t.clamp(0.0, 1.0));
+    let y = egui::lerp(rect.bottom()..=rect.top(), alpha.clamp(0.0, 1.0));
+    egui::pos2(x, y)
+}
+
+fn screen_to_tf_point(pos: egui::Pos2, rect: egui::Rect) -> (f32, f32) {
+    let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+    let alpha = ((rect.bottom() - pos.y) / rect.height().max(1.0)).clamp(0.0, 1.0);
+    (t, alpha)
+}
+
+fn nearest_tf_point(
+    pos: egui::Pos2,
+    points: &[OpacityPoint],
+    rect: egui::Rect,
+    max_dist_px: f32,
+) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (idx, pt) in points.iter().enumerate() {
+        let sp = tf_point_to_screen(pt.t, pt.alpha, rect);
+        let d = sp.distance(pos);
+        if d <= max_dist_px && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((idx, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+pub(crate) fn insert_opacity_point_sorted(points: &mut Vec<OpacityPoint>, t: f32, alpha: f32) {
+    points.push(OpacityPoint {
+        t: t.clamp(0.0, 1.0),
+        alpha: alpha.clamp(0.0, 1.0),
+    });
+    points.sort_by(|a, b| a.t.total_cmp(&b.t));
+}
+
+pub(crate) fn remove_interior_opacity_point(points: &mut Vec<OpacityPoint>, idx: usize) -> bool {
+    if points.len() > 2 && idx > 0 && idx + 1 < points.len() {
+        points.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn move_opacity_point_clamped(
+    points: &mut [OpacityPoint],
+    idx: usize,
+    raw_t: f32,
+    raw_alpha: f32,
+) -> bool {
+    if idx >= points.len() {
+        return false;
+    }
+    let min_t = if idx == 0 {
+        0.0
+    } else {
+        (points[idx - 1].t + 1e-4).min(1.0)
+    };
+    let max_t = if idx + 1 >= points.len() {
+        1.0
+    } else {
+        (points[idx + 1].t - 1e-4).max(0.0)
+    };
+    let new_t = raw_t.clamp(min_t, max_t.max(min_t));
+    let new_alpha = raw_alpha.clamp(0.0, 1.0);
+    let moved = (points[idx].t - new_t).abs() > 1e-5 || (points[idx].alpha - new_alpha).abs() > 1e-5;
+    points[idx].t = new_t;
+    points[idx].alpha = new_alpha;
+    moved
+}
+
+/// Interactive 2D piecewise-linear opacity transfer function curve editor overlaid on
+/// the active scalar field's histogram bars. Returns `true` if `tf.opacity_points` changed.
+pub fn draw_opacity_tf_editor(
+    ui: &mut egui::Ui,
+    tf: &mut TransferFunction,
+    hist: Option<&HistogramResult>,
+    theme: UiTheme,
+) -> bool {
+    let pal = palette(theme);
+    let mut changed = false;
+
+    if tf.opacity_points.is_empty() {
+        tf.opacity_points = vec![
+            OpacityPoint { t: 0.0, alpha: 0.0 },
+            OpacityPoint { t: 1.0, alpha: 0.85 },
+        ];
+        changed = true;
+    } else if tf.opacity_points.len() == 1 {
+        let existing = tf.opacity_points[0];
+        if existing.t < 0.5 {
+            tf.opacity_points.push(OpacityPoint { t: 1.0, alpha: 0.85 });
+        } else {
+            tf.opacity_points.insert(0, OpacityPoint { t: 0.0, alpha: 0.0 });
+        }
+        changed = true;
+    }
+    tf.opacity_points.sort_by(|a, b| a.t.total_cmp(&b.t));
+
+    let width = ui.available_width().max(180.0);
+    let height = 136.0;
+    let (outer_rect, resp) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+    let plot_rect = outer_rect.shrink2(egui::vec2(7.0, 7.0));
+    let painter = ui.painter_at(outer_rect);
+
+    painter.rect_filled(outer_rect, 4.0, pal.plot_bg);
+
+    for frac in [0.25f32, 0.5, 0.75] {
+        let gx = egui::lerp(plot_rect.left()..=plot_rect.right(), frac);
+        let gy = egui::lerp(plot_rect.bottom()..=plot_rect.top(), frac);
+        painter.line_segment(
+            [egui::pos2(gx, plot_rect.top()), egui::pos2(gx, plot_rect.bottom())],
+            egui::Stroke::new(1.0, pal.plot_grid),
+        );
+        painter.line_segment(
+            [egui::pos2(plot_rect.left(), gy), egui::pos2(plot_rect.right(), gy)],
+            egui::Stroke::new(1.0, pal.plot_grid),
+        );
+    }
+
+    // Background histogram bars mapped into the active TF scalar range
+    if let Some(h) = hist
+        && !h.counts.is_empty()
+        && h.bin_edges.len() >= 2
+    {
+        let max_count = h.counts.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let (r_min, r_max) = tf.scalar_range;
+        let span = r_max - r_min;
+        let n_bins = h.counts.len();
+        for (i, &cnt) in h.counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let (t0, t1) = if span.abs() > 1e-12 {
+                (
+                    ((h.bin_edges[i] - r_min) / span) as f32,
+                    ((h.bin_edges[i + 1] - r_min) / span) as f32,
+                )
+            } else {
+                (i as f32 / n_bins as f32, (i + 1) as f32 / n_bins as f32)
+            };
+            let t0 = t0.clamp(0.0, 1.0);
+            let t1 = t1.clamp(0.0, 1.0);
+            if t1 <= t0 {
+                continue;
+            }
+            let x0 = egui::lerp(plot_rect.left()..=plot_rect.right(), t0);
+            let x1 = egui::lerp(plot_rect.left()..=plot_rect.right(), t1).max(x0 + 1.0);
+            let h_frac = (cnt as f32 / max_count).clamp(0.02, 1.0);
+            let y0 = egui::lerp(plot_rect.bottom()..=plot_rect.top(), h_frac);
+            let rgb = tf.color_map.sample_rgb((t0 + t1) * 0.5);
+            let bar_col = egui::Color32::from_rgba_unmultiplied(
+                (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+                72,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, plot_rect.bottom())),
+                1.0,
+                bar_col,
+            );
+        }
+    }
+
+    // Handle pointer interactions (drag, insert on empty click, delete interior on right/double click)
+    let drag_id = resp.id.with("tf_drag_idx");
+    let mut dragging_idx: Option<usize> = ui
+        .data(|d| d.get_temp::<Option<usize>>(drag_id))
+        .flatten()
+        .filter(|&i| i < tf.opacity_points.len());
+
+    if resp.drag_started_by(egui::PointerButton::Primary)
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        dragging_idx = nearest_tf_point(pos, &tf.opacity_points, plot_rect, 11.0);
+        ui.data_mut(|d| d.insert_temp(drag_id, dragging_idx));
+    }
+
+    if resp.dragged_by(egui::PointerButton::Primary)
+        && let Some(idx) = dragging_idx
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let (raw_t, raw_a) = screen_to_tf_point(pos, plot_rect);
+        if move_opacity_point_clamped(&mut tf.opacity_points, idx, raw_t, raw_a) {
+            changed = true;
+        }
+    }
+
+    if resp.drag_stopped() {
+        dragging_idx = None;
+        ui.data_mut(|d| d.remove::<Option<usize>>(drag_id));
+    }
+
+    let remove_trigger = resp.clicked_by(egui::PointerButton::Secondary)
+        || resp.double_clicked_by(egui::PointerButton::Primary);
+    if remove_trigger
+        && let Some(pos) = resp.interact_pointer_pos()
+        && let Some(idx) = nearest_tf_point(pos, &tf.opacity_points, plot_rect, 11.0)
+    {
+        if remove_interior_opacity_point(&mut tf.opacity_points, idx) {
+            changed = true;
+            if dragging_idx == Some(idx) {
+                dragging_idx = None;
+                ui.data_mut(|d| d.remove::<Option<usize>>(drag_id));
+            }
+        }
+    } else if resp.clicked_by(egui::PointerButton::Primary)
+        && !resp.double_clicked()
+        && let Some(pos) = resp.interact_pointer_pos()
+        && nearest_tf_point(pos, &tf.opacity_points, plot_rect, 11.0).is_none()
+    {
+        let (t, alpha) = screen_to_tf_point(pos, plot_rect);
+        insert_opacity_point_sorted(&mut tf.opacity_points, t, alpha);
+        changed = true;
+    }
+
+    // Translucent area fill under the piecewise-linear curve
+    let pts = &tf.opacity_points;
+    let draw_seg_fill = |p0: OpacityPoint, p1: OpacityPoint| {
+        let s0 = tf_point_to_screen(p0.t, p0.alpha, plot_rect);
+        let s1 = tf_point_to_screen(p1.t, p1.alpha, plot_rect);
+        let b0 = egui::pos2(s0.x, plot_rect.bottom());
+        let b1 = egui::pos2(s1.x, plot_rect.bottom());
+        let rgb = tf.color_map.sample_rgb((p0.t + p1.t) * 0.5);
+        let fill = egui::Color32::from_rgba_unmultiplied(
+            (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+            52,
+        );
+        painter.add(egui::Shape::convex_polygon(
+            vec![b0, s0, s1, b1],
+            fill,
+            egui::Stroke::NONE,
+        ));
+    };
+
+    if pts[0].t > 0.0 {
+        let p0 = OpacityPoint {
+            t: 0.0,
+            alpha: pts[0].alpha,
+        };
+        draw_seg_fill(p0, pts[0]);
+        painter.line_segment(
+            [
+                tf_point_to_screen(p0.t, p0.alpha, plot_rect),
+                tf_point_to_screen(pts[0].t, pts[0].alpha, plot_rect),
+            ],
+            egui::Stroke::new(2.0, pal.accent),
+        );
+    }
+    for win in pts.windows(2) {
+        draw_seg_fill(win[0], win[1]);
+        painter.line_segment(
+            [
+                tf_point_to_screen(win[0].t, win[0].alpha, plot_rect),
+                tf_point_to_screen(win[1].t, win[1].alpha, plot_rect),
+            ],
+            egui::Stroke::new(2.0, pal.accent),
+        );
+    }
+    if let Some(&last) = pts.last()
+        && last.t < 1.0
+    {
+        let p1 = OpacityPoint {
+            t: 1.0,
+            alpha: last.alpha,
+        };
+        draw_seg_fill(last, p1);
+        painter.line_segment(
+            [
+                tf_point_to_screen(last.t, last.alpha, plot_rect),
+                tf_point_to_screen(p1.t, p1.alpha, plot_rect),
+            ],
+            egui::Stroke::new(2.0, pal.accent),
+        );
+    }
+
+    let hovered_idx = resp
+        .hover_pos()
+        .and_then(|pos| nearest_tf_point(pos, pts, plot_rect, 11.0));
+    let active_idx = dragging_idx.or(hovered_idx);
+
+    for (idx, pt) in pts.iter().enumerate() {
+        let center = tf_point_to_screen(pt.t, pt.alpha, plot_rect);
+        let active = active_idx == Some(idx);
+        let radius = if active { 6.5 } else { 5.0 };
+        let rgb = tf.color_map.sample_rgb(pt.t);
+        let fill = egui::Color32::from_rgb(
+            (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+        );
+        let stroke_col = if active {
+            pal.warning
+        } else {
+            egui::Color32::WHITE
+        };
+        painter.circle_filled(center, radius, fill);
+        painter.circle_stroke(center, radius, egui::Stroke::new(1.8, stroke_col));
+    }
+
+    painter.rect_stroke(
+        outer_rect,
+        4.0,
+        egui::Stroke::new(1.0, pal.card_border),
+        egui::StrokeKind::Inside,
+    );
+
+    if let Some(idx) = active_idx
+        && let Some(pt) = pts.get(idx)
+    {
+        let (r_min, r_max) = tf.scalar_range;
+        let scalar = r_min + (pt.t as f64) * (r_max - r_min);
+        let label = format!("#{idx} t={:.2} α={:.2} ({:.3})", pt.t, pt.alpha, scalar);
+        let galley =
+            painter.layout_no_wrap(label, egui::FontId::monospace(10.0), egui::Color32::WHITE);
+        let tip_pos = egui::pos2(
+            (plot_rect.left() + 4.0).min(outer_rect.right() - galley.size().x - 8.0),
+            plot_rect.top() + 2.0,
+        );
+        let tip_bg = egui::Rect::from_min_size(
+            tip_pos - egui::vec2(4.0, 2.0),
+            galley.size() + egui::vec2(8.0, 4.0),
+        );
+        painter.rect_filled(tip_bg, 3.0, pal.hud_bg);
+        painter.galley(tip_pos, galley, egui::Color32::WHITE);
+    }
+
+    ui.label(
+        egui::RichText::new("Click: add • Drag: move • Right/Double-click: remove")
+            .size(10.0)
+            .color(pal.muted),
+    );
+
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opacity_curve_insert_move_and_remove_keeps_endpoints() {
+        let mut pts = vec![
+            OpacityPoint { t: 0.0, alpha: 0.0 },
+            OpacityPoint { t: 1.0, alpha: 0.9 },
+        ];
+        insert_opacity_point_sorted(&mut pts, 0.45, 0.6);
+        assert_eq!(pts.len(), 3);
+        assert!((pts[1].t - 0.45).abs() < 1e-6);
+        assert!((pts[1].alpha - 0.6).abs() < 1e-6);
+
+        // Moving interior point clamps within neighbor t values and [0, 1] alpha
+        assert!(move_opacity_point_clamped(&mut pts, 1, 1.5, 1.2));
+        assert!(pts[1].t > pts[0].t && pts[1].t < pts[2].t);
+        assert!((pts[1].alpha - 1.0).abs() < 1e-6);
+
+        // Endpoints cannot be removed; interior point can
+        assert!(!remove_interior_opacity_point(&mut pts, 0));
+        assert!(!remove_interior_opacity_point(&mut pts, 2));
+        assert!(remove_interior_opacity_point(&mut pts, 1));
+        assert_eq!(pts.len(), 2);
+        assert!(!remove_interior_opacity_point(&mut pts, 1));
+    }
+}

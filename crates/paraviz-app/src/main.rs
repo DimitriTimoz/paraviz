@@ -79,12 +79,18 @@ fn main() {
                 Box::new(move |cc| Ok(Box::new(app::ParaVizApp::new(cc, initial_path)))),
             ) {
                 eprintln!("GUI error: {err}");
+                eprintln!(
+                    "Encountered an issue? Please report it at https://github.com/DimitriTimoz/paraviz/issues"
+                );
                 std::process::exit(1);
             }
         }
         other => {
             if let Err(err) = run_headless_command(other) {
                 eprintln!("Error: {err}");
+                eprintln!(
+                    "Encountered an unexpected issue? Please open an issue at https://github.com/DimitriTimoz/paraviz/issues"
+                );
                 std::process::exit(1);
             }
         }

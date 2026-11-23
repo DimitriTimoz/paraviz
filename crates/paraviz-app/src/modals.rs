@@ -63,6 +63,28 @@ pub struct ScreenshotModalState {
     pub width: u32,
     pub height: u32,
     pub use_viewport_size: bool,
+    pub transparent: bool,
+    pub include_scalar_bar: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GifModalState {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub delay_ms: u16,
+    pub is_turntable: bool,
+    pub transparent: bool,
+    pub include_scalar_bar: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportSpreadsheetModalState {
+    pub path: String,
+    pub domain_label: String,
+    pub col_filter: String,
+    pub row_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +96,9 @@ pub enum AppModal {
     SaveState(String),
     LoadState(String),
     ExportDataset(String),
+    ExportSpreadsheetCsv(ExportSpreadsheetModalState),
     SaveScreenshot(ScreenshotModalState),
+    ExportGif(GifModalState),
     DemoGallery,
     Shortcuts,
 }
@@ -85,7 +109,24 @@ pub enum ModalAction {
     LoadState(PathBuf),
     SaveState(PathBuf),
     ExportDataset(PathBuf),
-    SaveScreenshot { path: PathBuf, width: u32, height: u32 },
+    ExportSpreadsheetCsv(PathBuf),
+    SaveScreenshot {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        transparent: bool,
+        include_scalar_bar: bool,
+    },
+    ExportGif {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        frames: u32,
+        delay_ms: u16,
+        is_turntable: bool,
+        transparent: bool,
+        include_scalar_bar: bool,
+    },
     ImportRawVolume(RawVolumeModalState),
     RunGpuContour {
         node_id: NodeId,
@@ -518,6 +559,8 @@ pub fn draw_modal(
                             }
                         }
                     });
+                    ui.checkbox(&mut ss.transparent, "Transparent background (alpha = 0)");
+                    ui.checkbox(&mut ss.include_scalar_bar, "Include Scalar Color Bar");
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save PNG").clicked() {
@@ -536,6 +579,79 @@ pub fn draw_modal(
                         path: PathBuf::from(p),
                         width: ss.width.max(64),
                         height: ss.height.max(64),
+                        transparent: ss.transparent,
+                        include_scalar_bar: ss.include_scalar_bar,
+                    };
+                }
+            } else if keep_open {
+                *modal_slot = Some(modal);
+            }
+            return ModalAction::None;
+        }
+
+        AppModal::ExportGif(gm) => {
+            let mut confirm = false;
+            egui::Window::new("Export Animation (GIF)")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("Output GIF path:");
+                    ui.add(egui::TextEdit::singleline(&mut gm.path).desired_width(360.0));
+                    ui.horizontal(|ui| {
+                        ui.label("Mode:");
+                        ui.radio_value(&mut gm.is_turntable, true, "360° Turntable");
+                        ui.radio_value(&mut gm.is_turntable, false, "Time Series");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut gm.width)
+                                .range(64..=1920)
+                                .prefix("W: "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut gm.height)
+                                .range(64..=1080)
+                                .prefix("H: "),
+                        );
+                        if gm.is_turntable {
+                            ui.add(
+                                egui::DragValue::new(&mut gm.frames)
+                                    .range(4..=180)
+                                    .prefix("Frames: "),
+                            );
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut gm.delay_ms)
+                                .range(20..=2000)
+                                .prefix("Delay ms: "),
+                        );
+                    });
+                    ui.checkbox(&mut gm.transparent, "Transparent background (alpha = 0)");
+                    ui.checkbox(&mut gm.include_scalar_bar, "Include Scalar Color Bar");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Export GIF").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+
+            if confirm {
+                let p = gm.path.trim();
+                if !p.is_empty() {
+                    return ModalAction::ExportGif {
+                        path: PathBuf::from(p),
+                        width: gm.width.max(64),
+                        height: gm.height.max(64),
+                        frames: gm.frames.max(4),
+                        delay_ms: gm.delay_ms.max(20),
+                        is_turntable: gm.is_turntable,
+                        transparent: gm.transparent,
+                        include_scalar_bar: gm.include_scalar_bar,
                     };
                 }
             } else if keep_open {
@@ -628,6 +744,7 @@ pub fn draw_modal(
                                 ("T", "Toggle Turntable spin"),
                                 ("Tab", "Toggle Left Inspector Dock"),
                                 ("Space", "Play / Pause time steps"),
+                                ("Ctrl/Cmd + C / V", "Copy / Paste filter in Pipeline"),
                                 ("Delete / Backspace", "Remove selected pipeline node"),
                                 ("F1 / ?", "Open this shortcuts guide"),
                             ] {
@@ -642,6 +759,57 @@ pub fn draw_modal(
                     }
                 });
             if keep_open {
+                *modal_slot = Some(modal);
+            }
+            return ModalAction::None;
+        }
+
+        AppModal::ExportSpreadsheetCsv(es) => {
+            let mut confirm = false;
+            egui::Window::new("Export Spreadsheet CSV")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Domain:").color(pal.muted));
+                        ui.strong(&es.domain_label);
+                        ui.label(
+                            egui::RichText::new(format!("({} rows)", es.row_count)).color(pal.muted),
+                        );
+                    });
+                    if !es.col_filter.trim().is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Column filter:").color(pal.muted));
+                            ui.monospace(es.col_filter.trim());
+                        });
+                    }
+                    ui.label("Output CSV path:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut es.path)
+                            .desired_width(380.0)
+                            .hint_text("path/to/export.csv"),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Export CSV").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+
+            if confirm {
+                let p = es.path.trim();
+                if !p.is_empty() {
+                    return ModalAction::ExportSpreadsheetCsv(PathBuf::from(p));
+                }
+            } else if keep_open {
                 *modal_slot = Some(modal);
             }
             return ModalAction::None;
@@ -688,7 +856,7 @@ pub fn draw_modal(
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Format:");
                             for ext in
-                                ["vtp", "vtu", "vti", "vtk", "stl", "obj", "ply", "csv", "glb"]
+                                ["vtp", "vtu", "vti", "vtk", "stl", "obj", "ply", "csv", "glb", "html"]
                             {
                                 if ui.small_button(format!(".{ext}")).clicked() {
                                     let p = Path::new(path_str.trim());
@@ -707,10 +875,11 @@ pub fn draw_modal(
                                 }
                             }
                         });
-                        if path_str.trim().to_ascii_lowercase().ends_with(".glb") {
+                        let lower = path_str.trim().to_ascii_lowercase();
+                        if lower.ends_with(".glb") || lower.ends_with(".html") || lower.ends_with(".htm") {
                             ui.checkbox(
                                 export_glb_colors,
-                                "Include scalar vertex colors (COLOR_0)",
+                                "Include scalar vertex colors (colormap)",
                             );
                         }
                     }
