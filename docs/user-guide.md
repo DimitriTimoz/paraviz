@@ -35,8 +35,10 @@ Drag and drop any supported file directly onto the ParaViz window:
 - **Medical & Volumetric**: `.nii`, `.nii.gz`, `.nrrd`, `.nhdr`, `.mhd`, `.mha`, `.raw`, `.bin`, `.vol`
 - **Saved Studio State**: `.json`
 
+- **Built-In Auto-Updater** *(desktop non-WASM)*: Checks GitHub Releases asynchronously on startup (and via **Help → Check for Updates...**). When a newer SemVer release is available, click **`Update vX.Y.Z`** in the bottom status bar to download the platform binary (`tar.gz`, `.zip`, or `.AppImage`), verify its **SHA-256 checksum** against `SHA256SUMS.txt`, replace the executable atomically, and click **Restart Now**.
+
 ### Built-In Demo Gallery
-Open **Demos** in the top menu (or **Help → Demo Gallery**) to generate one of five built-in scientific pipelines immediately:
+Open **Demos** in the top menu (or **Help → Demo Gallery**) to generate one of five built-in scientific pipelines (Studio opens directly into **Swirling Vortex Streamlines + Glyphs**):
 1. **Wavelet Isosurfaces + Slice** (`wavelet`) — `WaveletSource` outline + two `ContourFilter` isosurfaces + translucent `SliceFilter`
 2. **Swirling Vortex Streamlines + Glyphs** (`vortex`) — `VectorFieldSource` + RK45 `StreamTracerFilter` + `TubeFilter` + `GlyphFilter` arrows
 3. **Gyroid Minimal Surface** (`gyroid`) — `GyroidSource` contoured at iso-value `0.0`

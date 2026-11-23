@@ -30,13 +30,14 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 - **File**: Open File Browser (with `DatasetReader` dropdown), Open by Path, Import Raw 3D Volume (`RawVolumeDescriptor`), Recent Files, Save/Load State `.json`, Export Dataset (`.vtp`, `.vtu`, `.vti`, `.vtk`, `.stl`, `.obj`, `.ply`, `.csv`, `.glb`, standalone WebGL2 `.html`), Save Screenshot `.png`, Export Animation `.gif` (turntable or time-series).
 - **Sources**: All 14 geometric & analytical procedural sources.
 - **Filters**: All 37 `FilterConfig` filters (contextually gated by input dataset type) + **GPU Compute Contour (WebGPU)...** + **Append Visible Datasets**.
-- **Demos**: Launch any of the 5 built-in `DemoPreset` pipelines.
+- **Demos**: Launch any of the 5 built-in `DemoPreset` pipelines (Studio opens with **Swirling Vortex Streamlines + Glyphs**).
 - **View & Quick Bar**:
   - Panels: `Inspector Dock (Tab)`, `Data Drawer`, `Zen Mode (Full Viewport)`.
   - Multi-pane layout: **Viewport Layout** (`1x1 Single`, `1x2 Split Horizontal`, `2x1 Split Vertical`, `2x2 Quad`) and **`Link Cameras`**.
   - Overlays & shaders: `Scalar Color Bar`, `Time Annotation (Time:)`, `3D Filter Widgets (W)`, `Axes Gizmo (G)`, `Bounding Box (B)`, `Turntable Spin (T)`, `4x MSAA (M)`, `Eye-Dome Lighting (E)` + `EDL Strength`.
   - Camera presets: `Isometric`, `+X`, `-X`, `+Y`, `-Y`, `+Z`, `-Z`, `Reset Camera (R)`, `Focus Selected (F)`, `DarkStudio` / `LightStudio`.
 - **Async Background Worker Status Pill** *(desktop non-WASM)*: Displays spinner, active job label, elapsed timer, and **Cancel** button during background file I/O or heavy filter evaluation.
+- **Help & Software Auto-Update**: `Keyboard & Mouse Shortcuts (F1)`, `Demo Gallery`, **`Check for Updates...`**, and `Report an Issue / Bug...`. On desktop native builds, ParaViz checks GitHub Releases asynchronously on launch, notifies in the status bar when a newer SemVer tag exists, verifies the downloaded archive/AppImage against `SHA256SUMS.txt`, and performs atomic self-replacement (`self-replace`).
 
 ### Split Viewport Panes (`P1`–`P4`)
 - Each pane header lets you click `P1`..`P4` to focus, switch **`3D View` | `XY Chart` | `Spreadsheet`**, and toggle **Per-Pane Node Visibility** (`Vis: Global` vs custom `Nodes (N)` checklist).
