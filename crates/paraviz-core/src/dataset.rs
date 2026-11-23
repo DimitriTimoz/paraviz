@@ -155,9 +155,13 @@ impl PolyData {
                         if poly.len() < 3 {
                             continue;
                         }
-                        let p0 = Vec3::from_array(points[poly[0] as usize]);
-                        let p1 = Vec3::from_array(points[poly[1] as usize]);
-                        let p2 = Vec3::from_array(points[poly[2] as usize]);
+                        let (i0, i1, i2) = (poly[0] as usize, poly[1] as usize, poly[2] as usize);
+                        if i0 >= n_pts || i1 >= n_pts || i2 >= n_pts {
+                            continue;
+                        }
+                        let p0 = Vec3::from_array(points[i0]);
+                        let p1 = Vec3::from_array(points[i1]);
+                        let p2 = Vec3::from_array(points[i2]);
                         let n = (p1 - p0).cross(p2 - p0);
                         for &idx in poly {
                             if let Some(acc) = local.get_mut(idx as usize) {
@@ -182,9 +186,13 @@ impl PolyData {
                 if poly.len() < 3 {
                     continue;
                 }
-                let p0 = Vec3::from_array(self.points[poly[0] as usize]);
-                let p1 = Vec3::from_array(self.points[poly[1] as usize]);
-                let p2 = Vec3::from_array(self.points[poly[2] as usize]);
+                let (i0, i1, i2) = (poly[0] as usize, poly[1] as usize, poly[2] as usize);
+                if i0 >= n_pts || i1 >= n_pts || i2 >= n_pts {
+                    continue;
+                }
+                let p0 = Vec3::from_array(self.points[i0]);
+                let p1 = Vec3::from_array(self.points[i1]);
+                let p2 = Vec3::from_array(self.points[i2]);
                 let n = (p1 - p0).cross(p2 - p0);
                 for &idx in poly {
                     if let Some(v) = acc.get_mut(idx as usize) {
@@ -212,9 +220,10 @@ impl PolyData {
     /// Triangulates polygons (using ear-clipping for n-gons >= 4 so concave polygons are handled
     /// accurately) and triangle strips into a flat list of `[u32; 3]` triangles.
     pub fn triangulate(&self) -> Vec<[u32; 3]> {
+        let n_pts = self.points.len();
         let mut tris = Vec::with_capacity(self.polys.len() * 2);
         for poly in &self.polys {
-            if poly.len() < 3 {
+            if poly.len() < 3 || poly.iter().any(|&v| (v as usize) >= n_pts) {
                 continue;
             }
             if poly.len() == 3 {
@@ -224,7 +233,7 @@ impl PolyData {
             }
         }
         for strip in &self.strips {
-            if strip.len() < 3 {
+            if strip.len() < 3 || strip.iter().any(|&v| (v as usize) >= n_pts) {
                 continue;
             }
             for k in 0..(strip.len() - 2) {

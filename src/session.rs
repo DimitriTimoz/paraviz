@@ -1128,21 +1128,43 @@ impl ParaViz {
 
     /// Reconstructs a [`ParaViz`] session from a JSON state produced by [`Self::save_state_json`].
     pub fn load_state_json(json: &str) -> Result<Self, SessionError> {
+        const MAX_SESSION_NODES: usize = 10_000;
+        const MAX_PIPELINE_DEPTH: usize = 256;
+
         let state: PipelineState = serde_json::from_str(json)?;
+        if state.nodes.len() > MAX_SESSION_NODES {
+            return Err(SessionError::Pipeline(
+                paraviz_core::PipelineError::ExecutionFailed(format!(
+                    "Session exceeds maximum node count of {MAX_SESSION_NODES}"
+                )),
+            ));
+        }
         let mut pv = Self::new();
         pv.camera = state.camera;
         pv.settings = state.settings;
         pv.time = state.time;
 
         let mut id_map: HashMap<u64, NodeId> = HashMap::new();
+        let mut depth_map: HashMap<u64, usize> = HashMap::new();
         for sn in state.nodes {
-            let new_id = if let Some(src) = sn.source {
-                pv.add_source_cfg(sn.name, src)?
+            let (new_id, depth) = if let Some(src) = sn.source {
+                (pv.add_source_cfg(sn.name, src)?, 0)
             } else if let (Some(old_parent), Some(flt)) = (sn.parent, sn.filter) {
-                let mapped_parent = *id_map.get(&old_parent).ok_or(SessionError::MissingNode(NodeId(old_parent)))?;
-                pv.add_filter_cfg(sn.name, mapped_parent, flt)?
+                let mapped_parent = *id_map
+                    .get(&old_parent)
+                    .ok_or(SessionError::MissingNode(NodeId(old_parent)))?;
+                let parent_depth = depth_map.get(&old_parent).copied().unwrap_or(0);
+                let next_depth = parent_depth + 1;
+                if next_depth > MAX_PIPELINE_DEPTH {
+                    return Err(SessionError::Pipeline(
+                        paraviz_core::PipelineError::ExecutionFailed(format!(
+                            "Session pipeline depth exceeds limit of {MAX_PIPELINE_DEPTH}"
+                        )),
+                    ));
+                }
+                (pv.add_filter_cfg(sn.name, mapped_parent, flt)?, next_depth)
             } else if let Some(ds) = sn.custom_dataset {
-                pv.add_dataset(sn.name, ds)
+                (pv.add_dataset(sn.name, ds), 0)
             } else {
                 continue;
             };
@@ -1151,6 +1173,7 @@ impl ParaViz {
                 node.auto_styled = true;
             }
             id_map.insert(sn.id, new_id);
+            depth_map.insert(sn.id, depth);
         }
         Ok(pv)
     }

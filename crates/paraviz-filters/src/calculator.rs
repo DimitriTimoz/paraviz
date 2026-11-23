@@ -424,12 +424,29 @@ fn tokenize(input: &str) -> Result<Vec<Token>, PipelineError> {
     Ok(tokens)
 }
 
+const MAX_EXPR_DEPTH: usize = 128;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
+    fn enter(&mut self) -> Result<(), PipelineError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(PipelineError::ExecutionFailed(format!(
+                "CalculatorFilter expression nesting depth exceeds limit of {MAX_EXPR_DEPTH}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -443,7 +460,10 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, PipelineError> {
-        self.parse_add_sub()
+        self.enter()?;
+        let res = self.parse_add_sub();
+        self.leave();
+        res
     }
 
     fn parse_add_sub(&mut self) -> Result<Expr, PipelineError> {
@@ -487,18 +507,22 @@ impl Parser {
     }
 
     fn parse_pow(&mut self) -> Result<Expr, PipelineError> {
+        self.enter()?;
         let base = self.parse_unary()?;
-        if matches!(self.peek(), Some(Token::Caret)) {
+        let res = if matches!(self.peek(), Some(Token::Caret)) {
             self.next();
             let exp = self.parse_pow()?; // right-associative
             Ok(Expr::Bin(BinOp::Pow, Box::new(base), Box::new(exp)))
         } else {
             Ok(base)
-        }
+        };
+        self.leave();
+        res
     }
 
     fn parse_unary(&mut self) -> Result<Expr, PipelineError> {
-        match self.peek() {
+        self.enter()?;
+        let res = match self.peek() {
             Some(Token::Minus) => {
                 self.next();
                 Ok(Expr::Neg(Box::new(self.parse_unary()?)))
@@ -508,7 +532,9 @@ impl Parser {
                 self.parse_unary()
             }
             _ => self.parse_primary(),
-        }
+        };
+        self.leave();
+        res
     }
 
     fn parse_primary(&mut self) -> Result<Expr, PipelineError> {
@@ -561,7 +587,11 @@ fn parse_expression(expr: &str) -> Result<Expr, PipelineError> {
             "CalculatorFilter expression is empty".into(),
         ));
     }
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     let ast = parser.parse_expr()?;
     if parser.pos < parser.tokens.len() {
         return Err(PipelineError::ExecutionFailed(format!(

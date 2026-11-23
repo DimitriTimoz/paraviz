@@ -167,10 +167,41 @@ impl ArrayData {
 
 /// Named, multi-component scientific data array (scalars, vectors, tensors, normals, etc.).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawDataArray")]
 pub struct DataArray {
     pub name: String,
     pub num_components: usize,
     pub data: ArrayData,
+}
+
+#[derive(Deserialize)]
+struct RawDataArray {
+    name: String,
+    num_components: usize,
+    data: ArrayData,
+}
+
+impl TryFrom<RawDataArray> for DataArray {
+    type Error = String;
+
+    fn try_from(raw: RawDataArray) -> Result<Self, Self::Error> {
+        if raw.num_components < 1 {
+            return Err("DataArray num_components must be >= 1".into());
+        }
+        if !raw.data.len().is_multiple_of(raw.num_components) {
+            return Err(format!(
+                "DataArray '{}' data length ({}) is not divisible by num_components ({})",
+                raw.name,
+                raw.data.len(),
+                raw.num_components
+            ));
+        }
+        Ok(Self {
+            name: raw.name,
+            num_components: raw.num_components,
+            data: raw.data,
+        })
+    }
 }
 
 impl DataArray {
