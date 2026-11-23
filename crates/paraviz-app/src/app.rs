@@ -14,7 +14,21 @@ enum InspectorTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrawerTab {
     Spreadsheet,
+    Chart,
     RustTrace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartMode {
+    XYPlot,
+    Histogram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportMode {
+    Orbit,
+    Pick,
+    Ruler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +38,28 @@ enum SpreadsheetTarget {
 }
 
 #[derive(Debug, Clone)]
+struct FileBrowserState {
+    current_dir: PathBuf,
+    filter_text: String,
+    path_input: String,
+}
+
+impl FileBrowserState {
+    fn new() -> Self {
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let path_input = current_dir.display().to_string();
+        Self {
+            current_dir,
+            filter_text: String::new(),
+            path_input,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum PathModal {
     OpenFile(String),
+    FileBrowser(FileBrowserState),
     SaveState(String),
     LoadState(String),
     ExportDataset(String),
@@ -48,8 +82,19 @@ pub struct ParaVizApp {
     inspector_tab: InspectorTab,
     show_drawer: bool,
     drawer_tab: DrawerTab,
+    chart_mode: ChartMode,
+    hist_array_name: String,
+    hist_association: AttributeAssociation,
+    hist_component: Option<usize>,
+    hist_bins: usize,
     spreadsheet_target: SpreadsheetTarget,
     show_scalar_bar: bool,
+    show_widgets: bool,
+
+    viewport_mode: ViewportMode,
+    last_pick: Option<PickResult>,
+    ruler_points: Vec<[f32; 3]>,
+    export_glb_colors: bool,
 
     playing: bool,
     time_accumulator: f64,
@@ -94,8 +139,18 @@ impl ParaVizApp {
             inspector_tab: InspectorTab::Properties,
             show_drawer: false,
             drawer_tab: DrawerTab::Spreadsheet,
+            chart_mode: ChartMode::Histogram,
+            hist_array_name: String::new(),
+            hist_association: AttributeAssociation::Point,
+            hist_component: None,
+            hist_bins: 20,
             spreadsheet_target: SpreadsheetTarget::Points,
             show_scalar_bar: true,
+            show_widgets: true,
+            viewport_mode: ViewportMode::Orbit,
+            last_pick: None,
+            ruler_points: Vec::new(),
+            export_glb_colors: true,
             playing: false,
             time_accumulator: 0.0,
             play_fps: 4.0,
@@ -292,20 +347,45 @@ impl ParaVizApp {
                         f.point1 = [bb.min.x, center[1], center[2]];
                         f.point2 = [bb.max.x, center[1], center[2]];
                     }
+                FilterConfig::Elevation(f) if bb.is_valid() => {
+                    let dz = (bb.max.z - bb.min.z).abs();
+                    let dy = (bb.max.y - bb.min.y).abs();
+                    if dz > 1e-4 {
+                        f.low_point = [center[0], center[1], bb.min.z];
+                        f.high_point = [center[0], center[1], bb.max.z];
+                    } else if dy > 1e-4 {
+                        f.low_point = [center[0], bb.min.y, center[2]];
+                        f.high_point = [center[0], bb.max.y, center[2]];
+                    } else {
+                        f.low_point = [bb.min.x, center[1], center[2]];
+                        f.high_point = [bb.max.x, center[1], center[2]];
+                    }
+                }
                 _ => {}
             }
         }
 
+        let is_cell_centers = matches!(cfg, FilterConfig::CellCenters(_));
+        let is_feature_edges = matches!(cfg, FilterConfig::FeatureEdges(_));
+        let is_probe = matches!(cfg, FilterConfig::ProbeOverLine(_));
         let label = self.unique_label(cfg.default_label());
         match self.session.add_filter_cfg(label.clone(), parent_id, cfg) {
             Ok(id) => {
                 let eval_res = self.session.evaluate(id);
-                self.session.show(id);
+                let handle = self.session.show(id);
+                if is_cell_centers {
+                    handle.representation(Representation::Points);
+                } else if is_feature_edges {
+                    handle.representation(Representation::Wireframe);
+                }
                 if let Err(e) = eval_res {
                     self.error_message = Some(format!("Filter '{label}' failed: {e}"));
                 } else {
                     self.error_message = None;
                     self.status_message = format!("Applied filter '{label}'");
+                }
+                if is_probe {
+                    self.chart_mode = ChartMode::XYPlot;
                 }
                 self.selected_node = Some(id);
                 self.pending_source = None;
@@ -314,6 +394,182 @@ impl ParaVizApp {
             Err(e) => {
                 self.error_message = Some(format!("Failed to add filter: {e}"));
             }
+        }
+    }
+
+    fn apply_gpu_contour_to_selected(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            self.error_message = Some("Select an ImageData node first.".into());
+            return;
+        };
+        let Ok(ds) = self.session.evaluate(sel_id) else {
+            self.error_message = Some("Failed to evaluate selected node.".into());
+            return;
+        };
+        let Some(img) = ds.as_image_data() else {
+            self.error_message =
+                Some("GPU Compute Contour requires an ImageData dataset.".into());
+            return;
+        };
+        let scalar_info = img
+            .point_data
+            .active_scalars_array()
+            .or_else(|| img.point_data.arrays().first())
+            .map(|a| (a.name.clone(), a.range(None)));
+        let (field_name, iso_value) = match scalar_info {
+            Some((name, (mn, mx))) => (Some(name), (mn + mx) * 0.5),
+            None => (None, 0.0),
+        };
+        let label = self.unique_label("GpuContour");
+        match self
+            .session
+            .gpu_contour(label.clone(), sel_id, field_name.as_deref(), iso_value)
+        {
+            Ok(new_id) => {
+                let _ = self.session.evaluate(new_id);
+                self.session.show(new_id);
+                self.selected_node = Some(new_id);
+                self.pending_source = None;
+                self.pending_filter = None;
+                self.error_message = None;
+                self.status_message =
+                    format!("Applied GPU Compute Contour '{label}' (iso={iso_value:.3})");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("GPU Compute Contour failed: {e}"));
+            }
+        }
+    }
+
+    fn append_visible_datasets(&mut self) {
+        if let Err(e) = self.session.update_visible() {
+            self.error_message = Some(format!("Append failed: {e}"));
+            return;
+        }
+        let merged_res = {
+            let refs: Vec<&DataSet> = self
+                .session
+                .nodes()
+                .iter()
+                .filter(|n| n.style.visible)
+                .filter_map(|n| n.dataset().map(|arc| arc.as_ref()))
+                .collect();
+            if refs.is_empty() {
+                self.error_message = Some("No visible datasets to append.".into());
+                return;
+            }
+            append_datasets(&refs)
+        };
+        match merged_res {
+            Ok(ds) => {
+                let label = self.unique_label("AppendDatasets");
+                let id = self.session.add_dataset(label.clone(), ds);
+                let _ = self.session.evaluate(id);
+                self.session.show(id);
+                self.selected_node = Some(id);
+                self.pending_source = None;
+                self.pending_filter = None;
+                self.error_message = None;
+                self.status_message = format!("Appended visible datasets -> '{label}'");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Append Datasets failed: {e}"));
+            }
+        }
+    }
+
+    fn sync_viewport_widgets(&mut self) {
+        self.session.widgets.clear();
+        if self.show_widgets
+            && let Some(sel_id) = self.selected_node
+            && let Ok(node) = self.session.node(sel_id)
+        {
+            let active_cfg = self
+                .pending_filter
+                .as_ref()
+                .filter(|(id, _)| *id == sel_id)
+                .map(|(_, cfg)| cfg)
+                .or(node.filter_config.as_ref());
+
+            if let Some(flt) = active_cfg {
+                let ref_bounds = node
+                    .parent
+                    .and_then(|pid| self.session.node(pid).ok())
+                    .and_then(|pn| pn.dataset())
+                    .map(|ds| ds.bounds())
+                    .filter(|b| b.is_valid())
+                    .or_else(|| node.dataset().map(|ds| ds.bounds()).filter(|b| b.is_valid()));
+                let plane_size = ref_bounds
+                    .map(|b| (b.diagonal() * 0.85).max(0.5))
+                    .unwrap_or(4.0);
+
+                match flt {
+                    FilterConfig::Slice(f) => {
+                        self.session.widgets.push(ViewportWidget::Plane {
+                            origin: f.origin,
+                            normal: f.normal,
+                            size: plane_size,
+                        });
+                    }
+                    FilterConfig::Clip(f) => match &f.function {
+                        ImplicitFunction::Plane { origin, normal } => {
+                            self.session.widgets.push(ViewportWidget::Plane {
+                                origin: *origin,
+                                normal: *normal,
+                                size: plane_size,
+                            });
+                        }
+                        ImplicitFunction::Sphere { center, radius } => {
+                            self.session.widgets.push(ViewportWidget::Sphere {
+                                center: *center,
+                                radius: *radius,
+                            });
+                        }
+                        ImplicitFunction::Box { min, max } => {
+                            self.session.widgets.push(ViewportWidget::Box {
+                                min: *min,
+                                max: *max,
+                            });
+                        }
+                    },
+                    FilterConfig::ProbeOverLine(f) => {
+                        self.session.widgets.push(ViewportWidget::Line {
+                            p1: f.point1,
+                            p2: f.point2,
+                        });
+                    }
+                    FilterConfig::StreamTracer(f) => match &f.seeds {
+                        SeedSource::Line { p1, p2, .. } => {
+                            self.session
+                                .widgets
+                                .push(ViewportWidget::Line { p1: *p1, p2: *p2 });
+                        }
+                        SeedSource::Sphere { center, radius, .. } => {
+                            self.session.widgets.push(ViewportWidget::Sphere {
+                                center: *center,
+                                radius: *radius,
+                            });
+                        }
+                        SeedSource::Points(_) => {}
+                    },
+                    FilterConfig::Elevation(f) => {
+                        self.session.widgets.push(ViewportWidget::Line {
+                            p1: f.low_point,
+                            p2: f.high_point,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if self.ruler_points.len() == 2
+            && (self.show_widgets || self.viewport_mode == ViewportMode::Ruler)
+        {
+            self.session.widgets.push(ViewportWidget::Line {
+                p1: self.ruler_points[0],
+                p2: self.ruler_points[1],
+            });
         }
     }
 
@@ -336,6 +592,18 @@ impl ParaVizApp {
             self.selected_node = Some(id);
             self.pending_source = None;
             self.pending_filter = None;
+            let has_arc = self
+                .session
+                .node(id)
+                .ok()
+                .and_then(|n| n.dataset())
+                .and_then(|ds| ds.as_poly_data())
+                .is_some_and(|pd| pd.point_data.get("ArcLength").is_some());
+            self.chart_mode = if has_arc {
+                ChartMode::XYPlot
+            } else {
+                ChartMode::Histogram
+            };
         }
     }
 
@@ -386,7 +654,11 @@ impl ParaVizApp {
     fn draw_menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Open File...").clicked() {
+                if ui.button("File Browser...").clicked() {
+                    self.modal = Some(PathModal::FileBrowser(FileBrowserState::new()));
+                    ui.close();
+                }
+                if ui.button("Open File by Path...").clicked() {
                     self.modal = Some(PathModal::OpenFile(String::new()));
                     ui.close();
                 }
@@ -462,6 +734,13 @@ impl ParaVizApp {
 
             ui.menu_button("Filters", |ui| {
                 let enabled = self.selected_node.is_some();
+                let is_imagedata = self
+                    .selected_node
+                    .and_then(|id| self.session.node(id).ok())
+                    .and_then(|n| n.dataset())
+                    .is_some_and(|ds| ds.as_image_data().is_some());
+                let has_visible = self.session.nodes().iter().any(|n| n.style.visible);
+
                 let entries: Vec<(&'static str, FilterConfig)> = vec![
                     (
                         "Extract Surface",
@@ -513,6 +792,28 @@ impl ParaVizApp {
                         "Probe Over Line",
                         FilterConfig::ProbeOverLine(ProbeOverLineFilter::default()),
                     ),
+                    (
+                        "Feature Edges",
+                        FilterConfig::FeatureEdges(FeatureEdgesFilter::default()),
+                    ),
+                    (
+                        "Connectivity",
+                        FilterConfig::Connectivity(ConnectivityFilter::default()),
+                    ),
+                    ("Shrink", FilterConfig::Shrink(ShrinkFilter::default())),
+                    (
+                        "Cell Centers",
+                        FilterConfig::CellCenters(CellCentersFilter::default()),
+                    ),
+                    ("Reflect", FilterConfig::Reflect(ReflectFilter::default())),
+                    (
+                        "Generate Normals",
+                        FilterConfig::GenerateNormals(GenerateNormalsFilter::default()),
+                    ),
+                    (
+                        "Elevation",
+                        FilterConfig::Elevation(ElevationFilter::default()),
+                    ),
                 ];
                 for (name, cfg) in entries {
                     if ui.add_enabled(enabled, egui::Button::new(name)).clicked() {
@@ -520,17 +821,49 @@ impl ParaVizApp {
                         ui.close();
                     }
                 }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        is_imagedata,
+                        egui::Button::new("GPU Compute Contour (WebGPU)"),
+                    )
+                    .clicked()
+                {
+                    self.apply_gpu_contour_to_selected();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(has_visible, egui::Button::new("Append Visible Datasets"))
+                    .clicked()
+                {
+                    self.append_visible_datasets();
+                    ui.close();
+                }
             });
 
             ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.show_drawer, "Inspector Drawer (Spreadsheet / Trace)");
+                ui.checkbox(
+                    &mut self.show_drawer,
+                    "Inspector Drawer (Spreadsheet / Chart / Trace)",
+                );
                 ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
+                ui.checkbox(&mut self.show_widgets, "3D Filter Widgets");
                 ui.checkbox(&mut self.session.settings.show_axes_gizmo, "Axes Gizmo");
                 ui.checkbox(
                     &mut self.session.settings.show_bounding_box,
                     "Bounding Box",
                 );
+                let mut msaa_4x = self.session.settings.msaa_samples >= 4;
+                if ui.checkbox(&mut msaa_4x, "4x MSAA").changed() {
+                    self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+                }
                 ui.checkbox(&mut self.session.settings.edl_enabled, "Eye-Dome Lighting");
+                if self.session.settings.edl_enabled {
+                    ui.add(
+                        egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
+                            .text("EDL Strength"),
+                    );
+                }
             });
         });
     }
@@ -554,13 +887,34 @@ impl ParaVizApp {
                 }
             }
             ui.separator();
+            ui.label("Mode:");
+            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Orbit, "Orbit");
+            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Pick, "Pick");
+            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Ruler, "Ruler");
+            if !self.ruler_points.is_empty() && ui.button("Clear Ruler").clicked() {
+                self.ruler_points.clear();
+            }
+
+            ui.separator();
             ui.toggle_value(&mut self.session.camera.orthographic, "Ortho");
             ui.toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes");
             ui.toggle_value(&mut self.session.settings.show_bounding_box, "Bounds");
+            ui.toggle_value(&mut self.show_widgets, "Widgets");
+            let mut msaa_4x = self.session.settings.msaa_samples >= 4;
+            if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
+                self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+            }
             ui.toggle_value(&mut self.session.settings.edl_enabled, "EDL");
+            if self.session.settings.edl_enabled {
+                ui.add(
+                    egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
+                        .text("Strength")
+                        .max_decimals(2),
+                );
+            }
             ui.toggle_value(&mut self.show_scalar_bar, "ScalarBar");
             ui.separator();
-            ui.toggle_value(&mut self.show_drawer, "Spreadsheet / Trace");
+            ui.toggle_value(&mut self.show_drawer, "Spreadsheet / Chart / Trace");
 
             let steps = self.session.all_time_steps();
             if !steps.is_empty() {
@@ -1108,6 +1462,7 @@ impl ParaVizApp {
     fn draw_drawer(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.drawer_tab, DrawerTab::Spreadsheet, "Spreadsheet");
+            ui.selectable_value(&mut self.drawer_tab, DrawerTab::Chart, "Chart / Histogram");
             ui.selectable_value(&mut self.drawer_tab, DrawerTab::RustTrace, "Rust Trace");
             if self.drawer_tab == DrawerTab::Spreadsheet {
                 ui.separator();
@@ -1132,6 +1487,7 @@ impl ParaVizApp {
 
         match self.drawer_tab {
             DrawerTab::Spreadsheet => self.draw_spreadsheet(ui),
+            DrawerTab::Chart => self.draw_chart_tab(ui),
             DrawerTab::RustTrace => {
                 let mut trace = self.session.to_rust_trace();
                 ui.horizontal(|ui| {
@@ -1149,6 +1505,195 @@ impl ParaVizApp {
                                 .desired_width(f32::INFINITY),
                         );
                     });
+            }
+        }
+    }
+
+    fn draw_chart_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(sel_id) = self.selected_node else {
+            ui.weak("Select a node to view XY plots or scalar histograms.");
+            return;
+        };
+        let _ = self.session.evaluate(sel_id);
+        let Ok(node) = self.session.node(sel_id) else {
+            return;
+        };
+        let Some(ds) = node.dataset().cloned() else {
+            ui.weak("Dataset not evaluated.");
+            return;
+        };
+
+        let has_arc_length = ds
+            .as_poly_data()
+            .and_then(|pd| pd.point_data.get("ArcLength"))
+            .is_some();
+
+        if !has_arc_length && self.chart_mode == ChartMode::XYPlot {
+            self.chart_mode = ChartMode::Histogram;
+        }
+
+        ui.horizontal(|ui| {
+            if has_arc_length {
+                ui.selectable_value(
+                    &mut self.chart_mode,
+                    ChartMode::XYPlot,
+                    "XY Plot (ArcLength)",
+                );
+                ui.selectable_value(
+                    &mut self.chart_mode,
+                    ChartMode::Histogram,
+                    "Scalar Histogram",
+                );
+                ui.separator();
+            }
+
+            if self.chart_mode == ChartMode::Histogram {
+                // Collect available point and cell arrays
+                let mut candidates: Vec<(AttributeAssociation, String, usize)> = Vec::new();
+                if let Some(pd) = ds.point_data() {
+                    for arr in pd.arrays() {
+                        candidates.push((
+                            AttributeAssociation::Point,
+                            arr.name.clone(),
+                            arr.num_components,
+                        ));
+                    }
+                }
+                if let Some(cd) = ds.cell_data() {
+                    for arr in cd.arrays() {
+                        candidates.push((
+                            AttributeAssociation::Cell,
+                            arr.name.clone(),
+                            arr.num_components,
+                        ));
+                    }
+                }
+
+                if candidates.is_empty() {
+                    ui.weak("Dataset has no point or cell scalar arrays.");
+                    return;
+                }
+
+                let current_valid = candidates.iter().any(|(a, n, _)| {
+                    *a == self.hist_association && *n == self.hist_array_name
+                });
+                if !current_valid {
+                    if let Some(active) = ds
+                        .point_data()
+                        .and_then(|p| p.active_scalars_array())
+                    {
+                        self.hist_association = AttributeAssociation::Point;
+                        self.hist_array_name = active.name.clone();
+                    } else if let Some(active) = ds
+                        .cell_data()
+                        .and_then(|c| c.active_scalars_array())
+                    {
+                        self.hist_association = AttributeAssociation::Cell;
+                        self.hist_array_name = active.name.clone();
+                    } else {
+                        self.hist_association = candidates[0].0;
+                        self.hist_array_name = candidates[0].1.clone();
+                    }
+                    self.hist_component = None;
+                }
+
+                let selected_comps = candidates
+                    .iter()
+                    .find(|(a, n, _)| {
+                        *a == self.hist_association && *n == self.hist_array_name
+                    })
+                    .map(|(_, _, c)| *c)
+                    .unwrap_or(1);
+
+                let sel_label = format!(
+                    "{}: {}",
+                    match self.hist_association {
+                        AttributeAssociation::Point => "Point",
+                        AttributeAssociation::Cell => "Cell",
+                        AttributeAssociation::Field => "Field",
+                    },
+                    self.hist_array_name
+                );
+                egui::ComboBox::from_id_salt("hist_array_combo")
+                    .selected_text(sel_label)
+                    .show_ui(ui, |ui| {
+                        for (assoc, name, _) in &candidates {
+                            let prefix = match assoc {
+                                AttributeAssociation::Point => "Point",
+                                AttributeAssociation::Cell => "Cell",
+                                AttributeAssociation::Field => "Field",
+                            };
+                            let active = *assoc == self.hist_association
+                                && *name == self.hist_array_name;
+                            if ui
+                                .selectable_label(active, format!("{prefix}: {name}"))
+                                .clicked()
+                            {
+                                self.hist_association = *assoc;
+                                self.hist_array_name = name.clone();
+                                self.hist_component = None;
+                            }
+                        }
+                    });
+
+                if selected_comps > 1 {
+                    let comp_text = match self.hist_component {
+                        None => "Magnitude".to_string(),
+                        Some(c) => format!("Comp {c}"),
+                    };
+                    egui::ComboBox::from_id_salt("hist_comp_combo")
+                        .selected_text(comp_text)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.hist_component, None, "Magnitude");
+                            for c in 0..selected_comps {
+                                ui.selectable_value(
+                                    &mut self.hist_component,
+                                    Some(c),
+                                    format!("Comp {c}"),
+                                );
+                            }
+                        });
+                }
+
+                ui.add(egui::Slider::new(&mut self.hist_bins, 4..=64).text("Bins"));
+            }
+        });
+
+        match self.chart_mode {
+            ChartMode::XYPlot if has_arc_length => {
+                if let Some(pd) = ds.as_poly_data() {
+                    paint_xy_arclength_plot(ui, pd);
+                }
+            }
+            _ => {
+                if self.hist_array_name.is_empty() {
+                    ui.weak("No scalar array selected for histogram.");
+                    return;
+                }
+                match compute_histogram(
+                    &ds,
+                    &self.hist_array_name,
+                    self.hist_association,
+                    self.hist_component,
+                    self.hist_bins,
+                ) {
+                    Ok(hist) => {
+                        ui.horizontal(|ui| {
+                            let total: usize = hist.counts.iter().sum();
+                            ui.monospace(format!(
+                                "min={:.4}  max={:.4}  mean={:.4}  std_dev={:.4}  N={}",
+                                hist.min, hist.max, hist.mean, hist.std_dev, total
+                            ));
+                        });
+                        paint_histogram_chart(ui, &hist);
+                    }
+                    Err(e) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 130, 130),
+                            format!("Histogram unavailable: {e}"),
+                        );
+                    }
+                }
             }
         }
     }
@@ -1242,6 +1787,8 @@ impl ParaVizApp {
         let w = (avail.x * ppp).round().max(1.0) as u32;
         let h = (avail.y * ppp).round().max(1.0) as u32;
 
+        self.sync_viewport_widgets();
+
         let t0 = Instant::now();
         let scene_res = self.session.build_scene();
         let mut total_points = 0usize;
@@ -1292,7 +1839,9 @@ impl ParaVizApp {
             let resp = ui.add(img);
 
             let shift = ui.input(|i| i.modifiers.shift);
-            if resp.dragged_by(egui::PointerButton::Primary) {
+            if self.viewport_mode == ViewportMode::Orbit
+                && resp.dragged_by(egui::PointerButton::Primary)
+            {
                 let d = resp.drag_delta();
                 if shift {
                     self.session
@@ -1322,7 +1871,33 @@ impl ParaVizApp {
                 }
             }
 
-            if resp.double_clicked() {
+            if resp.clicked_by(egui::PointerButton::Primary)
+                && let Some(pos) = resp.interact_pointer_pos()
+                && let Ok(scene) = &scene_res
+            {
+                let local = pos - resp.rect.min;
+                let px = local.x * ppp;
+                let py = local.y * ppp;
+                let hit = pick_scene(scene, px, py, w, h);
+                match self.viewport_mode {
+                    ViewportMode::Orbit | ViewportMode::Pick => {
+                        self.last_pick = hit;
+                    }
+                    ViewportMode::Ruler => {
+                        if let Some(h_res) = hit {
+                            if self.ruler_points.len() >= 2 {
+                                self.ruler_points.clear();
+                            }
+                            self.ruler_points.push(h_res.world_pos);
+                            self.last_pick = Some(h_res);
+                            self.sync_viewport_widgets();
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+            }
+
+            if resp.double_clicked() && self.viewport_mode == ViewportMode::Orbit {
                 let _ = self.session.reset_camera();
                 ui.ctx().request_repaint();
             }
@@ -1338,16 +1913,69 @@ impl ParaVizApp {
         } else {
             "Persp"
         };
-        let hud_text = format!(
-            "WebGPU | {:.1} FPS ({:.2} ms) | {} pts | {} cells | {}",
-            self.fps_smoothed, self.last_render_ms, total_points, total_cells, proj_mode
-        );
+        let msaa_label = if self.session.settings.edl_enabled {
+            "EDL".to_string()
+        } else if self.session.settings.msaa_samples >= 4 {
+            "MSAA 4x".to_string()
+        } else {
+            "1x".to_string()
+        };
+        let mode_label = match self.viewport_mode {
+            ViewportMode::Orbit => "Orbit",
+            ViewportMode::Pick => "Pick",
+            ViewportMode::Ruler => "Ruler",
+        };
+        let mut hud_lines = vec![format!(
+            "WebGPU | {:.1} FPS ({:.2} ms) | {} pts | {} cells | {} | {} | Mode: {}",
+            self.fps_smoothed,
+            self.last_render_ms,
+            total_points,
+            total_cells,
+            proj_mode,
+            msaa_label,
+            mode_label
+        )];
+        if let Some(pick) = &self.last_pick {
+            let pt_str = pick.point_index.map_or_else(|| "-".into(), |i| i.to_string());
+            let cell_str = pick.cell_index.map_or_else(|| "-".into(), |i| i.to_string());
+            let scalar_str = pick
+                .scalar_value
+                .map_or_else(|| "-".into(), |v| format!("{v:.4}"));
+            hud_lines.push(format!(
+                "Pick: Actor {} | Pos ({:.3}, {:.3}, {:.3}) | Pt {} | Cell {} | Scalar {}",
+                pick.actor_name,
+                pick.world_pos[0],
+                pick.world_pos[1],
+                pick.world_pos[2],
+                pt_str,
+                cell_str,
+                scalar_str
+            ));
+        }
+        if self.ruler_points.len() == 1 {
+            let p1 = self.ruler_points[0];
+            hud_lines.push(format!(
+                "Ruler: P1 ({:.3}, {:.3}, {:.3}) — click second point",
+                p1[0], p1[1], p1[2]
+            ));
+        } else if self.ruler_points.len() == 2 {
+            let p1 = glam::Vec3::from_array(self.ruler_points[0]);
+            let p2 = glam::Vec3::from_array(self.ruler_points[1]);
+            let dist = (p2 - p1).length();
+            hud_lines.push(format!(
+                "Ruler: Distance = {:.4} | ({:.3}, {:.3}, {:.3}) -> ({:.3}, {:.3}, {:.3})",
+                dist, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z
+            ));
+        }
+        let hud_text = hud_lines.join("\n");
+
         let painter = ui.painter_at(rect);
         let hud_pos = rect.left_top() + egui::vec2(12.0, 10.0);
-        let galley = painter.layout_no_wrap(
+        let galley = painter.layout(
             hud_text,
             egui::FontId::monospace(11.5),
             egui::Color32::from_rgb(230, 236, 245),
+            f32::INFINITY,
         );
         let hud_bg = egui::Rect::from_min_size(
             hud_pos - egui::vec2(6.0, 4.0),
@@ -1423,6 +2051,7 @@ impl ParaVizApp {
         };
         let title = match &modal {
             PathModal::OpenFile(_) => "Open Scientific File",
+            PathModal::FileBrowser(_) => "File Browser",
             PathModal::SaveState(_) => "Save Pipeline State (JSON)",
             PathModal::LoadState(_) => "Load Pipeline State (JSON)",
             PathModal::ExportDataset(_) => "Export Active Dataset",
@@ -1430,18 +2059,145 @@ impl ParaVizApp {
         };
         let mut keep_open = true;
         let mut confirm = false;
+        let mut switch_to_browser = false;
+        let mut picked_file: Option<PathBuf> = None;
+
+        if let PathModal::FileBrowser(ref mut fb) = modal {
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([560.0, 420.0])
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button(".. Up").clicked()
+                            && let Some(parent) = fb.current_dir.parent()
+                        {
+                            fb.current_dir = parent.to_path_buf();
+                            fb.path_input = fb.current_dir.display().to_string();
+                        }
+                        if ui.button("CWD").clicked() {
+                            fb.current_dir =
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                            fb.path_input = fb.current_dir.display().to_string();
+                        }
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut fb.path_input)
+                                .desired_width(340.0),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let p = PathBuf::from(fb.path_input.trim());
+                            if p.is_dir() {
+                                fb.current_dir = p;
+                            } else if p.is_file() {
+                                picked_file = Some(p);
+                            }
+                        }
+                        if ui.button("Go").clicked() {
+                            let p = PathBuf::from(fb.path_input.trim());
+                            if p.is_dir() {
+                                fb.current_dir = p;
+                            } else if p.is_file() {
+                                picked_file = Some(p);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut fb.filter_text)
+                                .desired_width(220.0)
+                                .hint_text("substring filter"),
+                        );
+                        ui.weak("Supported: .vtk .vtp .vti .vtu .pvtp .pvtu .stl .obj .ply .csv .json");
+                    });
+                    ui.separator();
+
+                    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+                    let mut files: Vec<(String, PathBuf)> = Vec::new();
+                    let mut read_err: Option<String> = None;
+
+                    match std::fs::read_dir(&fb.current_dir) {
+                        Ok(entries) => {
+                            let needle = fb.filter_text.trim().to_ascii_lowercase();
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if !needle.is_empty()
+                                    && !name.to_ascii_lowercase().contains(&needle)
+                                {
+                                    continue;
+                                }
+                                if path.is_dir() {
+                                    dirs.push((name, path));
+                                } else if is_supported_open_file(&path) {
+                                    files.push((name, path));
+                                }
+                            }
+                            dirs.sort_by(|a, b| {
+                                a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
+                            });
+                            files.sort_by(|a, b| {
+                                a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
+                            });
+                        }
+                        Err(e) => {
+                            read_err = Some(format!("Cannot read directory: {e}"));
+                        }
+                    }
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("file_browser_scroll")
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            if let Some(err) = read_err {
+                                ui.colored_label(egui::Color32::from_rgb(255, 130, 130), err);
+                            } else if dirs.is_empty() && files.is_empty() {
+                                ui.weak("No subdirectories or supported scientific files here.");
+                            }
+                            for (name, path) in dirs {
+                                if ui.selectable_label(false, format!("[DIR] {name}")).clicked() {
+                                    fb.current_dir = path;
+                                    fb.path_input = fb.current_dir.display().to_string();
+                                }
+                            }
+                            for (name, path) in files {
+                                if ui.selectable_label(false, format!("      {name}")).clicked() {
+                                    picked_file = Some(path);
+                                }
+                            }
+                        });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Close").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+
+            if let Some(path) = picked_file {
+                self.load_path(&path);
+            } else if keep_open {
+                self.modal = Some(modal);
+            }
+            return;
+        }
 
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
+                let is_open = matches!(modal, PathModal::OpenFile(_));
+                let is_export = matches!(modal, PathModal::ExportDataset(_));
                 let path_str = match &mut modal {
                     PathModal::OpenFile(s)
                     | PathModal::SaveState(s)
                     | PathModal::LoadState(s)
                     | PathModal::ExportDataset(s)
                     | PathModal::SaveScreenshot(s) => s,
+                    PathModal::FileBrowser(_) => unreachable!(),
                 };
                 ui.label("File path:");
                 let resp = ui.add(
@@ -1452,15 +2208,52 @@ impl ParaVizApp {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     confirm = true;
                 }
+                if is_export {
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        for ext in ["vtp", "vtu", "vti", "vtk", "stl", "obj", "ply", "csv", "glb"]
+                        {
+                            if ui.small_button(format!(".{ext}")).clicked() {
+                                let p = Path::new(path_str.trim());
+                                let stem = p
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("export");
+                                let next = match p.parent() {
+                                    Some(par) if !par.as_os_str().is_empty() => {
+                                        par.join(format!("{stem}.{ext}"))
+                                    }
+                                    _ => PathBuf::from(format!("{stem}.{ext}")),
+                                };
+                                *path_str = next.display().to_string();
+                            }
+                        }
+                    });
+                    if path_str.trim().to_ascii_lowercase().ends_with(".glb") {
+                        ui.checkbox(
+                            &mut self.export_glb_colors,
+                            "Include scalar vertex colors (COLOR_0)",
+                        );
+                    }
+                }
                 ui.horizontal(|ui| {
                     if ui.button("OK").clicked() {
                         confirm = true;
+                    }
+                    if is_open && ui.button("Browse...").clicked() {
+                        switch_to_browser = true;
                     }
                     if ui.button("Cancel").clicked() {
                         keep_open = false;
                     }
                 });
             });
+
+        if switch_to_browser {
+            self.modal = Some(PathModal::FileBrowser(FileBrowserState::new()));
+            return;
+        }
 
         if confirm {
             match modal {
@@ -1470,6 +2263,7 @@ impl ParaVizApp {
                         self.load_path(Path::new(trimmed));
                     }
                 }
+                PathModal::FileBrowser(_) => {}
                 PathModal::LoadState(p) => {
                     let trimmed = p.trim();
                     if !trimmed.is_empty() {
@@ -1488,10 +2282,17 @@ impl ParaVizApp {
                 },
                 PathModal::ExportDataset(p) => {
                     if let Some(id) = self.selected_node {
-                        match self.session.export_dataset(id, p.trim()) {
+                        let trimmed = p.trim();
+                        let res = if trimmed.to_ascii_lowercase().ends_with(".glb") {
+                            self.session
+                                .export_glb(id, trimmed, self.export_glb_colors)
+                        } else {
+                            self.session.export_dataset(id, trimmed)
+                        };
+                        match res {
                             Ok(()) => {
                                 self.error_message = None;
-                                self.status_message = format!("Exported dataset -> {}", p.trim());
+                                self.status_message = format!("Exported dataset -> {trimmed}");
                             }
                             Err(e) => self.error_message = Some(format!("Export failed: {e}")),
                         }
@@ -2395,6 +3196,86 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .add(egui::Slider::new(&mut f.resolution, 2..=1000).text("Resolution"))
                 .changed();
         }
+        FilterConfig::FeatureEdges(f) => {
+            changed |= ui
+                .checkbox(&mut f.boundary_edges, "Boundary Edges")
+                .changed();
+            changed |= ui
+                .checkbox(&mut f.feature_edges, "Feature Edges")
+                .changed();
+            changed |= ui
+                .checkbox(&mut f.non_manifold_edges, "Non-Manifold Edges")
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut f.feature_angle_deg, 0.0..=180.0)
+                        .text("Feature Angle (deg)"),
+                )
+                .changed();
+        }
+        FilterConfig::Connectivity(f) => {
+            changed |= ui
+                .checkbox(&mut f.extract_largest, "Extract Largest Region")
+                .changed();
+        }
+        FilterConfig::Shrink(f) => {
+            changed |= ui
+                .add(egui::Slider::new(&mut f.shrink_factor, 0.0..=1.0).text("Shrink Factor"))
+                .changed();
+        }
+        FilterConfig::CellCenters(f) => {
+            changed |= ui
+                .checkbox(&mut f.vertex_cells, "Generate Vertex Cells")
+                .changed();
+        }
+        FilterConfig::Reflect(f) => {
+            egui::ComboBox::from_label("Reflect Plane")
+                .selected_text(format!("{:?}", f.plane))
+                .show_ui(ui, |ui| {
+                    for plane in [
+                        ReflectPlane::XMin,
+                        ReflectPlane::XMax,
+                        ReflectPlane::YMin,
+                        ReflectPlane::YMax,
+                        ReflectPlane::ZMin,
+                        ReflectPlane::ZMax,
+                        ReflectPlane::CenterX,
+                        ReflectPlane::CenterY,
+                        ReflectPlane::CenterZ,
+                    ] {
+                        if ui
+                            .selectable_value(&mut f.plane, plane, format!("{plane:?}"))
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+            changed |= ui.checkbox(&mut f.copy_input, "Copy Input").changed();
+        }
+        FilterConfig::GenerateNormals(f) => {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut f.feature_angle_deg, 0.0..=180.0)
+                        .text("Feature Angle (deg)"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut f.splitting, "Split Sharp Edges")
+                .changed();
+            changed |= ui.checkbox(&mut f.flip_normals, "Flip Normals").changed();
+            changed |= ui
+                .checkbox(&mut f.consistency, "Enforce Consistency")
+                .changed();
+        }
+        FilterConfig::Elevation(f) => {
+            changed |= drag_vec3(ui, "Low Point", &mut f.low_point, 0.05);
+            changed |= drag_vec3(ui, "High Point", &mut f.high_point, 0.05);
+            ui.horizontal(|ui| {
+                ui.label("Scalar Name:");
+                changed |= ui.text_edit_singleline(&mut f.scalar_name).changed();
+            });
+        }
     }
     changed
 }
@@ -2583,5 +3464,429 @@ fn format_tuple(arr: &DataArray, row: usize) -> String {
     } else {
         let parts: Vec<String> = vals.iter().map(|v| format!("{v:.3}")).collect();
         format!("({})", parts.join(", "))
+    }
+}
+
+fn is_supported_open_file(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "vtk"
+            | "vtp"
+            | "vti"
+            | "vtu"
+            | "vtr"
+            | "vts"
+            | "vtm"
+            | "pvd"
+            | "pvtp"
+            | "pvti"
+            | "pvtu"
+            | "stl"
+            | "obj"
+            | "ply"
+            | "csv"
+            | "tsv"
+            | "json"
+    )
+}
+
+const CHART_PALETTE: [egui::Color32; 6] = [
+    egui::Color32::from_rgb(78, 195, 255),
+    egui::Color32::from_rgb(255, 166, 77),
+    egui::Color32::from_rgb(122, 232, 138),
+    egui::Color32::from_rgb(245, 114, 152),
+    egui::Color32::from_rgb(198, 148, 255),
+    egui::Color32::from_rgb(255, 224, 92),
+];
+
+fn paint_xy_arclength_plot(ui: &mut egui::Ui, pd: &PolyData) {
+    let Some(arc_arr) = pd.point_data.get("ArcLength") else {
+        ui.weak("No ArcLength array found.");
+        return;
+    };
+    let n = arc_arr.num_tuples();
+    if n < 2 {
+        ui.weak("At least 2 points are required for XY line plotting.");
+        return;
+    }
+
+    let x_vals: Vec<f64> = (0..n).map(|i| arc_arr.get_magnitude(i)).collect();
+    let series: Vec<(&str, Vec<f64>, egui::Color32)> = pd
+        .point_data
+        .arrays()
+        .iter()
+        .filter(|a| {
+            a.name != "ArcLength"
+                && a.name != "vtkValidPointMask"
+                && a.num_tuples() == n
+        })
+        .take(CHART_PALETTE.len())
+        .enumerate()
+        .map(|(idx, arr)| {
+            let ys: Vec<f64> = (0..n).map(|i| arr.get_magnitude(i)).collect();
+            (arr.name.as_str(), ys, CHART_PALETTE[idx % CHART_PALETTE.len()])
+        })
+        .collect();
+
+    if series.is_empty() {
+        ui.weak("No scalar arrays to plot against ArcLength.");
+        return;
+    }
+
+    let x_min = x_vals.iter().copied().fold(f64::INFINITY, f64::min);
+    let x_max = x_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (x_min, x_max) = if (x_max - x_min).abs() < 1e-12 {
+        (x_min - 0.5, x_max + 0.5)
+    } else {
+        (x_min, x_max)
+    };
+
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for (_, ys, _) in &series {
+        for &y in ys {
+            if y.is_finite() {
+                y_min = y_min.min(y);
+                y_max = y_max.max(y);
+            }
+        }
+    }
+    if !y_min.is_finite() || !y_max.is_finite() {
+        ui.weak("Plotted arrays contain no finite values.");
+        return;
+    }
+    if (y_max - y_min).abs() < 1e-12 {
+        y_min -= 0.5;
+        y_max += 0.5;
+    } else {
+        let pad = (y_max - y_min) * 0.05;
+        y_min -= pad;
+        y_max += pad;
+    }
+
+    let avail = ui.available_size();
+    let plot_h = avail.y.max(110.0);
+    let plot_w = avail.x.max(200.0);
+    let (outer_rect, resp) =
+        ui.allocate_exact_size(egui::vec2(plot_w, plot_h), egui::Sense::hover());
+    let painter = ui.painter_at(outer_rect);
+
+    let left_pad = 64.0;
+    let right_pad = if outer_rect.width() > 360.0 { 148.0 } else { 14.0 };
+    let top_pad = 10.0;
+    let bottom_pad = 24.0;
+    let plot_rect = egui::Rect::from_min_max(
+        egui::pos2(outer_rect.left() + left_pad, outer_rect.top() + top_pad),
+        egui::pos2(
+            (outer_rect.right() - right_pad).max(outer_rect.left() + left_pad + 40.0),
+            (outer_rect.bottom() - bottom_pad).max(outer_rect.top() + top_pad + 40.0),
+        ),
+    );
+
+    painter.rect_filled(plot_rect, 2.0, egui::Color32::from_rgb(18, 22, 30));
+
+    // Gridlines
+    let grid_color = egui::Color32::from_rgba_unmultiplied(120, 135, 160, 45);
+    for g in 0..=4 {
+        let frac = g as f32 / 4.0;
+        let gx = egui::lerp(plot_rect.left()..=plot_rect.right(), frac);
+        let gy = egui::lerp(plot_rect.bottom()..=plot_rect.top(), frac);
+        painter.line_segment(
+            [
+                egui::pos2(gx, plot_rect.top()),
+                egui::pos2(gx, plot_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, grid_color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), gy),
+                egui::pos2(plot_rect.right(), gy),
+            ],
+            egui::Stroke::new(1.0, grid_color),
+        );
+    }
+
+    painter.rect_stroke(
+        plot_rect,
+        2.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 95, 120)),
+        egui::StrokeKind::Inside,
+    );
+
+    // Axis labels
+    let label_font = egui::FontId::monospace(10.0);
+    let label_col = egui::Color32::from_rgb(200, 210, 225);
+    painter.text(
+        egui::pos2(plot_rect.left() - 6.0, plot_rect.top()),
+        egui::Align2::RIGHT_TOP,
+        format!("{y_max:.3}"),
+        label_font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.left() - 6.0, plot_rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        format!("{:.3}", 0.5 * (y_min + y_max)),
+        label_font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.left() - 6.0, plot_rect.bottom()),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("{y_min:.3}"),
+        label_font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.left(), plot_rect.bottom() + 4.0),
+        egui::Align2::LEFT_TOP,
+        format!("{x_min:.3}"),
+        label_font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.center().x, plot_rect.bottom() + 4.0),
+        egui::Align2::CENTER_TOP,
+        "ArcLength",
+        label_font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.right(), plot_rect.bottom() + 4.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{x_max:.3}"),
+        label_font.clone(),
+        label_col,
+    );
+
+    let to_screen = |x: f64, y: f64| -> egui::Pos2 {
+        let tx = ((x - x_min) / (x_max - x_min)).clamp(0.0, 1.0) as f32;
+        let ty = ((y - y_min) / (y_max - y_min)).clamp(0.0, 1.0) as f32;
+        egui::pos2(
+            egui::lerp(plot_rect.left()..=plot_rect.right(), tx),
+            egui::lerp(plot_rect.bottom()..=plot_rect.top(), ty),
+        )
+    };
+
+    for (_, ys, color) in &series {
+        let pts: Vec<egui::Pos2> = x_vals
+            .iter()
+            .zip(ys.iter())
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|(&x, &y)| to_screen(x, y))
+            .collect();
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.8, *color)));
+        }
+    }
+
+    // Color legend
+    if outer_rect.width() > 360.0 {
+        let lx = plot_rect.right() + 10.0;
+        let mut ly = plot_rect.top() + 4.0;
+        for (name, _, color) in &series {
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(lx, ly + 3.0), egui::vec2(10.0, 8.0)),
+                2.0,
+                *color,
+            );
+            painter.text(
+                egui::pos2(lx + 15.0, ly),
+                egui::Align2::LEFT_TOP,
+                *name,
+                egui::FontId::proportional(11.5),
+                egui::Color32::from_rgb(225, 232, 242),
+            );
+            ly += 17.0;
+        }
+    }
+
+    // Interactive hover crosshair
+    if resp.hovered()
+        && let Some(pointer) = resp.hover_pos()
+        && plot_rect.contains(pointer)
+    {
+        let frac = ((pointer.x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
+        let target_x = x_min + (x_max - x_min) * frac as f64;
+        let nearest = x_vals
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - target_x).abs().total_cmp(&(*b - target_x).abs()))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let sx = to_screen(x_vals[nearest], y_min).x;
+        painter.line_segment(
+            [
+                egui::pos2(sx, plot_rect.top()),
+                egui::pos2(sx, plot_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(235, 240, 250, 150)),
+        );
+
+        let mut tip_lines = vec![format!("ArcLength: {:.4}", x_vals[nearest])];
+        for (name, ys, color) in &series {
+            let yv = ys[nearest];
+            if yv.is_finite() {
+                let pt = to_screen(x_vals[nearest], yv);
+                painter.circle_filled(pt, 3.5, *color);
+                tip_lines.push(format!("{name}: {yv:.4}"));
+            }
+        }
+
+        let tip_galley = painter.layout(
+            tip_lines.join("\n"),
+            label_font,
+            egui::Color32::WHITE,
+            f32::INFINITY,
+        );
+        let tip_pos = egui::pos2(
+            (sx + 10.0).min(plot_rect.right() - tip_galley.size().x - 10.0),
+            (pointer.y - tip_galley.size().y * 0.5)
+                .clamp(plot_rect.top() + 4.0, (plot_rect.bottom() - tip_galley.size().y - 8.0).max(plot_rect.top() + 4.0)),
+        );
+        let tip_bg = egui::Rect::from_min_size(
+            tip_pos - egui::vec2(5.0, 3.0),
+            tip_galley.size() + egui::vec2(10.0, 6.0),
+        );
+        painter.rect_filled(
+            tip_bg,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(12, 16, 24, 215),
+        );
+        painter.galley(tip_pos, tip_galley, egui::Color32::WHITE);
+    }
+}
+
+fn paint_histogram_chart(ui: &mut egui::Ui, hist: &HistogramResult) {
+    let bins = hist.counts.len();
+    if bins == 0 || hist.bin_edges.len() < 2 {
+        ui.weak("Empty histogram.");
+        return;
+    }
+
+    let max_count = hist.counts.iter().copied().max().unwrap_or(1).max(1);
+    let avail = ui.available_size();
+    let plot_h = avail.y.max(100.0);
+    let plot_w = avail.x.max(200.0);
+    let (outer_rect, resp) =
+        ui.allocate_exact_size(egui::vec2(plot_w, plot_h), egui::Sense::hover());
+    let painter = ui.painter_at(outer_rect);
+
+    let left_pad = 54.0;
+    let right_pad = 14.0;
+    let top_pad = 10.0;
+    let bottom_pad = 24.0;
+    let plot_rect = egui::Rect::from_min_max(
+        egui::pos2(outer_rect.left() + left_pad, outer_rect.top() + top_pad),
+        egui::pos2(
+            (outer_rect.right() - right_pad).max(outer_rect.left() + left_pad + 40.0),
+            (outer_rect.bottom() - bottom_pad).max(outer_rect.top() + top_pad + 40.0),
+        ),
+    );
+
+    painter.rect_filled(plot_rect, 2.0, egui::Color32::from_rgb(18, 22, 30));
+
+    let grid_color = egui::Color32::from_rgba_unmultiplied(120, 135, 160, 45);
+    for g in 0..=4 {
+        let frac = g as f32 / 4.0;
+        let gy = egui::lerp(plot_rect.bottom()..=plot_rect.top(), frac);
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), gy),
+                egui::pos2(plot_rect.right(), gy),
+            ],
+            egui::Stroke::new(1.0, grid_color),
+        );
+    }
+
+    let hovered_bin = resp
+        .hover_pos()
+        .filter(|p| plot_rect.contains(*p))
+        .map(|p| {
+            let frac = ((p.x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 0.9999);
+            ((frac * bins as f32).floor() as usize).min(bins - 1)
+        });
+
+    let bin_w = plot_rect.width() / bins as f32;
+    for (i, &cnt) in hist.counts.iter().enumerate() {
+        let x0 = plot_rect.left() + i as f32 * bin_w + 1.0;
+        let x1 = (plot_rect.left() + (i + 1) as f32 * bin_w - 1.0).max(x0 + 1.0);
+        let h_frac = cnt as f32 / max_count as f32;
+        let y0 = egui::lerp(plot_rect.bottom()..=plot_rect.top(), h_frac);
+        let bar_rect =
+            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, plot_rect.bottom()));
+        let col = if hovered_bin == Some(i) {
+            egui::Color32::from_rgb(255, 195, 77)
+        } else {
+            egui::Color32::from_rgb(76, 175, 240)
+        };
+        painter.rect_filled(bar_rect, 1.0, col);
+    }
+
+    painter.rect_stroke(
+        plot_rect,
+        2.0,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 95, 120)),
+        egui::StrokeKind::Inside,
+    );
+
+    let font = egui::FontId::monospace(10.0);
+    let label_col = egui::Color32::from_rgb(200, 210, 225);
+    painter.text(
+        egui::pos2(plot_rect.left() - 6.0, plot_rect.top()),
+        egui::Align2::RIGHT_TOP,
+        format!("{max_count}"),
+        font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.left() - 6.0, plot_rect.bottom()),
+        egui::Align2::RIGHT_BOTTOM,
+        "0",
+        font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.left(), plot_rect.bottom() + 4.0),
+        egui::Align2::LEFT_TOP,
+        format!("{:.3}", hist.bin_edges[0]),
+        font.clone(),
+        label_col,
+    );
+    painter.text(
+        egui::pos2(plot_rect.right(), plot_rect.bottom() + 4.0),
+        egui::Align2::RIGHT_TOP,
+        format!("{:.3}", hist.bin_edges[bins]),
+        font.clone(),
+        label_col,
+    );
+
+    if let Some(bi) = hovered_bin
+        && let Some(pointer) = resp.hover_pos()
+    {
+        let lo = hist.bin_edges[bi];
+        let hi = hist.bin_edges[bi + 1];
+        let cnt = hist.counts[bi];
+        let tip = format!("[{lo:.4}, {hi:.4}]: {cnt}");
+        let galley = painter.layout_no_wrap(tip, font, egui::Color32::WHITE);
+        let tip_pos = egui::pos2(
+            (pointer.x + 10.0).min(plot_rect.right() - galley.size().x - 10.0),
+            (plot_rect.top() + 6.0).max(pointer.y - 24.0),
+        );
+        let tip_bg = egui::Rect::from_min_size(
+            tip_pos - egui::vec2(5.0, 3.0),
+            galley.size() + egui::vec2(10.0, 6.0),
+        );
+        painter.rect_filled(
+            tip_bg,
+            3.0,
+            egui::Color32::from_rgba_unmultiplied(12, 16, 24, 215),
+        );
+        painter.galley(tip_pos, galley, egui::Color32::WHITE);
     }
 }

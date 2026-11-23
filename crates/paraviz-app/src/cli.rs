@@ -20,6 +20,9 @@ pub enum CliCommand {
         cmap: Option<ColorMapPreset>,
         color_by: Option<String>,
         camera: Option<CameraPreset>,
+        edl: bool,
+        edl_strength: Option<f32>,
+        msaa: Option<u32>,
     },
     Info {
         input: PathBuf,
@@ -42,7 +45,7 @@ USAGE:
     paraviz demo <wavelet|vortex|gyroid|volume|superquadric> -o <out.png> [--width W] [--height H]
     paraviz render <input> -o <out.png> [OPTIONS]
     paraviz info <input>
-    paraviz convert <input> <output>
+    paraviz convert <input> <output>   (supports .vtk, .vtp, .vti, .vtu, .stl, .obj, .ply, .csv, .glb)
     paraviz --help | -h
     paraviz --version | -V
 
@@ -55,6 +58,9 @@ RENDER OPTIONS:
                               turbo | fast | rainbow | grayscale | cividis
     --color-by <array>        Point/cell array name (or 'solid')
     --camera <preset>         iso | +x | -x | +y | -y | +z | -z
+    --edl                     Enable Eye-Dome Lighting post-process
+    --edl-strength <val>      Eye-Dome Lighting strength (default: 1.0)
+    --msaa <1|4>              Multisample anti-aliasing sample count (default: 1)
 "
 }
 
@@ -181,6 +187,9 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
     let mut cmap: Option<ColorMapPreset> = None;
     let mut color_by: Option<String> = None;
     let mut camera: Option<CameraPreset> = None;
+    let mut edl = false;
+    let mut edl_strength: Option<f32> = None;
+    let mut msaa: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -224,6 +233,36 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
                 let val = args.get(i).ok_or("Missing value after --camera")?;
                 camera = Some(parse_camera_preset(val)?);
             }
+            "--edl" => {
+                edl = true;
+            }
+            "--edl-strength" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or("Missing value after --edl-strength")?;
+                let s = val
+                    .parse::<f32>()
+                    .map_err(|_| format!("Invalid EDL strength '{val}'"))?;
+                if !s.is_finite() || s < 0.0 {
+                    return Err(format!("EDL strength must be >= 0.0, got '{val}'"));
+                }
+                edl_strength = Some(s);
+                edl = true;
+            }
+            "--msaa" => {
+                i += 1;
+                let val = args.get(i).ok_or("Missing value after --msaa")?;
+                let samples = val
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid MSAA sample count '{val}'"))?;
+                if samples != 1 && samples != 4 {
+                    return Err(format!(
+                        "Unsupported MSAA sample count '{val}'. Expected 1 or 4"
+                    ));
+                }
+                msaa = Some(samples);
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("Unknown option '{flag}' for render subcommand"));
             }
@@ -253,6 +292,9 @@ fn parse_render_args(args: &[String]) -> Result<CliCommand, String> {
         cmap,
         color_by,
         camera,
+        edl,
+        edl_strength,
+        msaa,
     })
 }
 
@@ -409,6 +451,9 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             cmap,
             color_by,
             camera,
+            edl,
+            edl_strength,
+            msaa,
         } => {
             let ext = input
                 .extension()
@@ -450,9 +495,20 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
             };
 
             if ext == "json"
-                && let Some(cam) = camera {
-                    pv.camera_preset(cam)?;
-                }
+                && let Some(cam) = camera
+            {
+                pv.camera_preset(cam)?;
+            }
+
+            if edl {
+                pv.settings.edl_enabled = true;
+            }
+            if let Some(strength) = edl_strength {
+                pv.settings.edl_strength = strength;
+            }
+            if let Some(samples) = msaa {
+                pv.settings.msaa_samples = samples;
+            }
 
             pv.render_png(&output, width, height)?;
             println!(
@@ -471,7 +527,25 @@ pub fn run_headless_command(cmd: CliCommand) -> Result<(), Box<dyn std::error::E
         }
         CliCommand::Convert { input, output } => {
             let ds = read_dataset(&input)?;
-            write_dataset(&output, &ds)?;
+            let out_ext = output
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            if out_ext == "glb" {
+                let poly = match &ds {
+                    DataSet::PolyData(p) => p.clone(),
+                    other => paraviz::filters::extract_surface(other)?,
+                };
+                let scalar_name = poly
+                    .point_data
+                    .active_scalars_array()
+                    .map(|a| a.name.clone());
+                let cmap = scalar_name.as_ref().map(|_| ColorMap::default());
+                paraviz::io::write_glb(&output, &poly, cmap.as_ref(), scalar_name.as_deref())?;
+            } else {
+                write_dataset(&output, &ds)?;
+            }
             println!(
                 "Converted '{}' ({}, {} points, {} cells) -> '{}'",
                 input.display(),
