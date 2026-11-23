@@ -39,6 +39,8 @@ fn main() {
 
     match cmd {
         CliCommand::Gui(initial_path) => {
+            let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+            wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     .with_title("ParaViz — Scientific Visualization Studio (WebGPU)")
@@ -47,6 +49,7 @@ fn main() {
                     .with_icon(Arc::new(build_app_icon()))
                     .with_drag_and_drop(true),
                 renderer: eframe::Renderer::Wgpu,
+                wgpu_options,
                 ..Default::default()
             };
             if let Err(err) = eframe::run_native(

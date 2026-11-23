@@ -430,6 +430,12 @@ impl ParaVizApp {
                         ui.close();
                     }
                 });
+                ui.separator();
+                if ui.button("Rebuild UI Font Atlas").clicked() {
+                    ui.ctx().set_fonts(egui::FontDefinitions::default());
+                    self.theme_applied = false;
+                    ui.close();
+                }
             });
 
             ui.menu_button("Help", |ui| {
