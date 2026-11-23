@@ -1194,3 +1194,100 @@ fn parse_and_validate_glb(bytes: &[u8]) -> (serde_json::Value, Vec<u8>) {
 
     (json, bin)
 }
+
+#[test]
+fn xdmf_variants_and_reader_selection() {
+    use paraviz_io::{detect_reader, read_dataset_with_reader, DatasetReader};
+
+    let dir = TestDir::new("xdmf_variants");
+
+    // 1) X_Y_Z + Mixed topology + CDATA + Vector attribute + Reference
+    let xdmf_mixed = r#"<?xml version="1.0" ?>
+<Xdmf Version="3.0">
+  <Domain>
+    <Grid Name="MixedMesh" GridType="Uniform">
+      <Topology TopologyType="Mixed" NumberOfElements="2">
+        <DataItem Format="XML" Dimensions="9">
+          4 0 1 2  5 1 2 3 4
+        </DataItem>
+      </Topology>
+      <Geometry GeometryType="X_Y_Z">
+        <DataItem Name="X" Format="XML" Dimensions="5"><![CDATA[0 1 0 1 2]]></DataItem>
+        <DataItem Name="Y" Format="XML" Dimensions="5">0 0 1 1 0.5</DataItem>
+        <DataItem Name="Z" Format="XML" Dimensions="5">0 0 0 0 0</DataItem>
+      </Geometry>
+      <Attribute Name="Velocity" AttributeType="Vector" Center="Node">
+        <DataItem Format="XML" Dimensions="5 3">
+          1 0 0  2 0 0  3 0 0  4 0 0  5 0 0
+        </DataItem>
+      </Attribute>
+    </Grid>
+  </Domain>
+</Xdmf>"#;
+    let mixed_path = dir.file("mixed.xmf");
+    fs::write(&mixed_path, xdmf_mixed).unwrap();
+    assert_eq!(detect_reader(&mixed_path).unwrap(), DatasetReader::Xdmf);
+    let (ds, reader) = read_dataset_with_reader(&mixed_path, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Xdmf);
+    let ug = ds.as_unstructured_grid().unwrap();
+    assert_eq!(ug.num_points(), 5);
+    assert_eq!(ug.num_cells(), 2);
+    assert_eq!(ug.cell_types, vec![CellType::Triangle, CellType::Quad]);
+    let vel = ug.point_data.get("Velocity").unwrap();
+    assert_eq!(vel.num_components, 3);
+    assert_eq!(vel.num_tuples(), 5);
+
+    // 2) 3DCoRectMesh + ORIGIN_DXDYDZ -> ImageData
+    let xdmf_img = r#"<?xml version="1.0" ?>
+<Xdmf Version="2.0">
+  <Domain>
+    <Grid Name="Uniform" GridType="Uniform">
+      <Topology TopologyType="3DCoRectMesh" Dimensions="2 3 4"/>
+      <Geometry GeometryType="ORIGIN_DXDYDZ">
+        <DataItem Format="XML" Dimensions="3">1.0 2.0 3.0</DataItem>
+        <DataItem Format="XML" Dimensions="3">0.5 0.25 0.1</DataItem>
+      </Geometry>
+    </Grid>
+  </Domain>
+</Xdmf>"#;
+    let img_path = dir.file("uniform.xdmf");
+    fs::write(&img_path, xdmf_img).unwrap();
+    let img_ds = read_dataset(&img_path).unwrap();
+    let img = img_ds.as_image_data().unwrap();
+    assert_eq!(img.dimensions, [4, 3, 2]);
+    assert_eq!(img.origin, [3.0, 2.0, 1.0]);
+    assert_eq!(img.spacing, [0.1, 0.25, 0.5]);
+
+    // 3) Binary f64 BigEndian + Seek + Reference + .xml extension auto-detected as XDMF
+    let bin_path = dir.file("pts_be.bin");
+    let mut bin_bytes = vec![0xAAu8; 8]; // 8-byte Seek header
+    for val in [0.0f64, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+        bin_bytes.extend_from_slice(&val.to_be_bytes());
+    }
+    fs::write(&bin_path, &bin_bytes).unwrap();
+
+    let xml_xdmf = r#"<?xml version="1.0" ?>
+<Xdmf Version="2.0">
+  <Domain>
+    <DataItem Name="SharedPts" Format="Binary" NumberType="Float" Precision="8" Endian="Big" Seek="8" Dimensions="3 3">pts_be.bin</DataItem>
+    <Grid Name="Tri" GridType="Uniform">
+      <Topology TopologyType="Triangle" NumberOfElements="1">
+        <DataItem Format="XML" Dimensions="1 3">0 1 2</DataItem>
+      </Topology>
+      <Geometry GeometryType="XYZ">
+        <DataItem Reference="XML">/Xdmf/Domain/DataItem[@Name='SharedPts']</DataItem>
+      </Geometry>
+    </Grid>
+  </Domain>
+</Xdmf>"#;
+    let xml_path = dir.file("custom_ext.xml");
+    fs::write(&xml_path, xml_xdmf).unwrap();
+    assert_eq!(detect_reader(&xml_path).unwrap(), DatasetReader::Xdmf);
+    let (forced_ds, forced_reader) =
+        read_dataset_with_reader(&xml_path, DatasetReader::Xdmf).unwrap();
+    assert_eq!(forced_reader, DatasetReader::Xdmf);
+    let tri_ug = forced_ds.as_unstructured_grid().unwrap();
+    assert_eq!(tri_ug.num_points(), 3);
+    assert_eq!(tri_ug.num_cells(), 1);
+    assert_eq!(tri_ug.points[1], [1.0, 0.0, 0.0]);
+}

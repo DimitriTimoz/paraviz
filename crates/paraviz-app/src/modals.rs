@@ -108,7 +108,10 @@ pub struct ExportSpreadsheetModalState {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum AppModal {
-    OpenFile(String),
+    OpenFile {
+        path: String,
+        reader: paraviz::io::DatasetReader,
+    },
     FileBrowser(FileBrowserState),
     RawVolume(RawVolumeModalState),
     GpuContour(GpuContourModalState),
@@ -124,7 +127,7 @@ pub enum AppModal {
 
 pub enum ModalAction {
     None,
-    OpenFile(PathBuf),
+    OpenFile(PathBuf, paraviz::io::DatasetReader),
     LoadState(PathBuf),
     SaveState(PathBuf),
     ExportDataset(PathBuf),
@@ -172,6 +175,18 @@ pub fn is_supported_open_file(path: &Path) -> bool {
             | "pvtp"
             | "pvti"
             | "pvtu"
+            | "pvtr"
+            | "pvts"
+            | "xdmf"
+            | "xmf"
+            | "case"
+            | "nrrd"
+            | "nhdr"
+            | "mhd"
+            | "mha"
+            | "nii"
+            | "gz"
+            | "foam"
             | "stl"
             | "obj"
             | "ply"
@@ -402,7 +417,7 @@ pub fn draw_modal(
                     )));
                     return ModalAction::None;
                 }
-                return ModalAction::OpenFile(path);
+                return ModalAction::OpenFile(path, paraviz::io::DatasetReader::Auto);
             } else if keep_open {
                 *modal_slot = Some(modal);
             }
@@ -896,12 +911,12 @@ pub fn draw_modal(
             return ModalAction::None;
         }
 
-        AppModal::OpenFile(_)
+        AppModal::OpenFile { .. }
         | AppModal::SaveState(_)
         | AppModal::LoadState(_)
         | AppModal::ExportDataset(_) => {
             let title = match &modal {
-                AppModal::OpenFile(_) => "Open Scientific File",
+                AppModal::OpenFile { .. } => "Open Scientific File",
                 AppModal::SaveState(_) => "Save Pipeline State (JSON)",
                 AppModal::LoadState(_) => "Load Pipeline State (JSON)",
                 AppModal::ExportDataset(_) => "Export Active Dataset",
@@ -915,14 +930,14 @@ pub fn draw_modal(
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    let is_open = matches!(modal, AppModal::OpenFile(_));
+                    let is_open = matches!(modal, AppModal::OpenFile { .. });
                     let is_export = matches!(modal, AppModal::ExportDataset(_));
                     let is_save = matches!(modal, AppModal::SaveState(_) | AppModal::ExportDataset(_));
                     let path_str = match &mut modal {
-                        AppModal::OpenFile(s)
-                        | AppModal::SaveState(s)
-                        | AppModal::LoadState(s)
-                        | AppModal::ExportDataset(s) => s,
+                        AppModal::OpenFile { path, .. }
+                        | AppModal::SaveState(path)
+                        | AppModal::LoadState(path)
+                        | AppModal::ExportDataset(path) => path,
                         _ => unreachable!(),
                     };
                     if is_save {
@@ -988,6 +1003,30 @@ pub fn draw_modal(
                             );
                         }
                     }
+                    if let AppModal::OpenFile { path, reader } = &mut modal {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Reader:");
+                            egui::ComboBox::from_id_salt("open_file_reader_combo")
+                                .selected_text(reader.label())
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    for &r in paraviz::io::DatasetReader::ALL {
+                                        ui.selectable_value(reader, r, r.label());
+                                    }
+                                });
+                        });
+                        let trimmed = path.trim();
+                        if !trimmed.is_empty() && *reader == paraviz::io::DatasetReader::Auto {
+                            if let Ok(detected) = paraviz::io::detect_reader(trimmed) {
+                                ui.label(
+                                    egui::RichText::new(format!("Detected: {}", detected.short_name()))
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        }
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -1016,16 +1055,16 @@ pub fn draw_modal(
 
             if confirm {
                 let path_str = match &modal {
-                    AppModal::OpenFile(s)
-                    | AppModal::SaveState(s)
-                    | AppModal::LoadState(s)
-                    | AppModal::ExportDataset(s) => s.trim(),
+                    AppModal::OpenFile { path, .. }
+                    | AppModal::SaveState(path)
+                    | AppModal::LoadState(path)
+                    | AppModal::ExportDataset(path) => path.trim(),
                     _ => "",
                 };
                 if !path_str.is_empty() {
                     let p = PathBuf::from(path_str);
                     action = match &modal {
-                        AppModal::OpenFile(_) => {
+                        AppModal::OpenFile { reader, .. } => {
                             if is_raw_volume_ext(&p) {
                                 *modal_slot =
                                     Some(AppModal::RawVolume(RawVolumeModalState::with_path(
@@ -1033,7 +1072,7 @@ pub fn draw_modal(
                                     )));
                                 return ModalAction::None;
                             }
-                            ModalAction::OpenFile(p)
+                            ModalAction::OpenFile(p, *reader)
                         }
                         AppModal::LoadState(_) => ModalAction::LoadState(p),
                         AppModal::SaveState(_) => ModalAction::SaveState(p),

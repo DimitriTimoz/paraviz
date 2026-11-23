@@ -370,8 +370,59 @@ pub(super) fn edit_source_config(ui: &mut egui::Ui, cfg: &mut SourceConfig) -> b
                 .changed();
             changed |= ui.checkbox(&mut pc.volumetric, "Volumetric").changed();
         }
-        SourceConfig::File(p) | SourceConfig::PvdSeries(p) => {
+        SourceConfig::File(p) => {
             ui.label(format!("Path: {}", p.display()));
+            let detected = paraviz::io::detect_reader(&*p)
+                .map(|r| r.short_name())
+                .unwrap_or("Unknown");
+            ui.label(format!("Active Reader: {detected} (Auto)"));
+            let mut selected = paraviz::io::DatasetReader::Auto;
+            ui.horizontal(|ui| {
+                ui.label("Force Reader:");
+                egui::ComboBox::from_id_salt("node_force_reader_combo")
+                    .selected_text(selected.label())
+                    .show_ui(ui, |ui| {
+                        for &r in paraviz::io::DatasetReader::ALL {
+                            ui.selectable_value(&mut selected, r, r.label());
+                        }
+                    });
+            });
+            if selected != paraviz::io::DatasetReader::Auto {
+                *cfg = SourceConfig::FileWithReader {
+                    path: p.clone(),
+                    reader: selected,
+                };
+                changed = true;
+            }
+        }
+        SourceConfig::FileWithReader { path: p, reader } => {
+            ui.label(format!("Path: {}", p.display()));
+            let active_label = if *reader == paraviz::io::DatasetReader::Auto {
+                paraviz::io::detect_reader(p)
+                    .map(|r| format!("{} (Auto)", r.short_name()))
+                    .unwrap_or_else(|_| "Auto".into())
+            } else {
+                format!("{} (Forced)", reader.short_name())
+            };
+            ui.label(format!("Active Reader: {active_label}"));
+            let prev = *reader;
+            ui.horizontal(|ui| {
+                ui.label("Reader:");
+                egui::ComboBox::from_id_salt("node_reader_combo")
+                    .selected_text(reader.label())
+                    .show_ui(ui, |ui| {
+                        for &r in paraviz::io::DatasetReader::ALL {
+                            ui.selectable_value(reader, r, r.label());
+                        }
+                    });
+            });
+            if *reader != prev {
+                changed = true;
+            }
+        }
+        SourceConfig::PvdSeries(p) => {
+            ui.label(format!("Path: {}", p.display()));
+            ui.label("Active Reader: PVD Time-Series Reader");
         }
     }
     changed

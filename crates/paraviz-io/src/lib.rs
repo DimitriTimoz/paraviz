@@ -41,18 +41,117 @@ pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
 pub use xdmf::read_xdmf;
 
 use paraviz_core::{DataSet, PipelineError, PipelineInfo, Source};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Reads a scientific dataset from `path`, auto-detecting the format by extension and magic bytes.
-pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
+/// Explicit or auto-detected scientific dataset reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum DatasetReader {
+    #[default]
+    Auto,
+    Xdmf,
+    VtkXml,
+    VtkLegacy,
+    EnSight,
+    OpenFoam,
+    Stl,
+    Obj,
+    Ply,
+    Csv,
+    Nifti,
+    Nrrd,
+    MetaImage,
+}
+
+impl DatasetReader {
+    /// All selectable reader options, starting with [`DatasetReader::Auto`].
+    pub const ALL: &'static [DatasetReader] = &[
+        Self::Auto,
+        Self::Xdmf,
+        Self::VtkXml,
+        Self::VtkLegacy,
+        Self::EnSight,
+        Self::OpenFoam,
+        Self::Stl,
+        Self::Obj,
+        Self::Ply,
+        Self::Csv,
+        Self::Nifti,
+        Self::Nrrd,
+        Self::MetaImage,
+    ];
+
+    /// Human-readable reader name shown in the UI and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto-detect",
+            Self::Xdmf => "XDMF Reader (.xdmf, .xmf)",
+            Self::VtkXml => "VTK XML Reader (.vtp, .vtu, .vti, .vtr, .vts, .vtm)",
+            Self::VtkLegacy => "VTK Legacy Reader (.vtk)",
+            Self::EnSight => "EnSight Gold Reader (.case)",
+            Self::OpenFoam => "OpenFOAM Reader (.foam, polyMesh)",
+            Self::Stl => "STL Mesh Reader (.stl)",
+            Self::Obj => "Wavefront OBJ Reader (.obj)",
+            Self::Ply => "PLY Mesh Reader (.ply)",
+            Self::Csv => "CSV / TSV Table Reader (.csv, .tsv)",
+            Self::Nifti => "NIfTI Volume Reader (.nii, .nii.gz)",
+            Self::Nrrd => "NRRD Volume Reader (.nrrd, .nhdr)",
+            Self::MetaImage => "MetaImage Volume Reader (.mhd, .mha)",
+        }
+    }
+
+    /// Short reader name for compact badges and status messages.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Xdmf => "XDMF Reader",
+            Self::VtkXml => "VTK XML Reader",
+            Self::VtkLegacy => "VTK Legacy Reader",
+            Self::EnSight => "EnSight Gold Reader",
+            Self::OpenFoam => "OpenFOAM Reader",
+            Self::Stl => "STL Reader",
+            Self::Obj => "OBJ Reader",
+            Self::Ply => "PLY Reader",
+            Self::Csv => "CSV/TSV Reader",
+            Self::Nifti => "NIfTI Reader",
+            Self::Nrrd => "NRRD Reader",
+            Self::MetaImage => "MetaImage Reader",
+        }
+    }
+
+    /// Parses a reader name (case-insensitive) for CLI / API usage.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "auto" | "auto-detect" => Some(Self::Auto),
+            "xdmf" | "xmf" => Some(Self::Xdmf),
+            "vtkxml" | "vtk-xml" | "vtk_xml" | "vtp" | "vtu" | "vti" | "vtr" | "vts" | "vtm" => {
+                Some(Self::VtkXml)
+            }
+            "vtk" | "vtklegacy" | "vtk-legacy" | "vtk_legacy" => Some(Self::VtkLegacy),
+            "ensight" | "case" => Some(Self::EnSight),
+            "openfoam" | "foam" => Some(Self::OpenFoam),
+            "stl" => Some(Self::Stl),
+            "obj" => Some(Self::Obj),
+            "ply" => Some(Self::Ply),
+            "csv" | "tsv" => Some(Self::Csv),
+            "nifti" | "nii" => Some(Self::Nifti),
+            "nrrd" | "nhdr" => Some(Self::Nrrd),
+            "metaimage" | "mhd" | "mha" => Some(Self::MetaImage),
+            _ => None,
+        }
+    }
+}
+
+/// Detects which [`DatasetReader`] would be used for `path` without loading the full dataset.
+pub fn detect_reader(path: impl AsRef<Path>) -> Result<DatasetReader> {
     let path = path.as_ref();
     if !path.exists() {
         return Err(IoError::MissingFile(path.to_path_buf()));
     }
     if path.is_dir() && path.join("constant").join("polyMesh").is_dir() {
-        return openfoam::read_openfoam(path);
+        return Ok(DatasetReader::OpenFoam);
     }
 
     let ext = path
@@ -67,41 +166,43 @@ pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
 
     let full_lower = path.to_string_lossy().to_ascii_lowercase();
     if full_lower.ends_with(".nii.gz") || ext == "nii" {
-        return Ok(DataSet::ImageData(nifti::read_nifti(path)?));
+        return Ok(DatasetReader::Nifti);
     }
 
     match ext.as_str() {
         "vtk" => {
             if magic_str.starts_with('<') {
-                vtk_xml::read_vtk_xml(path)
+                Ok(DatasetReader::VtkXml)
             } else {
-                vtk_legacy::read_vtk_legacy(path)
+                Ok(DatasetReader::VtkLegacy)
             }
         }
         "vtp" | "vti" | "vtu" | "vtr" | "vts" | "vtm" | "pvd" | "pvtp" | "pvti" | "pvtu"
-        | "pvtr" | "pvts" => vtk_xml::read_vtk_xml(path),
-        "nrrd" | "nhdr" => Ok(DataSet::ImageData(medical_volume::read_nrrd(path)?)),
-        "mhd" | "mha" => Ok(DataSet::ImageData(medical_volume::read_metaimage(path)?)),
-        "case" => ensight::read_ensight_case(path),
-        "xdmf" | "xmf" => xdmf::read_xdmf(path),
-        "foam" => openfoam::read_openfoam(path),
-        "stl" => Ok(DataSet::PolyData(mesh::read_stl(path)?)),
-        "obj" => Ok(DataSet::PolyData(mesh::read_obj(path)?)),
-        "ply" => Ok(DataSet::PolyData(mesh::read_ply(path)?)),
-        "csv" | "tsv" => Ok(DataSet::PolyData(csv::read_csv(path)?)),
+        | "pvtr" | "pvts" => Ok(DatasetReader::VtkXml),
+        "nrrd" | "nhdr" => Ok(DatasetReader::Nrrd),
+        "mhd" | "mha" => Ok(DatasetReader::MetaImage),
+        "case" => Ok(DatasetReader::EnSight),
+        "xdmf" | "xmf" => Ok(DatasetReader::Xdmf),
+        "foam" => Ok(DatasetReader::OpenFoam),
+        "stl" => Ok(DatasetReader::Stl),
+        "obj" => Ok(DatasetReader::Obj),
+        "ply" => Ok(DatasetReader::Ply),
+        "csv" | "tsv" => Ok(DatasetReader::Csv),
         _ => {
             if path.file_name().and_then(|s| s.to_str()) == Some("controlDict") {
-                openfoam::read_openfoam(path)
+                Ok(DatasetReader::OpenFoam)
             } else if magic_str.starts_with("# vtk DataFile Version") {
-                vtk_legacy::read_vtk_legacy(path)
+                Ok(DatasetReader::VtkLegacy)
+            } else if magic_str.contains("<Xdmf") || magic_str.contains("<xdmf") {
+                Ok(DatasetReader::Xdmf)
             } else if magic_str.starts_with("<?xml") || magic_str.starts_with("<VTKFile") {
-                vtk_xml::read_vtk_xml(path)
+                Ok(DatasetReader::VtkXml)
             } else if magic_str.starts_with("NRRD") {
-                Ok(DataSet::ImageData(medical_volume::read_nrrd(path)?))
+                Ok(DatasetReader::Nrrd)
             } else if magic_str.starts_with("ply\n") || magic_str.starts_with("ply\r\n") {
-                Ok(DataSet::PolyData(mesh::read_ply(path)?))
+                Ok(DatasetReader::Ply)
             } else if magic_str.starts_with("solid") && magic_str.contains("facet") {
-                Ok(DataSet::PolyData(mesh::read_stl(path)?))
+                Ok(DatasetReader::Stl)
             } else {
                 Err(IoError::UnsupportedFormat(format!(
                     "Cannot detect format for '{}'",
@@ -110,6 +211,43 @@ pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
             }
         }
     }
+}
+
+/// Reads a scientific dataset from `path` using `reader` (or auto-detecting if [`DatasetReader::Auto`]),
+/// returning both the loaded [`DataSet`] and the concrete [`DatasetReader`] that was used.
+pub fn read_dataset_with_reader(
+    path: impl AsRef<Path>,
+    reader: DatasetReader,
+) -> Result<(DataSet, DatasetReader)> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Err(IoError::MissingFile(path.to_path_buf()));
+    }
+    let resolved = match reader {
+        DatasetReader::Auto => detect_reader(path)?,
+        explicit => explicit,
+    };
+    let ds = match resolved {
+        DatasetReader::Auto => unreachable!(),
+        DatasetReader::Xdmf => xdmf::read_xdmf(path)?,
+        DatasetReader::VtkXml => vtk_xml::read_vtk_xml(path)?,
+        DatasetReader::VtkLegacy => vtk_legacy::read_vtk_legacy(path)?,
+        DatasetReader::EnSight => ensight::read_ensight_case(path)?,
+        DatasetReader::OpenFoam => openfoam::read_openfoam(path)?,
+        DatasetReader::Stl => DataSet::PolyData(mesh::read_stl(path)?),
+        DatasetReader::Obj => DataSet::PolyData(mesh::read_obj(path)?),
+        DatasetReader::Ply => DataSet::PolyData(mesh::read_ply(path)?),
+        DatasetReader::Csv => DataSet::PolyData(csv::read_csv(path)?),
+        DatasetReader::Nifti => DataSet::ImageData(nifti::read_nifti(path)?),
+        DatasetReader::Nrrd => DataSet::ImageData(medical_volume::read_nrrd(path)?),
+        DatasetReader::MetaImage => DataSet::ImageData(medical_volume::read_metaimage(path)?),
+    };
+    Ok((ds, resolved))
+}
+
+/// Reads a scientific dataset from `path`, auto-detecting the format by extension and magic bytes.
+pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
+    read_dataset_with_reader(path, DatasetReader::Auto).map(|(ds, _)| ds)
 }
 
 /// Writes `dataset` to `path`, dispatching by file extension.
@@ -212,23 +350,38 @@ fn read_magic_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
 pub struct VtkFileSource {
     path: PathBuf,
     label: String,
+    reader: DatasetReader,
 }
 
 impl VtkFileSource {
-    /// Creates a new [`VtkFileSource`] pointing at `path`.
+    /// Creates a new [`VtkFileSource`] pointing at `path` with auto-detected reader.
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_reader(path, DatasetReader::Auto)
+    }
+
+    /// Creates a new [`VtkFileSource`] pointing at `path` using an explicit [`DatasetReader`].
+    pub fn with_reader(path: impl Into<PathBuf>, reader: DatasetReader) -> Self {
         let path = path.into();
         let label = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("VtkFileSource")
             .to_string();
-        Self { path, label }
+        Self {
+            path,
+            label,
+            reader,
+        }
     }
 
     /// Returns the underlying file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the configured [`DatasetReader`] (`Auto` or explicit).
+    pub fn reader(&self) -> DatasetReader {
+        self.reader
     }
 }
 
@@ -242,7 +395,9 @@ impl Source for VtkFileSource {
     }
 
     fn execute(&self, _time: f64) -> std::result::Result<DataSet, PipelineError> {
-        read_dataset(&self.path).map_err(|e| PipelineError::ExecutionFailed(e.to_string()))
+        read_dataset_with_reader(&self.path, self.reader)
+            .map(|(ds, _)| ds)
+            .map_err(|e| PipelineError::ExecutionFailed(e.to_string()))
     }
 }
 

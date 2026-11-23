@@ -418,7 +418,11 @@ impl ParaVizApp {
     }
 
     fn load_path(&mut self, path: &Path) {
-        if is_raw_volume_ext(path) {
+        self.load_path_with_reader(path, paraviz::io::DatasetReader::Auto);
+    }
+
+    fn load_path_with_reader(&mut self, path: &Path, reader: paraviz::io::DatasetReader) {
+        if is_raw_volume_ext(path) && reader == paraviz::io::DatasetReader::Auto {
             self.modal = Some(AppModal::RawVolume(RawVolumeModalState::with_path(
                 path.display().to_string(),
             )));
@@ -461,7 +465,11 @@ impl ParaVizApp {
         }
 
         let is_first = self.session.nodes().is_empty();
-        match self.session.open(path) {
+        let used_reader = match reader {
+            paraviz::io::DatasetReader::Auto => paraviz::io::detect_reader(path).ok(),
+            explicit => Some(explicit),
+        };
+        match self.session.open_with_reader(path, reader) {
             Ok(id) => {
                 let _ = self.session.evaluate(id);
                 self.session.show(id);
@@ -475,10 +483,32 @@ impl ParaVizApp {
                 self.error_message = None;
                 self.invalidate_viewport();
                 self.push_recent_file(path);
-                self.status_message = format!("Opened '{}'", path.display());
+                let reader_desc = used_reader
+                    .map(|r| r.short_name())
+                    .unwrap_or("Auto");
+                let counts_desc = self
+                    .session
+                    .node(id)
+                    .ok()
+                    .and_then(|n| n.dataset())
+                    .map(|ds| format!(" ({} pts, {} cells)", ds.num_points(), ds.num_cells()))
+                    .unwrap_or_default();
+                self.status_message = format!(
+                    "Opened '{}' via {}{}",
+                    path.display(),
+                    reader_desc,
+                    counts_desc
+                );
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to open '{}': {e}", path.display()));
+                let reader_desc = used_reader
+                    .map(|r| format!(" ({})", r.short_name()))
+                    .unwrap_or_default();
+                self.error_message = Some(format!(
+                    "Failed to open '{}'{}: {e}",
+                    path.display(),
+                    reader_desc
+                ));
             }
         }
     }
@@ -1251,7 +1281,8 @@ impl ParaVizApp {
     pub(super) fn execute_modal_action(&mut self, action: ModalAction) {
         match action {
             ModalAction::None => {}
-            ModalAction::OpenFile(p) | ModalAction::LoadState(p) => self.load_path(&p),
+            ModalAction::OpenFile(p, reader) => self.load_path_with_reader(&p, reader),
+            ModalAction::LoadState(p) => self.load_path(&p),
             ModalAction::ImportRawVolume(rv) => self.import_raw_volume(rv),
             ModalAction::RunGpuContour {
                 node_id,

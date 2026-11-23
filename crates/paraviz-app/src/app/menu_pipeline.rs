@@ -24,8 +24,11 @@ impl ParaVizApp {
                     #[cfg(target_arch = "wasm32")]
                     spawn_wasm_open_dialog(self.pending_file_loads.clone(), false);
                 }
-                if ui.button("Open File by Path...").clicked() {
-                    self.modal = Some(AppModal::OpenFile(String::new()));
+                if ui.button("Open File by Path / With Reader...").clicked() {
+                    self.modal = Some(AppModal::OpenFile {
+                        path: String::new(),
+                        reader: paraviz::io::DatasetReader::Auto,
+                    });
                     ui.close();
                 }
                 if ui.button("Import Raw 3D Volume (.raw)...").clicked() {

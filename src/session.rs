@@ -17,7 +17,7 @@ use paraviz_filters::{
 };
 use paraviz_io::{
     read_dataset, read_raw_volume, write_animated_gif, write_dataset, write_glb,
-    write_html_viewer, IoError, PvdSeriesSource, RawVolumeDescriptor, VtkFileSource,
+    write_html_viewer, DatasetReader, IoError, PvdSeriesSource, RawVolumeDescriptor, VtkFileSource,
 };
 use paraviz_render::{
     pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,
@@ -100,6 +100,10 @@ pub enum SourceConfig {
     Gyroid(GyroidSource),
     PointCloud(PointCloudSource),
     File(PathBuf),
+    FileWithReader {
+        path: PathBuf,
+        reader: DatasetReader,
+    },
     PvdSeries(PathBuf),
 }
 
@@ -121,7 +125,7 @@ impl SourceConfig {
             Self::Superquadric(_) => "Superquadric".into(),
             Self::Gyroid(_) => "Gyroid".into(),
             Self::PointCloud(_) => "PointCloud".into(),
-            Self::File(p) | Self::PvdSeries(p) => p
+            Self::File(p) | Self::FileWithReader { path: p, .. } | Self::PvdSeries(p) => p
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Dataset")
@@ -147,6 +151,9 @@ impl SourceConfig {
             Self::Gyroid(s) => Box::new(s.clone()),
             Self::PointCloud(s) => Box::new(s.clone()),
             Self::File(p) => Box::new(VtkFileSource::new(p)),
+            Self::FileWithReader { path, reader } => {
+                Box::new(VtkFileSource::with_reader(path, *reader))
+            }
             Self::PvdSeries(p) => Box::new(PvdSeriesSource::new(p)?),
         };
         Ok(src)
@@ -558,18 +565,29 @@ impl ParaViz {
         self.add_source(name, src)
     }
 
-    /// Opens a scientific file (`.vtk`, `.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.stl`, `.obj`, `.ply`, `.csv`).
+    /// Opens a scientific file (`.vtk`, `.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.xdmf`, `.xmf`, `.stl`, `.obj`, `.ply`, `.csv`, etc.).
     pub fn open(&mut self, path: impl AsRef<Path>) -> Result<NodeId, SessionError> {
+        self.open_with_reader(path, DatasetReader::Auto)
+    }
+
+    /// Opens a scientific file using an explicit [`DatasetReader`] (or [`DatasetReader::Auto`]).
+    pub fn open_with_reader(
+        &mut self,
+        path: impl AsRef<Path>,
+        reader: DatasetReader,
+    ) -> Result<NodeId, SessionError> {
         let path = path.as_ref().to_path_buf();
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        let cfg = if ext == "pvd" {
+        let cfg = if ext == "pvd" && reader == DatasetReader::Auto {
             SourceConfig::PvdSeries(path)
-        } else {
+        } else if reader == DatasetReader::Auto {
             SourceConfig::File(path)
+        } else {
+            SourceConfig::FileWithReader { path, reader }
         };
         let label = cfg.default_label();
         self.add_source_cfg(label, cfg)
