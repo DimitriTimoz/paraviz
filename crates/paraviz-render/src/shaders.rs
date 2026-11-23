@@ -126,7 +126,8 @@ fn map_scalar(s: f32) -> vec4<f32> {
     }
     var t: f32 = 0.5;
     let span = u.scalar_max - u.scalar_min;
-    if (abs(span) >= 1e-12) {
+    let eps = max(1e-6, 1e-5 * max(abs(u.scalar_min), abs(u.scalar_max)));
+    if (abs(span) > eps) {
         if (u.log_scale != 0u && u.scalar_min > 0.0 && u.scalar_max > 0.0 && s > 0.0) {
             t = (log(s) - log(u.scalar_min)) / (log(u.scalar_max) - log(u.scalar_min));
         } else {
@@ -315,7 +316,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         } else {
             var t: f32 = 0.5;
             let span = u.scalar_max - u.scalar_min;
-            if (abs(span) >= 1e-12) {
+            let eps = max(1e-6, 1e-5 * max(abs(u.scalar_min), abs(u.scalar_max)));
+            if (abs(span) > eps) {
                 if (u.log_scale != 0u && u.scalar_min > 0.0 && u.scalar_max > 0.0 && s > 0.0) {
                     t = (log(s) - log(u.scalar_min)) / (log(u.scalar_max) - log(u.scalar_min));
                 } else {
@@ -399,7 +401,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         } else {
             var t: f32 = 0.5;
             let span = u.scalar_max - u.scalar_min;
-            if (abs(span) >= 1e-12) {
+            let eps = max(1e-6, 1e-5 * max(abs(u.scalar_min), abs(u.scalar_max)));
+            if (abs(span) > eps) {
                 if (u.log_scale != 0u && u.scalar_min > 0.0 && u.scalar_max > 0.0 && s > 0.0) {
                     t = (log(s) - log(u.scalar_min)) / (log(u.scalar_max) - log(u.scalar_min));
                 } else {
@@ -554,7 +557,8 @@ fn sample_tf(val: f32) -> vec4<f32> {
     }
     var t: f32 = 0.5;
     let span = u.scalar_max - u.scalar_min;
-    if (abs(span) >= 1e-12) {
+    let eps = max(1e-6, 1e-5 * max(abs(u.scalar_min), abs(u.scalar_max)));
+    if (abs(span) > eps) {
         if (u.log_scale != 0u && u.scalar_min > 0.0 && u.scalar_max > 0.0 && val > 0.0) {
             t = (log(val) - log(u.scalar_min)) / (log(u.scalar_max) - log(u.scalar_min));
         } else {
