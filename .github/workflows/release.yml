@@ -1,0 +1,267 @@
+name: Release & Multi-Platform Packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag / version suffix (optional, defaults to ref name)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Linux (${{ matrix.arch }}) — AppImage, .deb & .tar.gz
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            deb_arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build & AppImage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            librsvg2-bin desktop-file-utils dpkg-dev curl file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version tag
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VER="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "deb_ver=${VER//[^0-9A-Za-z.+~-]/-}" >> "$GITHUB_OUTPUT"
+
+      - name: Build paraviz-app (release)
+        run: cargo build --release -p paraviz-app --target ${{ matrix.target }}
+
+      - name: Strip binary & package .tar.gz
+        run: |
+          mkdir -p dist stage-tar
+          BIN="target/${{ matrix.target }}/release/paraviz"
+          strip "$BIN" || true
+          cp "$BIN" stage-tar/paraviz
+          cp README.md stage-tar/
+          cp -r docs stage-tar/
+          tar -czf "dist/paraviz-${{ steps.meta.outputs.tag }}-linux-${{ matrix.arch }}.tar.gz" -C stage-tar .
+
+      - name: Build AppImage
+        run: |
+          chmod +x packaging/linux/build-appimage.sh
+          ./packaging/linux/build-appimage.sh \
+            "target/${{ matrix.target }}/release/paraviz" \
+            "${{ matrix.arch }}" \
+            "dist/ParaViz-${{ steps.meta.outputs.tag }}-${{ matrix.arch }}.AppImage"
+
+      - name: Build Debian .deb package
+        run: |
+          DEB_DIR="target/deb-pkg"
+          rm -rf "$DEB_DIR"
+          mkdir -p \
+            "$DEB_DIR/DEBIAN" \
+            "$DEB_DIR/usr/bin" \
+            "$DEB_DIR/usr/share/applications" \
+            "$DEB_DIR/usr/share/icons/hicolor/scalable/apps" \
+            "$DEB_DIR/usr/share/metainfo"
+          cp "target/${{ matrix.target }}/release/paraviz" "$DEB_DIR/usr/bin/paraviz"
+          chmod 755 "$DEB_DIR/usr/bin/paraviz"
+          cp packaging/linux/io.github.dimitritimoz.paraviz.desktop "$DEB_DIR/usr/share/applications/"
+          cp assets/icon.svg "$DEB_DIR/usr/share/icons/hicolor/scalable/apps/paraviz.svg"
+          cp packaging/linux/io.github.dimitritimoz.paraviz.appdata.xml "$DEB_DIR/usr/share/metainfo/"
+          cat > "$DEB_DIR/DEBIAN/control" <<EOF
+          Package: paraviz
+          Version: ${{ steps.meta.outputs.deb_ver }}
+          Section: science
+          Priority: optional
+          Architecture: ${{ matrix.deb_arch }}
+          Maintainer: ParaViz Contributors <https://github.com/DimitriTimoz/paraviz/issues>
+          Depends: libc6, libwayland-client0, libx11-6, libxkbcommon0
+          Recommends: libvulkan1
+          Description: Scientific Visualization Studio (Rust + WebGPU)
+           Kitware ParaView rewritten in Rust using WebGPU (wgpu) with GUI and headless CLI.
+          EOF
+          dpkg-deb --build --root-owner-group "$DEB_DIR" \
+            "dist/paraviz-${{ steps.meta.outputs.tag }}-linux-${{ matrix.deb_arch }}.deb"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paraviz-linux-${{ matrix.arch }}
+          path: dist/*
+
+  build-macos:
+    name: macOS Universal (.app, .dmg & .tar.gz)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version tag
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build arm64 & x86_64 release binaries
+        run: |
+          cargo build --release -p paraviz-app --target aarch64-apple-darwin
+          cargo build --release -p paraviz-app --target x86_64-apple-darwin
+
+      - name: Create Universal binary, .app bundle, .dmg & .tar.gz
+        run: |
+          mkdir -p dist stage-mac target/universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/paraviz \
+            target/x86_64-apple-darwin/release/paraviz \
+            -output target/universal/paraviz
+          chmod +x target/universal/paraviz
+
+          # CLI tarball
+          cp target/universal/paraviz stage-mac/paraviz
+          cp README.md stage-mac/
+          cp -r docs stage-mac/
+          tar -czf "dist/paraviz-${{ steps.meta.outputs.tag }}-macos-universal.tar.gz" -C stage-mac .
+
+          # .app bundle
+          APP="target/universal/ParaViz.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/universal/paraviz "$APP/Contents/MacOS/paraviz"
+          cp assets/icon.svg "$APP/Contents/Resources/icon.svg"
+          printf 'APPL????' > "$APP/Contents/PkgInfo"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>ParaViz</string>
+            <key>CFBundleDisplayName</key><string>ParaViz</string>
+            <key>CFBundleIdentifier</key><string>io.github.dimitritimoz.paraviz</string>
+            <key>CFBundleVersion</key><string>${{ steps.meta.outputs.tag }}</string>
+            <key>CFBundleShortVersionString</key><string>${{ steps.meta.outputs.tag }}</string>
+            <key>CFBundleExecutable</key><string>paraviz</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # .dmg image
+          mkdir -p target/dmg-src
+          cp -R "$APP" target/dmg-src/
+          ln -sfn /Applications target/dmg-src/Applications
+          hdiutil create -volname "ParaViz" -srcfolder target/dmg-src -ov -format UDZO \
+            "dist/ParaViz-${{ steps.meta.outputs.tag }}-macos-universal.dmg"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paraviz-macos-universal
+          path: dist/*
+
+  build-windows:
+    name: Windows (${{ matrix.arch }}) — .zip
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "${{ github.ref_name }}" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build paraviz-app (release)
+        run: cargo build --release -p paraviz-app --target ${{ matrix.target }}
+
+      - name: Package Windows .zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, stage-win | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/paraviz.exe" stage-win/paraviz.exe
+          Copy-Item README.md stage-win/README.md
+          Copy-Item -Recurse docs stage-win/docs
+          Compress-Archive -Path stage-win/* -DestinationPath "dist/paraviz-${{ steps.meta.outputs.tag }}-windows-${{ matrix.arch }}.zip" -Force
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paraviz-windows-${{ matrix.arch }}
+          path: dist/*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-macos, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-files
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-files/*

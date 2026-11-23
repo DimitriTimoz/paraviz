@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.dimitritimoz.paraviz</id>
+  <name>ParaViz</name>
+  <summary>Scientific Visualization Studio powered by Rust and WebGPU</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <description>
+    <p>
+      ParaViz is a modern scientific visualization studio and headless renderer
+      inspired by Kitware ParaView, built in Rust on top of WebGPU (wgpu) and egui.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/DimitriTimoz/paraviz</url>
+  <url type="bugtracker">https://github.com/DimitriTimoz/paraviz/issues</url>
+  <launchable type="desktop-id">io.github.dimitritimoz.paraviz.desktop</launchable>
+  <provides>
+    <binary>paraviz</binary>
+  </provides>
+</component>

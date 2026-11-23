@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ParaViz
+GenericName=Scientific Visualization Studio
+Comment=ParaView rewritten in Rust using WebGPU (wgpu)
+Exec=paraviz %F
+Icon=paraviz
+Terminal=false
+Categories=Science;DataVisualization;Graphics;Engineering;
+Keywords=paraview;vtk;visualization;webgpu;mesh;volume;cfd;
+MimeType=application/x-vtk;model/stl;model/obj;model/gltf-binary;
+StartupNotify=true
