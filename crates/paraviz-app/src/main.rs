@@ -3,6 +3,8 @@ mod charts;
 mod cli;
 mod modals;
 mod theme;
+#[cfg(not(target_arch = "wasm32"))]
+mod updater;
 
 #[cfg(not(target_arch = "wasm32"))]
 use cli::{parse_args, run_headless_command, CliCommand};

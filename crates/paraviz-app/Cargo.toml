@@ -1,6 +1,6 @@
 [package]
 name = "paraviz-app"
-version.workspace = true
+version = "0.2.6"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -13,7 +13,7 @@ readme = "../../README.md"
 description = "Interactive ParaView-style WebGPU desktop application and headless CLI renderer for ParaViz"
 
 [dependencies]
-paraviz = { path = "../..", version = "0.2.5" }
+paraviz = { path = "../..", version = "0.2.6" }
 paraviz-core.workspace = true
 paraviz-sources.workspace = true
 paraviz-filters.workspace = true
@@ -28,8 +28,18 @@ env_logger.workspace = true
 log.workspace = true
 png.workspace = true
 rfd.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 web-time.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flate2.workspace = true
+self-replace = "1.5"
+semver = "1.0"
+sha2 = "0.11"
+tar = "0.4"
+ureq = { version = "3.5", default-features = false, features = ["rustls", "gzip"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"

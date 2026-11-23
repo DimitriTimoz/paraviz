@@ -481,6 +481,15 @@ impl ParaVizApp {
                     self.modal = Some(AppModal::DemoGallery);
                     ui.close();
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    ui.separator();
+                    if ui.button("Check for Updates...").clicked() {
+                        self.trigger_update_check(true);
+                        self.show_update_modal = true;
+                        ui.close();
+                    }
+                }
                 ui.separator();
                 if ui
                     .button("Report an Issue / Bug...")

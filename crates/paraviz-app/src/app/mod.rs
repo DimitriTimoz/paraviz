@@ -12,6 +12,11 @@ pub(crate) use crate::theme::{
     apply_theme, node_badge_style, paint_logo_badge, palette, pill_badge, section_card,
     visibility_eye_button, UiTheme, ViewportBgPreset,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::updater::{
+    current_version, spawn_check_updates, spawn_install_update, InstallKind, ReleaseUpdateInfo,
+    UpdateEvent, UpdateStatus, RELEASES_PAGE_URL,
+};
 use paraviz::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -321,6 +326,16 @@ pub struct ParaVizApp {
     worker_tx: mpsc::Sender<WorkerCompletion>,
     #[cfg(not(target_arch = "wasm32"))]
     worker_rx: mpsc::Receiver<WorkerCompletion>,
+    #[cfg(not(target_arch = "wasm32"))]
+    update_status: UpdateStatus,
+    #[cfg(not(target_arch = "wasm32"))]
+    update_check_manual: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    show_update_modal: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    update_tx: mpsc::Sender<UpdateEvent>,
+    #[cfg(not(target_arch = "wasm32"))]
+    update_rx: mpsc::Receiver<UpdateEvent>,
 }
 
 impl ParaVizApp {
@@ -344,6 +359,8 @@ impl ParaVizApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         let (worker_tx, worker_rx) = mpsc::channel();
+        #[cfg(not(target_arch = "wasm32"))]
+        let (update_tx, update_rx) = mpsc::channel();
 
         let mut app = Self {
             session: ParaViz::new(),
@@ -379,7 +396,7 @@ impl ParaVizApp {
             spreadsheet_filter: String::new(),
             spreadsheet_scroll_to_top: false,
             show_scalar_bar: true,
-            show_widgets: true,
+            show_widgets: false,
             viewport_mode: ViewportMode::Orbit,
             last_pick: None,
             picked_highlight: None,
@@ -411,12 +428,25 @@ impl ParaVizApp {
             worker_tx,
             #[cfg(not(target_arch = "wasm32"))]
             worker_rx,
+            #[cfg(not(target_arch = "wasm32"))]
+            update_status: UpdateStatus::Idle,
+            #[cfg(not(target_arch = "wasm32"))]
+            update_check_manual: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            show_update_modal: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            update_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            update_rx,
         };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        app.trigger_update_check(false);
 
         if let Some(path) = initial_path {
             app.load_path(&path);
         } else {
-            app.load_demo(DemoPreset::WaveletContour);
+            app.load_demo(DemoPreset::VortexStreamlines);
         }
 
         app
@@ -2247,7 +2277,13 @@ impl eframe::App for ParaVizApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.poll_worker_jobs();
-            if self.active_job.is_some() {
+            self.poll_update_events();
+            if self.active_job.is_some()
+                || matches!(
+                    self.update_status,
+                    UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+                )
+            {
                 ui.ctx().request_repaint();
             }
         }
@@ -2391,6 +2427,46 @@ impl eframe::App for ParaVizApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    match &self.update_status {
+                        UpdateStatus::Available(info) => {
+                            if ui
+                                .small_button(
+                                    egui::RichText::new(format!("Update v{}", info.version))
+                                        .color(pal.accent)
+                                        .strong(),
+                                )
+                                .on_hover_text("Click to review and install the new ParaViz release")
+                                .clicked()
+                            {
+                                self.show_update_modal = true;
+                            }
+                            ui.separator();
+                        }
+                        UpdateStatus::Downloading { version, .. } => {
+                            ui.label(
+                                egui::RichText::new(format!("Updating to v{version}..."))
+                                    .size(11.0)
+                                    .color(pal.accent),
+                            );
+                            ui.spinner();
+                            ui.separator();
+                        }
+                        UpdateStatus::Installed { version } => {
+                            if ui
+                                .small_button(
+                                    egui::RichText::new(format!("Restart for v{version}"))
+                                        .color(pal.success)
+                                        .strong(),
+                                )
+                                .clicked()
+                            {
+                                self.show_update_modal = true;
+                            }
+                            ui.separator();
+                        }
+                        _ => {}
+                    }
                     let total_mem: usize = self
                         .session
                         .nodes()
@@ -2427,6 +2503,234 @@ impl eframe::App for ParaVizApp {
         });
 
         self.handle_modals(ui.ctx());
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.draw_update_modal(ui.ctx());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ParaVizApp {
+    pub(super) fn trigger_update_check(&mut self, manual: bool) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+        ) {
+            return;
+        }
+        self.update_check_manual = manual;
+        self.update_status = UpdateStatus::Checking;
+        spawn_check_updates(self.update_tx.clone());
+    }
+
+    fn poll_update_events(&mut self) {
+        while let Ok(ev) = self.update_rx.try_recv() {
+            match ev {
+                UpdateEvent::Checked(Ok(Some(info))) => {
+                    self.status_message = format!("ParaViz v{} release available", info.version);
+                    self.update_status = UpdateStatus::Available(info);
+                }
+                UpdateEvent::Checked(Ok(None)) => {
+                    let current = current_version().to_string();
+                    if self.update_check_manual {
+                        self.status_message = format!("ParaViz v{current} is up to date");
+                    }
+                    self.update_status = UpdateStatus::UpToDate { current };
+                }
+                UpdateEvent::Checked(Err(err)) => {
+                    if self.update_check_manual {
+                        self.update_status = UpdateStatus::Error(err);
+                    } else {
+                        // Stay unobtrusive when offline during background startup check.
+                        self.update_status = UpdateStatus::Idle;
+                    }
+                }
+                UpdateEvent::Installed(Ok(version)) => {
+                    self.status_message =
+                        format!("Installed ParaViz v{version}. Restart to finish updating.");
+                    self.update_status = UpdateStatus::Installed { version };
+                }
+                UpdateEvent::Installed(Err(err)) => {
+                    self.error_message = Some(format!("Auto-update failed: {err}"));
+                    self.update_status = UpdateStatus::Error(err);
+                }
+            }
+        }
+    }
+
+    fn start_install_update(&mut self, info: ReleaseUpdateInfo) {
+        let asset_name = info
+            .asset
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        self.update_status = UpdateStatus::Downloading {
+            version: info.version.clone(),
+            asset_name,
+        };
+        spawn_install_update(info, self.update_tx.clone());
+    }
+
+    fn restart_application(&self, ctx: &egui::Context) {
+        if let Some(appimage) = std::env::var_os("APPIMAGE") {
+            let _ = std::process::Command::new(appimage).spawn();
+        } else if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn draw_update_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_update_modal {
+            return;
+        }
+        let pal = palette(self.theme);
+        let mut open = self.show_update_modal;
+        let mut action_recheck = false;
+        let mut action_install: Option<ReleaseUpdateInfo> = None;
+        let mut action_restart = false;
+        let mut close_clicked = false;
+
+        egui::Window::new("ParaViz Software Update")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .min_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Installed version:").color(pal.muted));
+                    ui.monospace(format!("v{}", current_version()));
+                });
+                ui.separator();
+
+                match &self.update_status {
+                    UpdateStatus::Idle => {
+                        ui.label("Click below to check GitHub Releases for a newer version.");
+                        ui.add_space(6.0);
+                        if ui.button("Check Now").clicked() {
+                            action_recheck = true;
+                        }
+                    }
+                    UpdateStatus::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking GitHub Releases...");
+                        });
+                    }
+                    UpdateStatus::UpToDate { current } => {
+                        ui.colored_label(
+                            pal.success,
+                            format!("You are running the latest version (v{current})."),
+                        );
+                        ui.add_space(6.0);
+                        if ui.button("Check Again").clicked() {
+                            action_recheck = true;
+                        }
+                    }
+                    UpdateStatus::Available(info) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "New release available: {}",
+                                info.tag_name
+                            ))
+                            .strong()
+                            .size(15.0)
+                            .color(pal.accent),
+                        );
+                        if let Some(asset) = &info.asset {
+                            let mb = asset.size as f64 / (1024.0 * 1024.0);
+                            ui.label(
+                                egui::RichText::new(format!("Package: {} ({mb:.1} MiB)", asset.name))
+                                    .size(12.0)
+                                    .color(pal.muted),
+                            );
+                        }
+                        if info.checksums_url.is_some() {
+                            ui.label(
+                                egui::RichText::new("SHA-256 checksum verification: enabled (SHA256SUMS.txt)")
+                                    .size(11.5)
+                                    .color(pal.success),
+                            );
+                        }
+                        if !info.notes.trim().is_empty() {
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    ui.monospace(info.notes.trim());
+                                });
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let can_self_replace = info.asset.is_some()
+                                && info.checksums_url.is_some()
+                                && info.install_kind != InstallKind::CargoOrManual;
+                            if can_self_replace {
+                                if ui.button("Download & Install Update").clicked() {
+                                    action_install = Some(info.clone());
+                                }
+                            } else if info.install_kind == InstallKind::CargoOrManual {
+                                ui.label("Cargo install detected: run `cargo install paraviz-app --force` or download binary.");
+                            }
+                            if ui.button("Open Release Page").clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(&info.html_url));
+                            }
+                        });
+                    }
+                    UpdateStatus::Downloading {
+                        version,
+                        asset_name,
+                    } => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!(
+                                "Downloading & verifying v{version} ({asset_name})..."
+                            ));
+                        });
+                    }
+                    UpdateStatus::Installed { version } => {
+                        ui.colored_label(
+                            pal.success,
+                            format!(
+                                "ParaViz v{version} installed and verified via SHA-256!"
+                            ),
+                        );
+                        ui.label("Restart ParaViz now to launch the updated version.");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Restart Now").clicked() {
+                                action_restart = true;
+                            }
+                            if ui.button("Later").clicked() {
+                                close_clicked = true;
+                            }
+                        });
+                    }
+                    UpdateStatus::Error(err) => {
+                        ui.colored_label(pal.danger, format!("Update check failed: {err}"));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Retry").clicked() {
+                                action_recheck = true;
+                            }
+                            if ui.button("Open Releases").clicked() {
+                                ui.ctx()
+                                    .open_url(egui::OpenUrl::new_tab(RELEASES_PAGE_URL));
+                            }
+                        });
+                    }
+                }
+            });
+
+        self.show_update_modal = open && !close_clicked;
+        if action_recheck {
+            self.trigger_update_check(true);
+        } else if let Some(info) = action_install {
+            self.start_install_update(info);
+        } else if action_restart {
+            self.restart_application(ctx);
+        }
     }
 }
 
