@@ -1341,3 +1341,89 @@ fn truncated_and_incomplete_files_return_error_without_panicking() {
     .unwrap();
     assert!(read_dataset(&oob_xmf).is_err());
 }
+
+#[test]
+fn xdmf_temporal_collection_time_steps_and_source() {
+    use paraviz_core::Source;
+    use paraviz_io::{inspect_xdmf_time_steps, read_xdmf_at_time};
+
+    let dir = TestDir::new("xdmf_temporal");
+    let xml = r#"<?xml version="1.0" ?>
+<Xdmf Version="2.0">
+  <Domain>
+    <Grid Name="TimeSeries" GridType="Collection" CollectionType="Temporal">
+      <Grid Name="Step0" GridType="Uniform">
+        <Time Value="0.5"/>
+        <Topology TopologyType="Triangle" NumberOfElements="1">
+          <DataItem Format="XML" Dimensions="3">0 1 2</DataItem>
+        </Topology>
+        <Geometry GeometryType="XYZ">
+          <DataItem Format="XML" Dimensions="9">0 0 0  1 0 0  0 1 0</DataItem>
+        </Geometry>
+        <Attribute Name="Temp" Center="Node">
+          <DataItem Format="XML" Dimensions="3">10.0 10.0 10.0</DataItem>
+        </Attribute>
+      </Grid>
+      <Grid Name="Step1" GridType="Uniform">
+        <Time Value="1.25"/>
+        <Topology TopologyType="Triangle" NumberOfElements="1">
+          <DataItem Format="XML" Dimensions="3">0 1 2</DataItem>
+        </Topology>
+        <Geometry GeometryType="XYZ">
+          <DataItem Format="XML" Dimensions="9">0 0 0  1 0 0  0 1 0</DataItem>
+        </Geometry>
+        <Attribute Name="Temp" Center="Node">
+          <DataItem Format="XML" Dimensions="3">42.0 42.0 42.0</DataItem>
+        </Attribute>
+      </Grid>
+    </Grid>
+  </Domain>
+</Xdmf>"#;
+    let path = dir.file("series.xmf");
+    fs::write(&path, xml).unwrap();
+
+    let steps = inspect_xdmf_time_steps(&path).unwrap();
+    assert_eq!(steps, vec![0.5, 1.25]);
+
+    let ds0 = read_xdmf_at_time(&path, 0.5).unwrap();
+    assert!(
+        (ds0.as_unstructured_grid()
+            .unwrap()
+            .point_data
+            .get("Temp")
+            .unwrap()
+            .get_scalar(0)
+            - 10.0)
+            .abs()
+            < 1e-6
+    );
+
+    let ds1 = read_xdmf_at_time(&path, 1.25).unwrap();
+    assert!(
+        (ds1.as_unstructured_grid()
+            .unwrap()
+            .point_data
+            .get("Temp")
+            .unwrap()
+            .get_scalar(0)
+            - 42.0)
+            .abs()
+            < 1e-6
+    );
+
+    let src = VtkFileSource::new(&path);
+    let info = src.request_information();
+    assert_eq!(info.time_steps, vec![0.5, 1.25]);
+    let s1 = src.execute(1.25).unwrap();
+    assert!(
+        (s1.as_unstructured_grid()
+            .unwrap()
+            .point_data
+            .get("Temp")
+            .unwrap()
+            .get_scalar(0)
+            - 42.0)
+            .abs()
+            < 1e-6
+    );
+}

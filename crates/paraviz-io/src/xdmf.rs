@@ -17,7 +17,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Reads an XDMF (`.xdmf` / `.xmf`) file into a [`DataSet`].
+/// Reads an XDMF (`.xdmf` / `.xmf`) file into a [`DataSet`] (first time step if temporal).
 pub fn read_xdmf(path: impl AsRef<Path>) -> Result<DataSet> {
     let path = path.as_ref();
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -25,8 +25,37 @@ pub fn read_xdmf(path: impl AsRef<Path>) -> Result<DataSet> {
     read_xdmf_str(&xml, base_dir)
 }
 
+/// Reads the time step closest to `time` from a temporal XDMF file (or the dataset if non-temporal).
+pub fn read_xdmf_at_time(path: impl AsRef<Path>, time: f64) -> Result<DataSet> {
+    let path = path.as_ref();
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let xml = fs::read_to_string(path)?;
+    read_xdmf_str_at_time(&xml, base_dir, Some(time))
+}
+
+/// Inspects an XDMF file's XML structure (without loading HDF5/Binary arrays) and returns
+/// its temporal time steps if it contains a `Temporal` collection, or an empty `Vec` otherwise.
+pub fn inspect_xdmf_time_steps(path: impl AsRef<Path>) -> Result<Vec<f64>> {
+    let path = path.as_ref();
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let xml = fs::read_to_string(path)?;
+    let root = parse_xml_tree(&xml, base_dir, 0)?;
+    let mut grids = Vec::new();
+    find_top_level_grids(&root, &mut grids);
+    for g in grids {
+        if let Some(steps) = find_temporal_steps(g) {
+            return Ok(steps);
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// Reads an XDMF XML string using `base_dir` for external binary / XInclude references.
 pub fn read_xdmf_str(xml: &str, base_dir: &Path) -> Result<DataSet> {
+    read_xdmf_str_at_time(xml, base_dir, None)
+}
+
+fn read_xdmf_str_at_time(xml: &str, base_dir: &Path, target_time: Option<f64>) -> Result<DataSet> {
     let root = parse_xml_tree(xml, base_dir, 0)?;
     let mut named_items: HashMap<String, XmlNode> = HashMap::new();
     collect_named_data_items(&root, &mut named_items);
@@ -49,7 +78,7 @@ pub fn read_xdmf_str(xml: &str, base_dir: &Path) -> Result<DataSet> {
     }
 
     if grids.len() == 1 {
-        parse_grid_node(grids[0], &ctx)
+        parse_grid_node(grids[0], &ctx, target_time)
     } else {
         let mut mb = MultiBlockDataSet::new();
         for (idx, g) in grids.iter().enumerate() {
@@ -57,7 +86,7 @@ pub fn read_xdmf_str(xml: &str, base_dir: &Path) -> Result<DataSet> {
                 .attr("Name")
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("Grid_{idx}"));
-            let ds = parse_grid_node(g, &ctx)?;
+            let ds = parse_grid_node(g, &ctx, target_time)?;
             mb.add_block(name, ds);
         }
         Ok(DataSet::MultiBlock(mb))
@@ -298,7 +327,53 @@ fn collect_child_grids<'a>(node: &'a XmlNode, out: &mut Vec<&'a XmlNode>) {
     }
 }
 
-fn parse_grid_node(grid_node: &XmlNode, ctx: &XdmfContext<'_>) -> Result<DataSet> {
+fn extract_grid_time(grid_node: &XmlNode) -> Option<f64> {
+    let time_node = grid_node.child("Time")?;
+    if let Some(val) = time_node.attr("Value")
+        && let Ok(t) = val.trim().parse::<f64>()
+    {
+        return Some(t);
+    }
+    if let Some(di) = time_node.data_items().next()
+        && let Some(first) = di.text.split_whitespace().next()
+        && let Ok(t) = first.parse::<f64>()
+    {
+        return Some(t);
+    }
+    None
+}
+
+fn find_temporal_steps(grid_node: &XmlNode) -> Option<Vec<f64>> {
+    let grid_type = grid_node
+        .attr("GridType")
+        .or_else(|| grid_node.attr("Type"))
+        .unwrap_or("Uniform");
+    if grid_type.eq_ignore_ascii_case("Collection") || grid_type.eq_ignore_ascii_case("Tree") {
+        let coll_type = grid_node.attr("CollectionType").unwrap_or("Spatial");
+        let mut child_grids: Vec<&XmlNode> = Vec::new();
+        collect_child_grids(grid_node, &mut child_grids);
+        if coll_type.eq_ignore_ascii_case("Temporal") && !child_grids.is_empty() {
+            let steps: Vec<f64> = child_grids
+                .iter()
+                .enumerate()
+                .map(|(i, cg)| extract_grid_time(cg).unwrap_or(i as f64))
+                .collect();
+            return Some(steps);
+        }
+        for cg in child_grids {
+            if let Some(steps) = find_temporal_steps(cg) {
+                return Some(steps);
+            }
+        }
+    }
+    None
+}
+
+fn parse_grid_node(
+    grid_node: &XmlNode,
+    ctx: &XdmfContext<'_>,
+    target_time: Option<f64>,
+) -> Result<DataSet> {
     let grid_type = grid_node
         .attr("GridType")
         .or_else(|| grid_node.attr("Type"))
@@ -312,11 +387,24 @@ fn parse_grid_node(grid_node: &XmlNode, ctx: &XdmfContext<'_>) -> Result<DataSet
             return Ok(DataSet::UnstructuredGrid(UnstructuredGrid::new()));
         }
         if coll_type.eq_ignore_ascii_case("Temporal") {
-            // Return first valid time step for single-dataset read_xdmf
-            return parse_grid_node(child_grids[0], ctx);
+            let chosen = if let Some(t) = target_time {
+                child_grids
+                    .iter()
+                    .enumerate()
+                    .min_by(|(ia, ga), (ib, gb)| {
+                        let ta = extract_grid_time(ga).unwrap_or(*ia as f64);
+                        let tb = extract_grid_time(gb).unwrap_or(*ib as f64);
+                        (ta - t).abs().total_cmp(&(tb - t).abs())
+                    })
+                    .map(|(_, g)| *g)
+                    .unwrap_or(child_grids[0])
+            } else {
+                child_grids[0]
+            };
+            return parse_grid_node(chosen, ctx, target_time);
         }
         if child_grids.len() == 1 {
-            return parse_grid_node(child_grids[0], ctx);
+            return parse_grid_node(child_grids[0], ctx, target_time);
         }
         let mut mb = MultiBlockDataSet::new();
         for (i, cg) in child_grids.iter().enumerate() {
@@ -324,7 +412,7 @@ fn parse_grid_node(grid_node: &XmlNode, ctx: &XdmfContext<'_>) -> Result<DataSet
                 .attr("Name")
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("Block_{i}"));
-            mb.add_block(name, parse_grid_node(cg, ctx)?);
+            mb.add_block(name, parse_grid_node(cg, ctx, target_time)?);
         }
         return Ok(DataSet::MultiBlock(mb));
     }

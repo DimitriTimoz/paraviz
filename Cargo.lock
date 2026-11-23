@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "glam",
  "paraviz-core",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz-app"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "console_error_panic_hook",
  "eframe",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "glam",
  "rayon",
@@ -2642,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz-filters"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "glam",
  "paraviz-core",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz-io"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64",
  "flate2",
@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz-render"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytemuck",
  "glam",
@@ -2688,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "paraviz-sources"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "glam",
  "paraviz-core",

@@ -471,6 +471,11 @@ impl ParaVizApp {
         };
         match self.session.open_with_reader(path, reader) {
             Ok(id) => {
+                if is_first
+                    && let Some(first_t) = self.session.all_time_steps().first().copied()
+                {
+                    self.session.time = first_t;
+                }
                 if let Err(e) = self.session.evaluate(id) {
                     let _ = self.session.remove_node(id);
                     let reader_desc = used_reader

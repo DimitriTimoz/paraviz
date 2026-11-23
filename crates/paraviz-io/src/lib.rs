@@ -38,7 +38,7 @@ pub use raw_volume::{
 };
 pub use vtk_legacy::VtkLegacyFormat;
 pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
-pub use xdmf::read_xdmf;
+pub use xdmf::{inspect_xdmf_time_steps, read_xdmf, read_xdmf_at_time};
 
 use paraviz_core::{DataSet, PipelineError, PipelineInfo, Source};
 use serde::{Deserialize, Serialize};
@@ -359,12 +359,14 @@ fn read_magic_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Pipeline [`Source`] that reads any single dataset file supported by `paraviz-io`.
+/// Pipeline [`Source`] that reads any single dataset file supported by `paraviz-io`
+/// (including temporal XDMF collections on demand).
 #[derive(Debug, Clone)]
 pub struct VtkFileSource {
     path: PathBuf,
     label: String,
     reader: DatasetReader,
+    time_steps: Vec<f64>,
 }
 
 impl VtkFileSource {
@@ -381,10 +383,21 @@ impl VtkFileSource {
             .and_then(|s| s.to_str())
             .unwrap_or("VtkFileSource")
             .to_string();
+        let is_xdmf = reader == DatasetReader::Xdmf
+            || (reader == DatasetReader::Auto && detect_reader(&path).ok() == Some(DatasetReader::Xdmf));
+        let time_steps = if is_xdmf {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                xdmf::inspect_xdmf_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Self {
             path,
             label,
             reader,
+            time_steps,
         }
     }
 
@@ -405,10 +418,27 @@ impl Source for VtkFileSource {
     }
 
     fn request_information(&self) -> PipelineInfo {
-        PipelineInfo::default()
+        PipelineInfo {
+            time_steps: self.time_steps.clone(),
+            current_time: self.time_steps.first().copied().unwrap_or(0.0),
+            bounds: None,
+        }
     }
 
-    fn execute(&self, _time: f64) -> std::result::Result<DataSet, PipelineError> {
+    fn execute(&self, time: f64) -> std::result::Result<DataSet, PipelineError> {
+        if !self.time_steps.is_empty() {
+            let path = self.path.clone();
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                xdmf::read_xdmf_at_time(&path, time)
+            }));
+            return match res {
+                Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                    "XDMF Reader failed unexpectedly while reading '{}'",
+                    self.path.display()
+                ))),
+            };
+        }
         read_dataset_with_reader(&self.path, self.reader)
             .map(|(ds, _)| ds)
             .map_err(|e| PipelineError::ExecutionFailed(e.to_string()))
