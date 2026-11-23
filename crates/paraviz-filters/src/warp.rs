@@ -1,5 +1,6 @@
 //! Geometric warping filters (`WarpByVectorFilter` and `WarpByScalarFilter`).
 
+use crate::util::GridPoints;
 use glam::Vec3;
 use paraviz_core::{
     DataSet, Filter, MultiBlockDataSet, PipelineError, PolyData, StructuredGrid, UnstructuredGrid,
@@ -54,10 +55,10 @@ impl Filter for WarpByVectorFilter {
                 })?
             };
             let s = self.scale_factor;
-            Ok(points
-                .par_iter()
-                .enumerate()
-                .map(|(i, &p)| {
+            Ok((0..points.len())
+                .into_par_iter()
+                .map(|i| {
+                    let p = points.at_linear(i);
                     let v = arr.get_vec3(i);
                     [p[0] + v[0] * s, p[1] + v[1] * s, p[2] + v[2] * s]
                 })
@@ -125,10 +126,10 @@ impl Filter for WarpByScalarFilter {
                 None
             };
             let s = self.scale_factor;
-            Ok(points
-                .par_iter()
-                .enumerate()
-                .map(|(i, &p)| {
+            Ok((0..points.len())
+                .into_par_iter()
+                .map(|i| {
+                    let p = points.at_linear(i);
                     let val = arr.get_magnitude(i) as f32;
                     let n = normals_arr
                         .map(|na| Vec3::from_array(na.get_vec3(i)).normalize_or(fallback_n))
@@ -143,11 +144,18 @@ impl Filter for WarpByScalarFilter {
 
 fn warp_dataset<F>(input: &DataSet, warp_fn: &F) -> Result<DataSet, PipelineError>
 where
-    F: Fn(&[[f32; 3]], &paraviz_core::FieldData) -> Result<Vec<[f32; 3]>, PipelineError> + Sync,
+    F: Fn(GridPoints<'_>, &paraviz_core::FieldData) -> Result<Vec<[f32; 3]>, PipelineError> + Sync,
 {
     match input {
         DataSet::PolyData(pd) => {
-            let new_pts = warp_fn(&pd.points, &pd.point_data)?;
+            let new_pts = warp_fn(
+                GridPoints::Explicit {
+                    points: &pd.points,
+                    nx: pd.points.len(),
+                    ny: 1,
+                },
+                &pd.point_data,
+            )?;
             let mut out = PolyData {
                 points: new_pts,
                 ..pd.clone()
@@ -158,8 +166,7 @@ where
             Ok(DataSet::PolyData(out))
         }
         DataSet::ImageData(img) => {
-            let pts = img.all_points();
-            let new_pts = warp_fn(&pts, &img.point_data)?;
+            let new_pts = warp_fn(GridPoints::Image(img), &img.point_data)?;
             Ok(DataSet::StructuredGrid(StructuredGrid {
                 dimensions: img.dimensions,
                 points: new_pts,
@@ -169,8 +176,7 @@ where
             }))
         }
         DataSet::RectilinearGrid(rg) => {
-            let pts = rg.all_points();
-            let new_pts = warp_fn(&pts, &rg.point_data)?;
+            let new_pts = warp_fn(GridPoints::Rectilinear(rg), &rg.point_data)?;
             Ok(DataSet::StructuredGrid(StructuredGrid {
                 dimensions: rg.dimensions(),
                 points: new_pts,
@@ -180,14 +186,24 @@ where
             }))
         }
         DataSet::StructuredGrid(sg) => {
-            let new_pts = warp_fn(&sg.points, &sg.point_data)?;
+            let new_pts = warp_fn(
+                GridPoints::from_structured(&sg.points, sg.dimensions),
+                &sg.point_data,
+            )?;
             Ok(DataSet::StructuredGrid(StructuredGrid {
                 points: new_pts,
                 ..sg.clone()
             }))
         }
         DataSet::UnstructuredGrid(ug) => {
-            let new_pts = warp_fn(&ug.points, &ug.point_data)?;
+            let new_pts = warp_fn(
+                GridPoints::Explicit {
+                    points: &ug.points,
+                    nx: ug.points.len(),
+                    ny: 1,
+                },
+                &ug.point_data,
+            )?;
             Ok(DataSet::UnstructuredGrid(UnstructuredGrid {
                 points: new_pts,
                 ..ug.clone()

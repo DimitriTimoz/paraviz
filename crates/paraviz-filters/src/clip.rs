@@ -1,9 +1,9 @@
 //! Implicit-function mesh clipping (`ClipFilter` + `ImplicitFunction`, equivalent to `vtkClipDataSet`).
 
-use crate::contour::interp_edge;
+use crate::contour::interp_edge_pos;
 use crate::util::{
     canonical_edge_key, compact_polydata_points, compact_unstructured_points,
-    interpolate_field_data_edges, merge_polydata,
+    interpolate_field_data_edges, merge_polydata, FxHashMap, GridPoints,
 };
 use glam::Vec3;
 use paraviz_core::{
@@ -11,7 +11,6 @@ use paraviz_core::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Analytical implicit scalar function `f(p)` whose zero-contour defines the clip boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,7 +100,7 @@ impl Filter for ClipFilter {
             ))),
             DataSet::ImageData(img) => Ok(DataSet::UnstructuredGrid(clip_structured(
                 img.dimensions,
-                img.all_points(),
+                GridPoints::Image(img),
                 &img.point_data,
                 &img.cell_data,
                 CellType::Voxel,
@@ -111,7 +110,7 @@ impl Filter for ClipFilter {
             ))),
             DataSet::RectilinearGrid(rg) => Ok(DataSet::UnstructuredGrid(clip_structured(
                 rg.dimensions(),
-                rg.all_points(),
+                GridPoints::Rectilinear(rg),
                 &rg.point_data,
                 &rg.cell_data,
                 CellType::Voxel,
@@ -121,7 +120,7 @@ impl Filter for ClipFilter {
             ))),
             DataSet::StructuredGrid(sg) => Ok(DataSet::UnstructuredGrid(clip_structured(
                 sg.dimensions,
-                sg.points.clone(),
+                GridPoints::from_structured(&sg.points, sg.dimensions),
                 &sg.point_data,
                 &sg.cell_data,
                 CellType::Hexahedron,
@@ -159,12 +158,45 @@ fn eval_signed(points: &[[f32; 3]], func: &ImplicitFunction, sign: f64) -> Vec<f
         .collect()
 }
 
+fn eval_signed_grid(points: GridPoints<'_>, func: &ImplicitFunction, sign: f64) -> Vec<f64> {
+    match points {
+        GridPoints::Explicit { points, .. } => eval_signed(points, func, sign),
+        GridPoints::Image(img) => {
+            let [nx, ny, nz] = img.dimensions;
+            (0..(nx * ny * nz))
+                .into_par_iter()
+                .map(|idx| {
+                    let i = idx % nx;
+                    let rem = idx / nx;
+                    let j = rem % ny;
+                    let k = rem / ny;
+                    func.evaluate(img.point_coords(i, j, k)) * sign
+                })
+                .collect()
+        }
+        GridPoints::Rectilinear(rg) => {
+            let [nx, ny, nz] = rg.dimensions();
+            (0..(nx * ny * nz))
+                .into_par_iter()
+                .map(|idx| {
+                    let i = idx % nx;
+                    let rem = idx / nx;
+                    let j = rem % ny;
+                    let k = rem / ny;
+                    func.evaluate(rg.point_coords(i, j, k)) * sign
+                })
+                .collect()
+        }
+    }
+}
+
 struct EdgeCache<'a> {
-    orig_points: &'a [[f32; 3]],
+    orig_points: GridPoints<'a>,
     vals: &'a [f64],
     out_points: Vec<[f32; 3]>,
     out_edges: Vec<(usize, usize, f64)>,
-    edge_map: HashMap<u64, u32>,
+    edge_map: FxHashMap<u64, u32>,
+    vert_remap: Vec<u32>,
 }
 
 impl<'a> EdgeCache<'a> {
@@ -175,12 +207,45 @@ impl<'a> EdgeCache<'a> {
             out_edges.push((i, i, 0.0));
         }
         Self {
-            orig_points,
+            orig_points: GridPoints::Explicit {
+                points: orig_points,
+                nx: n,
+                ny: 1,
+            },
             vals,
             out_points: orig_points.to_vec(),
             out_edges,
-            edge_map: HashMap::new(),
+            edge_map: FxHashMap::default(),
+            vert_remap: Vec::new(),
         }
+    }
+
+    fn new_lazy(orig_points: GridPoints<'a>, vals: &'a [f64]) -> Self {
+        let n = orig_points.len();
+        Self {
+            orig_points,
+            vals,
+            out_points: Vec::new(),
+            out_edges: Vec::new(),
+            edge_map: FxHashMap::default(),
+            vert_remap: vec![u32::MAX; n],
+        }
+    }
+
+    #[inline]
+    fn vertex_id(&mut self, orig_idx: usize) -> u32 {
+        if self.vert_remap.is_empty() {
+            return orig_idx as u32;
+        }
+        let slot = &mut self.vert_remap[orig_idx];
+        if *slot != u32::MAX {
+            return *slot;
+        }
+        let id = self.out_points.len() as u32;
+        self.out_points.push(self.orig_points.at_linear(orig_idx));
+        self.out_edges.push((orig_idx, orig_idx, 0.0));
+        *slot = id;
+        id
     }
 
     fn get_or_insert_intersection(&mut self, ia: usize, ib: usize) -> u32 {
@@ -188,7 +253,9 @@ impl<'a> EdgeCache<'a> {
         if let Some(&id) = self.edge_map.get(&key) {
             return id;
         }
-        let (t, pos) = interp_edge(self.orig_points, ia, ib, self.vals[ia], self.vals[ib], 0.0);
+        let pa = self.orig_points.at_linear(ia);
+        let pb = self.orig_points.at_linear(ib);
+        let (t, pos) = interp_edge_pos(pa, pb, self.vals[ia], self.vals[ib], 0.0);
         let id = self.out_points.len() as u32;
         self.out_points.push(pos);
         self.out_edges.push((ia, ib, t));
@@ -354,7 +421,7 @@ fn clip_polydata(
 #[allow(clippy::too_many_arguments)]
 fn clip_structured(
     dims: [usize; 3],
-    points: Vec<[f32; 3]>,
+    points: GridPoints<'_>,
     point_data: &FieldData,
     cell_data: &FieldData,
     cell_type: CellType,
@@ -366,14 +433,14 @@ fn clip_structured(
     if nx < 2 || ny < 2 || nz < 2 || points.is_empty() {
         return UnstructuredGrid::new();
     }
-    let vals = eval_signed(&points, func, sign);
+    let vals = eval_signed_grid(points, func, sign);
     let cx = nx - 1;
     let cy = ny - 1;
     let cz = nz - 1;
     let total_cells = cx * cy * cz;
 
     let mut ug = UnstructuredGrid::new();
-    let mut cache = EdgeCache::new(&points, &vals);
+    let mut cache = EdgeCache::new_lazy(points, &vals);
     let mut out_cell_indices = Vec::new();
     let tets = cell_type.tetrahedra();
 
@@ -420,7 +487,17 @@ fn clip_structured(
             continue;
         }
         if all_in || crinkle {
-            ug.push_cell(cell_type, &c);
+            let remapped = [
+                cache.vertex_id(c[0] as usize),
+                cache.vertex_id(c[1] as usize),
+                cache.vertex_id(c[2] as usize),
+                cache.vertex_id(c[3] as usize),
+                cache.vertex_id(c[4] as usize),
+                cache.vertex_id(c[5] as usize),
+                cache.vertex_id(c[6] as usize),
+                cache.vertex_id(c[7] as usize),
+            ];
+            ug.push_cell(cell_type, &remapped);
             out_cell_indices.push(cell_idx);
             continue;
         }
@@ -582,17 +659,18 @@ fn clip_tet(
         return 0;
     }
     if n_in == 4 {
-        ug.push_cell(
-            CellType::Tetra,
-            &[tv[0] as u32, tv[1] as u32, tv[2] as u32, tv[3] as u32],
-        );
+        let v0 = cache.vertex_id(tv[0]);
+        let v1 = cache.vertex_id(tv[1]);
+        let v2 = cache.vertex_id(tv[2]);
+        let v3 = cache.vertex_id(tv[3]);
+        ug.push_cell(CellType::Tetra, &[v0, v1, v2, v3]);
         return 1;
     }
 
-    let p0 = Vec3::from_array(cache.orig_points[tv[0]]);
-    let p1 = Vec3::from_array(cache.orig_points[tv[1]]);
-    let p2 = Vec3::from_array(cache.orig_points[tv[2]]);
-    let p3 = Vec3::from_array(cache.orig_points[tv[3]]);
+    let p0 = Vec3::from_array(cache.orig_points.at_linear(tv[0]));
+    let p1 = Vec3::from_array(cache.orig_points.at_linear(tv[1]));
+    let p2 = Vec3::from_array(cache.orig_points.at_linear(tv[2]));
+    let p3 = Vec3::from_array(cache.orig_points.at_linear(tv[3]));
     let pos_orient = (p1 - p0).cross(p2 - p0).dot(p3 - p0) >= 0.0;
 
     let before = ug.num_cells();
@@ -602,7 +680,8 @@ fn clip_tet(
             let ab = cache.get_or_insert_intersection(a, outside[0]);
             let ac = cache.get_or_insert_intersection(a, outside[1]);
             let ad = cache.get_or_insert_intersection(a, outside[2]);
-            push_oriented_tet(ug, cache, [a as u32, ab, ac, ad], pos_orient);
+            let va = cache.vertex_id(a);
+            push_oriented_tet(ug, cache, [va, ab, ac, ad], pos_orient);
         }
         2 => {
             let a = inside[0];
@@ -613,10 +692,12 @@ fn clip_tet(
             let ad = cache.get_or_insert_intersection(a, d);
             let bc = cache.get_or_insert_intersection(b, c);
             let bd = cache.get_or_insert_intersection(b, d);
+            let va = cache.vertex_id(a);
+            let vb = cache.vertex_id(b);
             // Decompose wedge [a, b, ac, ad, bc, bd] into 3 tets.
-            push_oriented_tet(ug, cache, [a as u32, b as u32, ac, ad], pos_orient);
-            push_oriented_tet(ug, cache, [b as u32, ac, ad, bd], pos_orient);
-            push_oriented_tet(ug, cache, [b as u32, ac, bd, bc], pos_orient);
+            push_oriented_tet(ug, cache, [va, vb, ac, ad], pos_orient);
+            push_oriented_tet(ug, cache, [vb, ac, ad, bd], pos_orient);
+            push_oriented_tet(ug, cache, [vb, ac, bd, bc], pos_orient);
         }
         3 => {
             let a = inside[0];
@@ -626,10 +707,13 @@ fn clip_tet(
             let ad = cache.get_or_insert_intersection(a, d);
             let bd = cache.get_or_insert_intersection(b, d);
             let cd = cache.get_or_insert_intersection(c, d);
+            let va = cache.vertex_id(a);
+            let vb = cache.vertex_id(b);
+            let vc = cache.vertex_id(c);
             // Decompose truncated tet (prism [a, b, c, ad, bd, cd]) into 3 tets.
-            push_oriented_tet(ug, cache, [a as u32, b as u32, c as u32, ad], pos_orient);
-            push_oriented_tet(ug, cache, [b as u32, c as u32, ad, bd], pos_orient);
-            push_oriented_tet(ug, cache, [c as u32, ad, bd, cd], pos_orient);
+            push_oriented_tet(ug, cache, [va, vb, vc, ad], pos_orient);
+            push_oriented_tet(ug, cache, [vb, vc, ad, bd], pos_orient);
+            push_oriented_tet(ug, cache, [vc, ad, bd, cd], pos_orient);
         }
         _ => {}
     }

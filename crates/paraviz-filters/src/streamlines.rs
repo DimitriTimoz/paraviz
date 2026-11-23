@@ -1,9 +1,10 @@
 //! Streamline integration filter (`StreamTracerFilter`, equivalent to `vtkStreamTracer`).
 
+use crate::probe::CellDataToPointDataFilter;
 use crate::util::{interpolate_field_data_weighted, SpatialSampler};
 use glam::Vec3;
 use paraviz_core::{
-    ArrayData, DataArray, DataSet, Filter, PipelineError, PolyData,
+    ArrayData, DataArray, DataSet, Filter, MultiInputFilter, PipelineError, PolyData,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -147,32 +148,124 @@ impl Filter for StreamTracerFilter {
     }
 
     fn apply(&self, input: &DataSet) -> Result<DataSet, PipelineError> {
-        let sampler = SpatialSampler::new(input)?;
-        let fd = sampler.field_data();
-        let vec_arr = if self.vector_field.is_empty() {
-            fd.active_vectors_array().ok_or_else(|| {
+        let seed_pts = self.seeds.seed_points();
+        trace_streamlines(input, self, &seed_pts)
+    }
+}
+
+/// Multi-input streamline tracer (`vtkStreamTracerWithCustomSource` equivalent).
+///
+/// Uses `inputs[0]` as the vector-field dataset (supporting both point and cell vector arrays)
+/// and extracts seed coordinates from every point of `inputs[1]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamTracerWithCustomSource {
+    pub base: StreamTracerFilter,
+}
+
+impl StreamTracerWithCustomSource {
+    pub fn new(base: StreamTracerFilter) -> Self {
+        Self { base }
+    }
+}
+
+impl MultiInputFilter for StreamTracerWithCustomSource {
+    fn name(&self) -> &str {
+        "StreamTracerWithCustomSource"
+    }
+
+    fn apply_multi(&self, inputs: &[&DataSet]) -> Result<DataSet, PipelineError> {
+        if inputs.len() < 2 {
+            return Err(PipelineError::ExecutionFailed(
+                "StreamTracerWithCustomSource requires 2 inputs (vector field, seed geometry)"
+                    .into(),
+            ));
+        }
+        let seeds = dataset_all_points(inputs[1]);
+        if seeds.is_empty() {
+            return Err(PipelineError::ExecutionFailed(
+                "Seed dataset contains no points for StreamTracerWithCustomSource".into(),
+            ));
+        }
+        trace_streamlines(inputs[0], &self.base, &seeds)
+    }
+}
+
+fn dataset_all_points(ds: &DataSet) -> Vec<[f32; 3]> {
+    match ds {
+        DataSet::PolyData(pd) => pd.points.clone(),
+        DataSet::ImageData(img) => img.all_points(),
+        DataSet::RectilinearGrid(rg) => rg.all_points(),
+        DataSet::StructuredGrid(sg) => sg.points.clone(),
+        DataSet::UnstructuredGrid(ug) => ug.points.clone(),
+        DataSet::MultiBlock(mb) => mb.blocks.iter().flat_map(|(_, b)| dataset_all_points(b)).collect(),
+    }
+}
+
+fn has_point_vector_field(ds: &DataSet, field_name: &str) -> bool {
+    let Some(pd) = ds.point_data() else {
+        return false;
+    };
+    if field_name.is_empty() {
+        pd.active_vectors_array().is_some_and(|a| a.num_components >= 3)
+    } else {
+        pd.get(field_name).is_some_and(|a| a.num_components >= 3)
+    }
+}
+
+fn has_cell_vector_field(ds: &DataSet, field_name: &str) -> bool {
+    let Some(cd) = ds.cell_data() else {
+        return false;
+    };
+    if field_name.is_empty() {
+        cd.active_vectors_array().is_some_and(|a| a.num_components >= 3)
+            || cd.arrays().iter().any(|a| a.num_components >= 3)
+    } else {
+        cd.get(field_name).is_some_and(|a| a.num_components >= 3)
+    }
+}
+
+fn trace_streamlines(
+    input: &DataSet,
+    cfg: &StreamTracerFilter,
+    seed_pts: &[[f32; 3]],
+) -> Result<DataSet, PipelineError> {
+    let converted_cow;
+    let working = if !has_point_vector_field(input, &cfg.vector_field)
+        && has_cell_vector_field(input, &cfg.vector_field)
+    {
+        converted_cow = CellDataToPointDataFilter { pass_cell_data: true }.apply(input)?;
+        &converted_cow
+    } else {
+        input
+    };
+
+    let sampler = SpatialSampler::new(working)?;
+    let fd = sampler.field_data();
+    let vec_arr = if cfg.vector_field.is_empty() {
+        fd.active_vectors_array()
+            .or_else(|| fd.arrays().iter().find(|a| a.num_components >= 3))
+            .ok_or_else(|| {
                 PipelineError::ExecutionFailed(
                     "No active vector array found for StreamTracerFilter".into(),
                 )
             })?
-        } else {
-            fd.get(&self.vector_field).ok_or_else(|| {
-                PipelineError::ExecutionFailed(format!(
-                    "Vector array '{}' not found in point_data",
-                    self.vector_field
-                ))
-            })?
-        };
-        if vec_arr.num_components < 3 {
-            return Err(PipelineError::ExecutionFailed(format!(
-                "Vector field '{}' has {} components, expected >= 3",
-                vec_arr.name, vec_arr.num_components
-            )));
-        }
+    } else {
+        fd.get(&cfg.vector_field).ok_or_else(|| {
+            PipelineError::ExecutionFailed(format!(
+                "Vector array '{}' not found in point_data or cell_data",
+                cfg.vector_field
+            ))
+        })?
+    };
+    if vec_arr.num_components < 3 {
+        return Err(PipelineError::ExecutionFailed(format!(
+            "Vector field '{}' has {} components, expected >= 3",
+            vec_arr.name, vec_arr.num_components
+        )));
+    }
 
-        let seed_pts = self.seeds.seed_points();
-        let step_size = self.step_size.max(1e-6);
-        let tol = (input.bounds().diagonal() * 1e-4).max(1e-5);
+    let step_size = cfg.step_size.max(1e-6);
+    let tol = (working.bounds().diagonal() * 1e-4).max(1e-5);
 
         // Trace each seed in parallel.
         struct TraceResult {
@@ -190,7 +283,7 @@ impl Filter for StreamTracerFilter {
                 let w0 = sampler.sample_weights(s_pos)?;
                 let v0 = sampler.sample_vec3(vec_arr, s_pos)?;
                 let sp0 = v0.length();
-                if sp0 <= self.terminal_speed {
+                if sp0 <= cfg.terminal_speed {
                     return None;
                 }
 
@@ -206,24 +299,24 @@ impl Filter for StreamTracerFilter {
                     let mut cur_arc = 0.0f32;
                     let mut h = step_size;
 
-                    for _ in 0..self.max_steps {
-                        if cur_arc >= self.max_length || cur_speed <= self.terminal_speed {
+                    for _ in 0..cfg.max_steps {
+                        if cur_arc >= cfg.max_length || cur_speed <= cfg.terminal_speed {
                             break;
                         }
-                        let rem_len = self.max_length - cur_arc;
+                        let rem_len = cfg.max_length - cur_arc;
                         let step_h = h.min(rem_len);
 
                         let dir_at = |p: Vec3| -> Option<(Vec3, f32)> {
                             let v = sampler.sample_vec3(vec_arr, p)?;
                             let sp = v.length();
-                            if sp <= self.terminal_speed {
+                            if sp <= cfg.terminal_speed {
                                 None
                             } else {
                                 Some(((v / sp) * sign, sp))
                             }
                         };
 
-                        let (next_pos, next_h) = match self.integrator {
+                        let (next_pos, next_h) = match cfg.integrator {
                             Integrator::Rk4 => {
                                 let Some(p_next) = step_rk4(pos, step_h, &dir_at) else {
                                     break;
@@ -251,7 +344,7 @@ impl Filter for StreamTracerFilter {
                         if ds < 1e-8 {
                             break;
                         }
-                        let avg_speed = 0.5 * (cur_speed + next_speed).max(self.terminal_speed);
+                        let avg_speed = 0.5 * (cur_speed + next_speed).max(cfg.terminal_speed);
                         cur_arc += ds;
                         cur_time += sign * (ds / avg_speed);
                         pos = next_pos;
@@ -271,7 +364,7 @@ impl Filter for StreamTracerFilter {
                 let mut speed = Vec::new();
                 let mut weights = Vec::new();
 
-                match self.direction {
+                match cfg.direction {
                     IntegrationDirection::Forward => {
                         points.push(seed);
                         time.push(0.0);
@@ -376,7 +469,6 @@ impl Filter for StreamTracerFilter {
         pd.point_data = pdata;
 
         Ok(DataSet::PolyData(pd))
-    }
 }
 
 fn step_rk4<F>(pos: Vec3, h: f32, dir_at: &F) -> Option<Vec3>

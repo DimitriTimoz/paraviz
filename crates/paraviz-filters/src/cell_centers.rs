@@ -1,6 +1,6 @@
 //! Cell centroid extraction filter (`CellCentersFilter`, equivalent to `vtkCellCenters`).
 
-use crate::util::{dataset_points, structured_cells};
+use crate::util::structured_cells;
 use glam::Vec3;
 use paraviz_core::{DataSet, Filter, MultiBlockDataSet, PipelineError, PolyData};
 use rayon::prelude::*;
@@ -42,20 +42,54 @@ impl Filter for CellCentersFilter {
                 .map(|c| average_points(&ug.points, ug.cell_points(c)))
                 .collect(),
             DataSet::ImageData(img) => {
-                let pts = dataset_points(input)?;
-                let cells = structured_cells(img.dimensions, true);
-                cells
-                    .par_iter()
-                    .map(|(_, verts)| average_points(&pts, verts))
-                    .collect()
+                let [nx, ny, nz] = img.dimensions;
+                if nx == 0 || ny == 0 || nz == 0 {
+                    Vec::new()
+                } else {
+                    let cx = nx.saturating_sub(1).max(1);
+                    let cy = ny.saturating_sub(1).max(1);
+                    let cz = nz.saturating_sub(1).max(1);
+                    let ox = if nx > 1 { 0.5 } else { 0.0 };
+                    let oy = if ny > 1 { 0.5 } else { 0.0 };
+                    let oz = if nz > 1 { 0.5 } else { 0.0 };
+                    (0..(cx * cy * cz))
+                        .into_par_iter()
+                        .map(|idx| {
+                            let i = idx % cx;
+                            let rem = idx / cx;
+                            let j = rem % cy;
+                            let k = rem / cy;
+                            [
+                                (img.origin[0] + (i as f64 + ox) * img.spacing[0]) as f32,
+                                (img.origin[1] + (j as f64 + oy) * img.spacing[1]) as f32,
+                                (img.origin[2] + (k as f64 + oz) * img.spacing[2]) as f32,
+                            ]
+                        })
+                        .collect()
+                }
             }
             DataSet::RectilinearGrid(rg) => {
-                let pts = dataset_points(input)?;
-                let cells = structured_cells(rg.dimensions(), true);
-                cells
-                    .par_iter()
-                    .map(|(_, verts)| average_points(&pts, verts))
-                    .collect()
+                let [nx, ny, nz] = rg.dimensions();
+                if nx == 0 || ny == 0 || nz == 0 {
+                    Vec::new()
+                } else {
+                    let cx = nx.saturating_sub(1).max(1);
+                    let cy = ny.saturating_sub(1).max(1);
+                    let cz = nz.saturating_sub(1).max(1);
+                    (0..(cx * cy * cz))
+                        .into_par_iter()
+                        .map(|idx| {
+                            let i = idx % cx;
+                            let rem = idx / cx;
+                            let j = rem % cy;
+                            let k = rem / cy;
+                            let x = if nx > 1 { 0.5 * (rg.x_coords[i] + rg.x_coords[i + 1]) } else { rg.x_coords[0] };
+                            let y = if ny > 1 { 0.5 * (rg.y_coords[j] + rg.y_coords[j + 1]) } else { rg.y_coords[0] };
+                            let z = if nz > 1 { 0.5 * (rg.z_coords[k] + rg.z_coords[k + 1]) } else { rg.z_coords[0] };
+                            [x, y, z]
+                        })
+                        .collect()
+                }
             }
             DataSet::StructuredGrid(sg) => {
                 let cells = structured_cells(sg.dimensions, false);

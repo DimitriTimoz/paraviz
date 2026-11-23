@@ -125,20 +125,48 @@ impl Filter for TransformFilter {
                 cell_data: img.cell_data.clone(),
                 field_data: img.field_data.clone(),
             })),
-            DataSet::ImageData(img) => Ok(DataSet::StructuredGrid(StructuredGrid {
-                dimensions: img.dimensions,
-                points: transform_pts(&img.all_points()),
-                point_data: transform_field_data(&img.point_data),
-                cell_data: img.cell_data.clone(),
-                field_data: img.field_data.clone(),
-            })),
-            DataSet::RectilinearGrid(rg) => Ok(DataSet::StructuredGrid(StructuredGrid {
-                dimensions: rg.dimensions(),
-                points: transform_pts(&rg.all_points()),
-                point_data: transform_field_data(&rg.point_data),
-                cell_data: rg.cell_data.clone(),
-                field_data: rg.field_data.clone(),
-            })),
+            DataSet::ImageData(img) => {
+                let [nx, ny, nz] = img.dimensions;
+                let pts: Vec<[f32; 3]> = (0..(nx * ny * nz))
+                    .into_par_iter()
+                    .map(|idx| {
+                        let i = idx % nx;
+                        let rem = idx / nx;
+                        let j = rem % ny;
+                        let k = rem / ny;
+                        mat.transform_point3(Vec3::from_array(img.point_coords(i, j, k)))
+                            .to_array()
+                    })
+                    .collect();
+                Ok(DataSet::StructuredGrid(StructuredGrid {
+                    dimensions: img.dimensions,
+                    points: pts,
+                    point_data: transform_field_data(&img.point_data),
+                    cell_data: img.cell_data.clone(),
+                    field_data: img.field_data.clone(),
+                }))
+            }
+            DataSet::RectilinearGrid(rg) => {
+                let [nx, ny, nz] = rg.dimensions();
+                let pts: Vec<[f32; 3]> = (0..(nx * ny * nz))
+                    .into_par_iter()
+                    .map(|idx| {
+                        let i = idx % nx;
+                        let rem = idx / nx;
+                        let j = rem % ny;
+                        let k = rem / ny;
+                        mat.transform_point3(Vec3::from_array(rg.point_coords(i, j, k)))
+                            .to_array()
+                    })
+                    .collect();
+                Ok(DataSet::StructuredGrid(StructuredGrid {
+                    dimensions: rg.dimensions(),
+                    points: pts,
+                    point_data: transform_field_data(&rg.point_data),
+                    cell_data: rg.cell_data.clone(),
+                    field_data: rg.field_data.clone(),
+                }))
+            }
             DataSet::StructuredGrid(sg) => Ok(DataSet::StructuredGrid(StructuredGrid {
                 points: transform_pts(&sg.points),
                 point_data: transform_field_data(&sg.point_data),

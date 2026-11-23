@@ -1,0 +1,14 @@
+[package]
+name = "paraviz-py"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Python bindings for ParaViz (Rust + WebGPU scientific visualization, mirroring paraview.simple)"
+
+[lib]
+name = "paraviz"
+crate-type = ["cdylib"]
+
+[dependencies]
+paraviz = { path = "../.." }
+pyo3 = { version = "0.24", features = ["extension-module"] }

@@ -1,6 +1,6 @@
 //! Scalar range threshold extraction filter (`ThresholdFilter`, equivalent to `vtkThreshold`).
 
-use crate::util::{compact_polydata_points, compact_unstructured_points};
+use crate::util::{compact_polydata_points, compact_unstructured_points, GridPoints};
 use paraviz_core::{
     AttributeAssociation, CellType, DataArray, DataSet, FieldData, Filter, MultiBlockDataSet,
     PipelineError, PolyData, UnstructuredGrid,
@@ -56,7 +56,7 @@ impl Filter for ThresholdFilter {
             DataSet::PolyData(pd) => Ok(DataSet::PolyData(self.threshold_polydata(pd)?)),
             DataSet::ImageData(img) => Ok(DataSet::UnstructuredGrid(self.threshold_structured(
                 img.dimensions,
-                img.all_points(),
+                GridPoints::Image(img),
                 &img.point_data,
                 &img.cell_data,
                 CellType::Voxel,
@@ -64,7 +64,7 @@ impl Filter for ThresholdFilter {
             DataSet::RectilinearGrid(rg) => {
                 Ok(DataSet::UnstructuredGrid(self.threshold_structured(
                     rg.dimensions(),
-                    rg.all_points(),
+                    GridPoints::Rectilinear(rg),
                     &rg.point_data,
                     &rg.cell_data,
                     CellType::Voxel,
@@ -73,7 +73,7 @@ impl Filter for ThresholdFilter {
             DataSet::StructuredGrid(sg) => {
                 Ok(DataSet::UnstructuredGrid(self.threshold_structured(
                     sg.dimensions,
-                    sg.points.clone(),
+                    GridPoints::from_structured(&sg.points, sg.dimensions),
                     &sg.point_data,
                     &sg.cell_data,
                     CellType::Hexahedron,
@@ -212,7 +212,7 @@ impl ThresholdFilter {
     fn threshold_structured(
         &self,
         dims: [usize; 3],
-        points: Vec<[f32; 3]>,
+        points: GridPoints<'_>,
         point_data: &FieldData,
         cell_data: &FieldData,
         cell_type: CellType,
@@ -262,18 +262,41 @@ impl ThresholdFilter {
             })
             .collect();
 
+        if kept.is_empty() {
+            return Ok(UnstructuredGrid::new());
+        }
+
+        let n_pts = nx * ny * nz;
+        let mut remap = vec![u32::MAX; n_pts];
+        let mut new_points = Vec::new();
+        let mut old_indices = Vec::new();
         let mut ug = UnstructuredGrid::new();
-        ug.points = points;
-        ug.point_data = point_data.clone();
         let mut kept_ids = Vec::with_capacity(kept.len());
-        for (cidx, corners) in kept {
+
+        for (cidx, mut corners) in kept {
+            for v in &mut corners {
+                let orig = *v as usize;
+                let mapped = remap[orig];
+                if mapped == u32::MAX {
+                    let id = new_points.len() as u32;
+                    remap[orig] = id;
+                    new_points.push(points.at_linear(orig));
+                    old_indices.push(orig);
+                    *v = id;
+                } else {
+                    *v = mapped;
+                }
+            }
             ug.push_cell(cell_type, &corners);
             kept_ids.push(cidx);
         }
+
+        ug.points = new_points;
+        ug.point_data = point_data.gather(&old_indices);
         if !cell_data.is_empty() {
             ug.cell_data = cell_data.gather(&kept_ids);
         }
-        Ok(compact_unstructured_points(ug))
+        Ok(ug)
     }
 
     fn threshold_unstructured(&self, in_ug: &UnstructuredGrid) -> Result<UnstructuredGrid, PipelineError> {

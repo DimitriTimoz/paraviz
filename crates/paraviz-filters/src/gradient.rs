@@ -1,5 +1,6 @@
 //! Vector/scalar gradient, divergence, vorticity, and Q-criterion filter (`GradientFilter`).
 
+use crate::util::{canonical_edge_key, FxHashSet};
 use glam::Vec3;
 use paraviz_core::{
     ArrayData, DataArray, DataSet, FieldData, Filter, ImageData, MultiBlockDataSet, PipelineError,
@@ -17,10 +18,18 @@ pub struct GradientFilter {
     pub compute_divergence: bool,
     pub compute_vorticity: bool,
     pub compute_q_criterion: bool,
+    #[serde(default)]
+    pub compute_lambda2: bool,
     pub gradient_name: String,
     pub divergence_name: String,
     pub vorticity_name: String,
     pub q_criterion_name: String,
+    #[serde(default = "default_lambda2_name")]
+    pub lambda2_name: String,
+}
+
+fn default_lambda2_name() -> String {
+    "Lambda2".into()
 }
 
 impl Default for GradientFilter {
@@ -31,10 +40,12 @@ impl Default for GradientFilter {
             compute_divergence: false,
             compute_vorticity: false,
             compute_q_criterion: false,
+            compute_lambda2: false,
             gradient_name: "Gradient".into(),
             divergence_name: "Divergence".into(),
             vorticity_name: "Vorticity".into(),
             q_criterion_name: "QCriterion".into(),
+            lambda2_name: default_lambda2_name(),
         }
     }
 }
@@ -54,6 +65,7 @@ impl GradientFilter {
             compute_divergence: true,
             compute_vorticity: true,
             compute_q_criterion: true,
+            compute_lambda2: true,
             ..Default::default()
         }
     }
@@ -217,10 +229,72 @@ impl GradientFilter {
                         .collect();
                     pd.add_array(DataArray::scalars_f32(&self.q_criterion_name, qcrit));
                 }
+                if self.compute_lambda2 {
+                    let l2: Vec<f32> = jacs
+                        .par_iter()
+                        .map(|j| compute_lambda2_from_jacobian(j) as f32)
+                        .collect();
+                    pd.add_array(DataArray::scalars_f32(&self.lambda2_name, l2));
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Computes the Jeong-Hussain $\lambda_2$ vortex criterion (middle eigenvalue of symmetric $S^2 + \Omega^2$).
+fn compute_lambda2_from_jacobian(j: &[f64; 9]) -> f64 {
+    let s = [
+        [j[0], 0.5 * (j[1] + j[3]), 0.5 * (j[2] + j[6])],
+        [0.5 * (j[1] + j[3]), j[4], 0.5 * (j[5] + j[7])],
+        [0.5 * (j[2] + j[6]), 0.5 * (j[5] + j[7]), j[8]],
+    ];
+    let o = [
+        [0.0, 0.5 * (j[1] - j[3]), 0.5 * (j[2] - j[6])],
+        [-0.5 * (j[1] - j[3]), 0.0, 0.5 * (j[5] - j[7])],
+        [-0.5 * (j[2] - j[6]), -0.5 * (j[5] - j[7]), 0.0],
+    ];
+    // Symmetric matrix M = S^2 + O^2
+    let mut m = [[0.0f64; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            let mut sum = 0.0;
+            for k in 0..3 {
+                sum += s[r][k] * s[k][c] + o[r][k] * o[k][c];
+            }
+            m[r][c] = sum;
+        }
+    }
+    // Eigenvalues of 3x3 real symmetric matrix via analytical trigonometric method
+    let p1 = m[0][1] * m[0][1] + m[0][2] * m[0][2] + m[1][2] * m[1][2];
+    if p1 < 1e-24 {
+        let mut e = [m[0][0], m[1][1], m[2][2]];
+        e.sort_by(|a, b| a.total_cmp(b));
+        return e[1];
+    }
+    let q = (m[0][0] + m[1][1] + m[2][2]) / 3.0;
+    let p2 = (m[0][0] - q).powi(2) + (m[1][1] - q).powi(2) + (m[2][2] - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    if p < 1e-18 {
+        return q;
+    }
+    let b00 = (m[0][0] - q) / p;
+    let b11 = (m[1][1] - q) / p;
+    let b22 = (m[2][2] - q) / p;
+    let b01 = m[0][1] / p;
+    let b02 = m[0][2] / p;
+    let b12 = m[1][2] / p;
+    let det_b = b00 * (b11 * b22 - b12 * b12)
+        - b01 * (b01 * b22 - b12 * b02)
+        + b02 * (b01 * b12 - b11 * b02);
+    let r = (det_b * 0.5).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    let eig1 = q + 2.0 * p * phi.cos();
+    let eig3 = q + 2.0 * p * (phi + 2.0 * std::f64::consts::PI / 3.0).cos();
+    let eig2 = 3.0 * q - eig1 - eig3;
+    let mut e = [eig1, eig2, eig3];
+    e.sort_by(|a, b| a.total_cmp(b));
+    e[1]
 }
 
 fn compute_image_jacobians(
@@ -434,14 +508,17 @@ fn compute_unstructured_jacobians(
 ) -> Result<JacobianResult, PipelineError> {
     let n = ug.num_points();
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut seen_pairs: FxHashSet<u64> =
+        FxHashSet::with_capacity_and_hasher(ug.num_cells() * 8, Default::default());
     for cell_idx in 0..ug.num_cells() {
         let pts = ug.cell_points(cell_idx);
-        for &a in pts {
+        for (idx_a, &a) in pts.iter().enumerate() {
             let ai = a as usize;
-            for &b in pts {
+            for &b in &pts[(idx_a + 1)..] {
                 let bi = b as usize;
-                if ai != bi && !adj[ai].contains(&bi) {
+                if ai != bi && seen_pairs.insert(canonical_edge_key(a, b)) {
                     adj[ai].push(bi);
+                    adj[bi].push(ai);
                 }
             }
         }

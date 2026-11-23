@@ -1,6 +1,6 @@
 //! 3D glyph placement filter (`GlyphFilter`, equivalent to `vtkGlyph3D`).
 
-use crate::util::dataset_points;
+use crate::util::GridPoints;
 use glam::{Quat, Vec3};
 use paraviz_core::{
     ArrayData, DataArray, DataSet, FieldData, Filter, PipelineError, PolyData,
@@ -79,7 +79,7 @@ impl Filter for GlyphFilter {
             return Ok(DataSet::PolyData(crate::util::merge_polydata(parts)));
         }
 
-        let in_points = dataset_points(input)?;
+        let in_points = GridPoints::from_dataset(input)?;
         if in_points.is_empty() {
             return Ok(DataSet::PolyData(PolyData::new()));
         }
@@ -129,7 +129,7 @@ impl Filter for GlyphFilter {
         let instances: Vec<GlyphInstance> = sample_indices
             .par_iter()
             .map(|&pt_idx| {
-                let origin = Vec3::from_array(in_points[pt_idx]);
+                let origin = Vec3::from_array(in_points.at_linear(pt_idx));
                 let vec = vec_arr.map(|a| Vec3::from_array(a.get_vec3(pt_idx)));
                 let rot = match vec {
                     Some(v) if v.length_squared() > 1e-12 => {

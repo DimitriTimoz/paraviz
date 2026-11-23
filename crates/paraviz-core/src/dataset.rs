@@ -143,23 +143,59 @@ impl PolyData {
 
     /// Computes smooth vertex normals if `polys` are present and stores them in `point_data`.
     pub fn compute_normals(&mut self) {
-        let mut normals = vec![Vec3::ZERO; self.points.len()];
-        for poly in &self.polys {
-            if poly.len() < 3 {
-                continue;
-            }
-            let p0 = Vec3::from_array(self.points[poly[0] as usize]);
-            let p1 = Vec3::from_array(self.points[poly[1] as usize]);
-            let p2 = Vec3::from_array(self.points[poly[2] as usize]);
-            let n = (p1 - p0).cross(p2 - p0);
-            for &idx in poly {
-                if let Some(acc) = normals.get_mut(idx as usize) {
-                    *acc += n;
+        use rayon::prelude::*;
+        let n_pts = self.points.len();
+        let normals: Vec<Vec3> = if self.polys.len() >= 2048 {
+            let points = &self.points;
+            self.polys
+                .par_chunks(1024)
+                .map(|chunk| {
+                    let mut local = vec![Vec3::ZERO; n_pts];
+                    for poly in chunk {
+                        if poly.len() < 3 {
+                            continue;
+                        }
+                        let p0 = Vec3::from_array(points[poly[0] as usize]);
+                        let p1 = Vec3::from_array(points[poly[1] as usize]);
+                        let p2 = Vec3::from_array(points[poly[2] as usize]);
+                        let n = (p1 - p0).cross(p2 - p0);
+                        for &idx in poly {
+                            if let Some(acc) = local.get_mut(idx as usize) {
+                                *acc += n;
+                            }
+                        }
+                    }
+                    local
+                })
+                .reduce(
+                    || vec![Vec3::ZERO; n_pts],
+                    |mut a, b| {
+                        for (va, vb) in a.iter_mut().zip(b.iter()) {
+                            *va += *vb;
+                        }
+                        a
+                    },
+                )
+        } else {
+            let mut acc = vec![Vec3::ZERO; n_pts];
+            for poly in &self.polys {
+                if poly.len() < 3 {
+                    continue;
+                }
+                let p0 = Vec3::from_array(self.points[poly[0] as usize]);
+                let p1 = Vec3::from_array(self.points[poly[1] as usize]);
+                let p2 = Vec3::from_array(self.points[poly[2] as usize]);
+                let n = (p1 - p0).cross(p2 - p0);
+                for &idx in poly {
+                    if let Some(v) = acc.get_mut(idx as usize) {
+                        *v += n;
+                    }
                 }
             }
-        }
+            acc
+        };
         let flat: Vec<[f32; 3]> = normals
-            .into_iter()
+            .into_par_iter()
             .map(|n| {
                 let len = n.length();
                 if len > 1e-12 {
@@ -173,16 +209,18 @@ impl PolyData {
             .set_normals(DataArray::vectors_f32("Normals", flat));
     }
 
-    /// Triangulates polygons and triangle strips into a flat list of `[u32; 3]` triangles.
+    /// Triangulates polygons (using ear-clipping for n-gons >= 4 so concave polygons are handled
+    /// accurately) and triangle strips into a flat list of `[u32; 3]` triangles.
     pub fn triangulate(&self) -> Vec<[u32; 3]> {
         let mut tris = Vec::with_capacity(self.polys.len() * 2);
         for poly in &self.polys {
             if poly.len() < 3 {
                 continue;
             }
-            let v0 = poly[0];
-            for k in 1..(poly.len() - 1) {
-                tris.push([v0, poly[k], poly[k + 1]]);
+            if poly.len() == 3 {
+                tris.push([poly[0], poly[1], poly[2]]);
+            } else {
+                ear_clip_polygon(&self.points, poly, &mut tris);
             }
         }
         for strip in &self.strips {
@@ -198,6 +236,137 @@ impl PolyData {
             }
         }
         tris
+    }
+}
+
+/// Ear-clipping triangulation of a 3D polygon projected onto its Newell normal plane.
+/// Falls back to a triangle fan only if the polygon is degenerate/self-intersecting.
+fn ear_clip_polygon(points: &[[f32; 3]], poly: &[u32], out: &mut Vec<[u32; 3]>) {
+    let n = poly.len();
+    if n == 3 {
+        out.push([poly[0], poly[1], poly[2]]);
+        return;
+    }
+    if n == 4 {
+        // Choose the better diagonal for quads (handles concave quads cleanly)
+        let p0 = Vec3::from_array(points[poly[0] as usize]);
+        let p1 = Vec3::from_array(points[poly[1] as usize]);
+        let p2 = Vec3::from_array(points[poly[2] as usize]);
+        let p3 = Vec3::from_array(points[poly[3] as usize]);
+        let n012 = (p1 - p0).cross(p2 - p0);
+        let n023 = (p2 - p0).cross(p3 - p0);
+        if n012.dot(n023) >= 0.0 {
+            out.push([poly[0], poly[1], poly[2]]);
+            out.push([poly[0], poly[2], poly[3]]);
+        } else {
+            out.push([poly[1], poly[2], poly[3]]);
+            out.push([poly[1], poly[3], poly[0]]);
+        }
+        return;
+    }
+
+    // Newell's method for robust polygon normal
+    let mut normal = Vec3::ZERO;
+    for i in 0..n {
+        let a = Vec3::from_array(points[poly[i] as usize]);
+        let b = Vec3::from_array(points[poly[(i + 1) % n] as usize]);
+        normal.x += (a.y - b.y) * (a.z + b.z);
+        normal.y += (a.z - b.z) * (a.x + b.x);
+        normal.z += (a.x - b.x) * (a.y + b.y);
+    }
+    let nlen = normal.length();
+    if nlen < 1e-12 {
+        let v0 = poly[0];
+        for k in 1..(n - 1) {
+            out.push([v0, poly[k], poly[k + 1]]);
+        }
+        return;
+    }
+    let normal = normal / nlen;
+    // Build 2D orthonormal basis on the polygon plane
+    let ref_axis = if normal.x.abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let u = normal.cross(ref_axis).normalize();
+    let v = normal.cross(u);
+
+    let pts2d: Vec<[f32; 2]> = poly
+        .iter()
+        .map(|&idx| {
+            let p = Vec3::from_array(points[idx as usize]);
+            [p.dot(u), p.dot(v)]
+        })
+        .collect();
+
+    // Ensure CCW orientation in 2D
+    let mut signed_area2 = 0.0f32;
+    for i in 0..n {
+        let a = pts2d[i];
+        let b = pts2d[(i + 1) % n];
+        signed_area2 += a[0] * b[1] - b[0] * a[1];
+    }
+    let orient = if signed_area2 >= 0.0 { 1.0f32 } else { -1.0f32 };
+
+    let cross2d = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> f32 {
+        ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) * orient
+    };
+
+    let point_in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> bool {
+        let c1 = cross2d(a, b, p);
+        let c2 = cross2d(b, c, p);
+        let c3 = cross2d(c, a, p);
+        c1 >= -1e-6 && c2 >= -1e-6 && c3 >= -1e-6
+    };
+
+    let mut remaining: Vec<usize> = (0..n).collect();
+    let mut guard = remaining.len() * remaining.len() + 4;
+    let start_len = out.len();
+
+    while remaining.len() > 3 && guard > 0 {
+        guard -= 1;
+        let m = remaining.len();
+        let mut clipped = false;
+        for i in 0..m {
+            let prev = remaining[(i + m - 1) % m];
+            let curr = remaining[i];
+            let next = remaining[(i + 1) % m];
+            let a = pts2d[prev];
+            let b = pts2d[curr];
+            let c = pts2d[next];
+            if cross2d(a, b, c) <= 1e-7 {
+                continue; // reflex or collinear
+            }
+            let mut has_inside = false;
+            for &other in &remaining {
+                if other == prev || other == curr || other == next {
+                    continue;
+                }
+                if point_in_tri(pts2d[other], a, b, c) {
+                    has_inside = true;
+                    break;
+                }
+            }
+            if !has_inside {
+                out.push([poly[prev], poly[curr], poly[next]]);
+                remaining.remove(i);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            // Degenerate polygon fallback: fan remaining vertices
+            out.truncate(start_len);
+            let v0 = poly[0];
+            for k in 1..(n - 1) {
+                out.push([v0, poly[k], poly[k + 1]]);
+            }
+            return;
+        }
+    }
+    if remaining.len() == 3 {
+        out.push([poly[remaining[0]], poly[remaining[1]], poly[remaining[2]]]);
     }
 }
 
@@ -694,21 +863,23 @@ impl DataSet {
         }
     }
 
+    pub fn field_data_mut(&mut self) -> Option<&mut FieldData> {
+        match self {
+            Self::PolyData(d) => Some(&mut d.field_data),
+            Self::ImageData(d) => Some(&mut d.field_data),
+            Self::RectilinearGrid(d) => Some(&mut d.field_data),
+            Self::StructuredGrid(d) => Some(&mut d.field_data),
+            Self::UnstructuredGrid(d) => Some(&mut d.field_data),
+            Self::MultiBlock(_) => None,
+        }
+    }
+
     /// Approximate in-memory footprint in bytes for ParaView Information tab.
     pub fn memory_bytes(&self) -> usize {
         let field_bytes = |f: &FieldData| -> usize {
             f.arrays()
                 .iter()
-                .map(|a| {
-                    let elem = match a.data.scalar_type() {
-                        crate::array::ScalarType::U8 => 1,
-                        crate::array::ScalarType::F32
-                        | crate::array::ScalarType::I32
-                        | crate::array::ScalarType::U32 => 4,
-                        crate::array::ScalarType::F64 | crate::array::ScalarType::I64 => 8,
-                    };
-                    a.data.len() * elem
-                })
+                .map(|a| a.data.len() * a.data.scalar_type().byte_size())
                 .sum()
         };
         match self {

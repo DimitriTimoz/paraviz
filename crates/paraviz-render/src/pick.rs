@@ -5,6 +5,98 @@ use crate::mesh_prep;
 use crate::scene::{ActorStyle, ColorBy, RenderScene, Representation, SceneActor};
 use glam::Vec3;
 use paraviz_core::{BoundingBox, DataArray, DataSet, FieldData, PolyData};
+use rayon::prelude::*;
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+const PARALLEL_TRI_THRESHOLD: usize = 2000;
+const PICK_CHUNK_TRIS: usize = 64;
+const MAX_PICK_CACHE_ENTRIES: usize = 32;
+
+struct PickChunk {
+    bounds: BoundingBox,
+    tri_range: Range<usize>,
+}
+
+struct PickTriMesh {
+    positions: Vec<[f32; 3]>,
+    tris: Vec<[u32; 3]>,
+    scalars: Option<Vec<f32>>,
+    chunks: Vec<PickChunk>,
+}
+
+struct CachedPickEntry {
+    actor_id: u64,
+    dataset_weak: Weak<DataSet>,
+    color_by: ColorBy,
+    mesh: Arc<PickTriMesh>,
+}
+
+static PICK_SURFACE_CACHE: OnceLock<Mutex<Vec<CachedPickEntry>>> = OnceLock::new();
+
+fn build_pick_trimesh(dataset: &DataSet, color_by: &ColorBy) -> PickTriMesh {
+    let prep = mesh_prep::prepare_surface_indexed(dataset, color_by);
+    let positions: Vec<[f32; 3]> = prep.geom_vertices.iter().map(|v| v.position).collect();
+    let tris: Vec<[u32; 3]> = prep.indices.as_chunks::<3>().0.to_vec();
+    let scalars = if matches!(color_by, ColorBy::Solid(_)) {
+        None
+    } else {
+        Some(prep.scalars)
+    };
+    let mut chunks = Vec::with_capacity(tris.len().div_ceil(PICK_CHUNK_TRIS));
+    let mut start = 0;
+    while start < tris.len() {
+        let end = (start + PICK_CHUNK_TRIS).min(tris.len());
+        let mut bb = BoundingBox::EMPTY;
+        for tri in &tris[start..end] {
+            for &vi in tri {
+                if let Some(&p) = positions.get(vi as usize) {
+                    bb.expand_point(Vec3::from_array(p));
+                }
+            }
+        }
+        chunks.push(PickChunk {
+            bounds: bb,
+            tri_range: start..end,
+        });
+        start = end;
+    }
+    PickTriMesh {
+        positions,
+        tris,
+        scalars,
+        chunks,
+    }
+}
+
+fn get_or_build_pick_trimesh(actor: &SceneActor) -> Arc<PickTriMesh> {
+    let cache = PICK_SURFACE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut entries) = cache.lock() {
+        entries.retain(|e| e.dataset_weak.strong_count() > 0);
+        if let Some(found) = entries.iter().find(|e| {
+            e.actor_id == actor.id
+                && e.color_by == actor.style.color_by
+                && e.dataset_weak
+                    .upgrade()
+                    .is_some_and(|d| Arc::ptr_eq(&d, &actor.dataset))
+        }) {
+            return Arc::clone(&found.mesh);
+        }
+        let mesh = Arc::new(build_pick_trimesh(&actor.dataset, &actor.style.color_by));
+        if entries.len() >= MAX_PICK_CACHE_ENTRIES {
+            entries.remove(0);
+        }
+        entries.push(CachedPickEntry {
+            actor_id: actor.id,
+            dataset_weak: Arc::downgrade(&actor.dataset),
+            color_by: actor.style.color_by.clone(),
+            mesh: Arc::clone(&mesh),
+        });
+        mesh
+    } else {
+        Arc::new(build_pick_trimesh(&actor.dataset, &actor.style.color_by))
+    }
+}
 
 /// Result of a 3D viewport pick query from [`pick_scene`].
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +163,7 @@ fn pick_actor(
 
     // Pad AABB for point/wireframe representations so grazing picks on boundary points still pass pre-cull.
     let aabb_pad = match actor.style.representation {
-        Representation::Points => {
+        Representation::Points | Representation::PointGaussian => {
             let approx_dist = (bounds.center() - ray_origin).length().max(1.0);
             let scale = if orthographic { 1.0 } else { approx_dist };
             actor.style.point_size.max(4.0) * scale * pixel_world_scale + bounds.diagonal() * 0.02
@@ -97,7 +189,7 @@ fn pick_actor(
         Representation::Surface | Representation::SurfaceWithEdges => {
             pick_surface(actor, ray_origin, ray_dir, max_t)
         }
-        Representation::Points => {
+        Representation::Points | Representation::PointGaussian => {
             pick_points(actor, ray_origin, ray_dir, pixel_world_scale, orthographic, max_t)
         }
         Representation::Wireframe => {
@@ -158,32 +250,67 @@ fn pick_surface(
         return pick_polydata_surface(actor, poly, ray_origin, ray_dir, max_t);
     }
 
-    // Fallback for volumetric / grid / multiblock datasets: intersect extracted boundary surface triangles.
-    let prep = mesh_prep::prepare_surface(&actor.dataset, &actor.style.color_by);
-    let mut best_t = max_t;
-    let mut best_pos = None;
-    let mut best_scalar = None;
-
-    for tri in prep.vertices.as_chunks::<3>().0 {
-        let p0 = Vec3::from_array(tri[0].position);
-        let p1 = Vec3::from_array(tri[1].position);
-        let p2 = Vec3::from_array(tri[2].position);
-        if let Some((t, u, v)) = ray_triangle_intersect(ray_origin, ray_dir, p0, p1, p2)
-            && t < best_t
-        {
-            best_t = t;
-            let w = 1.0 - u - v;
-            best_pos = Some(p0 * w + p1 * u + p2 * v);
-            let s = if !matches!(actor.style.color_by, ColorBy::Solid(_)) {
-                Some((tri[0].scalar * w + tri[1].scalar * u + tri[2].scalar * v) as f64)
-            } else {
-                None
-            };
-            best_scalar = s;
-        }
+    // Cached indexed boundary surface with chunk AABB pre-filtering + Rayon parallel ray intersection.
+    let mesh = get_or_build_pick_trimesh(actor);
+    if mesh.tris.is_empty() {
+        return None;
     }
 
-    best_pos.map(|pos| PickResult {
+    let test_chunk = |chunk: &PickChunk, limit_t: f32| -> Option<(f32, usize, Vec3, Option<f64>)> {
+        let (t_enter, _) = ray_aabb_intersect(ray_origin, ray_dir, &chunk.bounds)?;
+        if t_enter >= limit_t {
+            return None;
+        }
+        let mut best_t = limit_t;
+        let mut best: Option<(f32, usize, Vec3, Option<f64>)> = None;
+        for (local_idx, tri) in mesh.tris[chunk.tri_range.clone()].iter().enumerate() {
+            let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            if i0 >= mesh.positions.len() || i1 >= mesh.positions.len() || i2 >= mesh.positions.len() {
+                continue;
+            }
+            let p0 = Vec3::from_array(mesh.positions[i0]);
+            let p1 = Vec3::from_array(mesh.positions[i1]);
+            let p2 = Vec3::from_array(mesh.positions[i2]);
+            if let Some((t, u, v)) = ray_triangle_intersect(ray_origin, ray_dir, p0, p1, p2)
+                && t < best_t
+            {
+                best_t = t;
+                let w = 1.0 - u - v;
+                let pos = p0 * w + p1 * u + p2 * v;
+                let scalar = mesh
+                    .scalars
+                    .as_ref()
+                    .map(|sc| (sc[i0] * w + sc[i1] * u + sc[i2] * v) as f64);
+                best = Some((t, chunk.tri_range.start + local_idx, pos, scalar));
+            }
+        }
+        best
+    };
+
+    let best_hit = if mesh.tris.len() > PARALLEL_TRI_THRESHOLD {
+        mesh.chunks
+            .par_iter()
+            .filter_map(|chunk| test_chunk(chunk, max_t))
+            .reduce_with(|a, b| {
+                if a.0 < b.0 || (a.0 == b.0 && a.1 < b.1) {
+                    a
+                } else {
+                    b
+                }
+            })
+    } else {
+        let mut best_t = max_t;
+        let mut best: Option<(f32, usize, Vec3, Option<f64>)> = None;
+        for chunk in &mesh.chunks {
+            if let Some(hit) = test_chunk(chunk, best_t) {
+                best_t = hit.0;
+                best = Some(hit);
+            }
+        }
+        best
+    };
+
+    best_hit.map(|(best_t, _, pos, best_scalar)| PickResult {
         actor_id: actor.id,
         actor_name: actor.name.clone(),
         world_pos: pos.to_array(),
@@ -195,6 +322,7 @@ fn pick_surface(
 }
 
 struct PolyTriHit {
+    t: f32,
     pos: Vec3,
     point_index: usize,
     cell_index: usize,
@@ -209,20 +337,27 @@ fn pick_polydata_surface(
     ray_dir: Vec3,
     max_t: f32,
 ) -> Option<PickResult> {
-    let mut best_t = max_t;
-    let mut best_hit: Option<PolyTriHit> = None;
-
     let poly_base = poly.verts.len() + poly.lines.len();
-    for (pi, p) in poly.polys.iter().enumerate() {
+    let strip_base = poly_base + poly.polys.len();
+    let total_est_tris = poly.polys.len()
+        + poly
+            .strips
+            .iter()
+            .map(|s| s.len().saturating_sub(2))
+            .sum::<usize>();
+
+    let test_poly = |pi: usize, p: &Vec<u32>, limit_t: f32| -> Option<PolyTriHit> {
         if p.len() < 3 {
-            continue;
+            return None;
         }
-        let cell_idx = poly_base + pi;
         let i0 = p[0] as usize;
         if i0 >= poly.points.len() {
-            continue;
+            return None;
         }
+        let cell_idx = poly_base + pi;
         let p0 = Vec3::from_array(poly.points[i0]);
+        let mut best_t = limit_t;
+        let mut best: Option<PolyTriHit> = None;
         for k in 1..(p.len() - 1) {
             let i1 = p[k] as usize;
             let i2 = p[k + 1] as usize;
@@ -244,7 +379,8 @@ fn pick_polydata_surface(
                 } else {
                     i2
                 };
-                best_hit = Some(PolyTriHit {
+                best = Some(PolyTriHit {
+                    t,
                     pos: hit_pos,
                     point_index: nearest_pt,
                     cell_index: cell_idx,
@@ -253,14 +389,16 @@ fn pick_polydata_surface(
                 });
             }
         }
-    }
+        best
+    };
 
-    let strip_base = poly_base + poly.polys.len();
-    for (si, s) in poly.strips.iter().enumerate() {
+    let test_strip = |si: usize, s: &Vec<u32>, limit_t: f32| -> Option<PolyTriHit> {
         if s.len() < 3 {
-            continue;
+            return None;
         }
         let cell_idx = strip_base + si;
+        let mut best_t = limit_t;
+        let mut best: Option<PolyTriHit> = None;
         for k in 0..(s.len() - 2) {
             let (i0, i1, i2) = if k % 2 == 0 {
                 (s[k] as usize, s[k + 1] as usize, s[k + 2] as usize)
@@ -286,7 +424,8 @@ fn pick_polydata_surface(
                 } else {
                     i2
                 };
-                best_hit = Some(PolyTriHit {
+                best = Some(PolyTriHit {
+                    t,
                     pos: hit_pos,
                     point_index: nearest_pt,
                     cell_index: cell_idx,
@@ -295,7 +434,51 @@ fn pick_polydata_surface(
                 });
             }
         }
-    }
+        best
+    };
+
+    let pick_closer = |a: PolyTriHit, b: PolyTriHit| -> PolyTriHit {
+        if a.t < b.t || (a.t == b.t && a.cell_index < b.cell_index) {
+            a
+        } else {
+            b
+        }
+    };
+
+    let best_hit = if total_est_tris > PARALLEL_TRI_THRESHOLD {
+        let poly_best = poly
+            .polys
+            .par_iter()
+            .enumerate()
+            .filter_map(|(pi, p)| test_poly(pi, p, max_t))
+            .reduce_with(&pick_closer);
+        let strip_best = poly
+            .strips
+            .par_iter()
+            .enumerate()
+            .filter_map(|(si, s)| test_strip(si, s, max_t))
+            .reduce_with(&pick_closer);
+        match (poly_best, strip_best) {
+            (Some(a), Some(b)) => Some(pick_closer(a, b)),
+            (a, b) => a.or(b),
+        }
+    } else {
+        let mut best_t = max_t;
+        let mut best: Option<PolyTriHit> = None;
+        for (pi, p) in poly.polys.iter().enumerate() {
+            if let Some(hit) = test_poly(pi, p, best_t) {
+                best_t = hit.t;
+                best = Some(hit);
+            }
+        }
+        for (si, s) in poly.strips.iter().enumerate() {
+            if let Some(hit) = test_strip(si, s, best_t) {
+                best_t = hit.t;
+                best = Some(hit);
+            }
+        }
+        best
+    };
 
     let hit = best_hit?;
     let scalar_value = resolve_triangle_scalar(
@@ -311,7 +494,7 @@ fn pick_polydata_surface(
         actor_id: actor.id,
         actor_name: actor.name.clone(),
         world_pos: hit.pos.to_array(),
-        distance: best_t,
+        distance: hit.t,
         point_index: Some(hit.point_index),
         cell_index: Some(hit.cell_index),
         scalar_value,

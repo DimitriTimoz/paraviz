@@ -1,13 +1,13 @@
 //! Surface normal generation and sharp-edge vertex splitting filter
 //! (`GenerateNormalsFilter`, equivalent to `vtkPolyDataNormals`).
 
-use crate::util::{canonical_edge_key, polygon_area_normal};
+use crate::util::{canonical_edge_key, fx_map_with_capacity, polygon_area_normal, FxHashMap};
 use glam::Vec3;
 use paraviz_core::{
     DataArray, DataSet, Filter, MultiBlockDataSet, PipelineError, PolyData,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 /// Splits vertices across sharp edges exceeding `feature_angle_deg` and computes
 /// smooth area-weighted vertex normals on [`PolyData`] surfaces.
@@ -153,7 +153,7 @@ impl GenerateNormalsFilter {
             .map(|n| n.normalize_or_zero())
             .collect();
 
-        let mut edge_to_polys: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut edge_to_polys: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
         let mut vert_to_polys: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_pts];
         for (pidx, poly) in polys.iter().enumerate() {
             let m = poly.len();
@@ -187,7 +187,7 @@ impl GenerateNormalsFilter {
             let k = occurrences.len();
             // Build local adjacency among incident occurrences of vertex `v_idx`.
             let mut visited = vec![false; k];
-            let mut poly_to_occ: HashMap<usize, usize> = HashMap::with_capacity(k);
+            let mut poly_to_occ: FxHashMap<usize, usize> = fx_map_with_capacity(k);
             for (oi, &(pidx, _)) in occurrences.iter().enumerate() {
                 poly_to_occ.insert(pidx, oi);
             }
@@ -326,7 +326,7 @@ fn enforce_consistent_winding(polys: &mut [Vec<u32>]) {
         return;
     }
 
-    let mut edge_map: HashMap<u64, Vec<(usize, u32, u32)>> = HashMap::new();
+    let mut edge_map: FxHashMap<u64, Vec<(usize, u32, u32)>> = FxHashMap::default();
     for (pidx, poly) in polys.iter().enumerate() {
         let m = poly.len();
         if m < 3 {

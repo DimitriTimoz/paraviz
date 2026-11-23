@@ -1,5 +1,6 @@
 //! Self-contained mesh, line, point, outline, and 3D volume extraction from `paraviz-core` datasets.
 
+use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::scene::{ColorBy, ViewportWidget};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
@@ -7,9 +8,11 @@ use paraviz_core::{
     BoundingBox, CellType, DataArray, DataSet, FieldData, ImageData, PolyData, RectilinearGrid,
     StructuredGrid, UnstructuredGrid,
 };
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 
-/// Non-indexed triangle vertex for Surface and SurfaceWithEdges rendering.
+const PARALLEL_THRESHOLD: usize = 4096;
+
+/// Non-indexed triangle vertex for SurfaceWithEdges rendering.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SurfaceVertex {
@@ -17,6 +20,35 @@ pub struct SurfaceVertex {
     pub normal: [f32; 3],
     pub scalar: f32,
     pub barycentric: [f32; 3],
+}
+
+/// Geometry-only vertex (position + normal) for indexed Surface rendering with split scalar slot.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct SurfaceGeomVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+}
+
+/// Describes how an indexed surface's vertices map back to dataset point scalars for fast re-coloring.
+#[derive(Debug, Clone)]
+pub enum SurfaceScalarSource {
+    /// GPU vertex `i` maps directly to `PolyData.points[i]`.
+    PointDirect,
+    /// GPU vertex `v` maps to dataset point index `point_indices[v]`.
+    PointMapped(Vec<u32>),
+    /// Cell scalars or multi-block datasets require rebuilding geometry when `color_by` changes.
+    RebuildRequired,
+}
+
+/// Indexed surface mesh with split geometry and scalar streams plus `u32` triangle indices.
+#[derive(Debug, Clone)]
+pub struct PreparedIndexedSurface {
+    pub geom_vertices: Vec<SurfaceGeomVertex>,
+    pub scalars: Vec<f32>,
+    pub indices: Vec<u32>,
+    pub scalar_source: SurfaceScalarSource,
+    pub scalar_range: (f64, f64),
 }
 
 /// Line vertex for Wireframe and Outline rendering.
@@ -135,6 +167,544 @@ pub fn prepare_outline(bounds: &BoundingBox) -> Vec<LineVertex> {
     out
 }
 
+/// Extracts indexed surface triangles (position+normal, split scalar stream, and `u32` indices)
+/// from any [`DataSet`] for `Representation::Surface` without barycentric overhead.
+pub fn prepare_surface_indexed(dataset: &DataSet, color_by: &ColorBy) -> PreparedIndexedSurface {
+    let mut geom_vertices = Vec::new();
+    let mut scalars = Vec::new();
+    let mut indices = Vec::new();
+    let mut range = None;
+    let is_multiblock = matches!(dataset, DataSet::MultiBlock(_));
+    let mut point_map: Option<Vec<u32>> = if !is_multiblock
+        && !matches!(dataset, DataSet::PolyData(_))
+        && !matches!(color_by, ColorBy::CellScalar { .. })
+    {
+        Some(Vec::new())
+    } else {
+        None
+    };
+
+    append_indexed_dataset(
+        dataset,
+        color_by,
+        &mut geom_vertices,
+        &mut scalars,
+        &mut indices,
+        &mut point_map,
+        &mut range,
+    );
+
+    let scalar_source = if is_multiblock || matches!(color_by, ColorBy::CellScalar { .. }) {
+        SurfaceScalarSource::RebuildRequired
+    } else if matches!(dataset, DataSet::PolyData(_)) {
+        SurfaceScalarSource::PointDirect
+    } else {
+        match point_map {
+            Some(map) => SurfaceScalarSource::PointMapped(map),
+            None => SurfaceScalarSource::RebuildRequired,
+        }
+    };
+
+    PreparedIndexedSurface {
+        geom_vertices,
+        scalars,
+        indices,
+        scalar_source,
+        scalar_range: range.unwrap_or((0.0, 1.0)),
+    }
+}
+
+/// Re-extracts only the per-vertex scalar float stream for an already-uploaded indexed surface,
+/// avoiding position/normal/index buffer rebuilds when only `ColorBy` point scalar or solid changes.
+pub fn extract_indexed_surface_scalars(
+    dataset: &DataSet,
+    color_by: &ColorBy,
+    source: &SurfaceScalarSource,
+    vertex_count: usize,
+) -> Option<(Vec<f32>, (f64, f64))> {
+    if matches!(color_by, ColorBy::CellScalar { .. }) {
+        return None;
+    }
+    let pd = dataset.point_data()?;
+    match source {
+        SurfaceScalarSource::PointDirect => {
+            if let ColorBy::PointScalar { array, component } = color_by {
+                let mut sc = extract_scalars(pd, array, *component).unwrap_or_default();
+                let range = compute_finite_range(&sc).unwrap_or((0.0, 1.0));
+                sc.resize(vertex_count, 0.0);
+                Some((sc, range))
+            } else {
+                Some((vec![0.0; vertex_count], (0.0, 1.0)))
+            }
+        }
+        SurfaceScalarSource::PointMapped(map) => {
+            if let ColorBy::PointScalar { array, component } = color_by {
+                if let Some(sc) = extract_scalars(pd, array, *component) {
+                    let range = compute_finite_range(&sc).unwrap_or((0.0, 1.0));
+                    let mapped: Vec<f32> = if map.len() >= PARALLEL_THRESHOLD {
+                        map.par_iter()
+                            .map(|&pi| sc.get(pi as usize).copied().unwrap_or(0.0))
+                            .collect()
+                    } else {
+                        map.iter()
+                            .map(|&pi| sc.get(pi as usize).copied().unwrap_or(0.0))
+                            .collect()
+                    };
+                    Some((mapped, range))
+                } else {
+                    Some((vec![0.0; vertex_count], (0.0, 1.0)))
+                }
+            } else {
+                Some((vec![0.0; vertex_count], (0.0, 1.0)))
+            }
+        }
+        SurfaceScalarSource::RebuildRequired => None,
+    }
+}
+
+fn append_indexed_dataset(
+    dataset: &DataSet,
+    color_by: &ColorBy,
+    geom: &mut Vec<SurfaceGeomVertex>,
+    scalars: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    point_map: &mut Option<Vec<u32>>,
+    range: &mut Option<(f64, f64)>,
+) {
+    match dataset {
+        DataSet::PolyData(poly) => {
+            append_indexed_poly(poly, color_by, geom, scalars, indices, range);
+        }
+        DataSet::ImageData(img) => {
+            append_indexed_structured(
+                img.dimensions,
+                &img.point_data,
+                &img.cell_data,
+                color_by,
+                |i, j, k| img.point_coords(i, j, k),
+                |i, j, k| img.point_index(i, j, k),
+                true,
+                geom,
+                scalars,
+                indices,
+                point_map,
+                range,
+            );
+        }
+        DataSet::RectilinearGrid(rect) => {
+            append_indexed_structured(
+                rect.dimensions(),
+                &rect.point_data,
+                &rect.cell_data,
+                color_by,
+                |i, j, k| rect.point_coords(i, j, k),
+                |i, j, k| rect.point_index(i, j, k),
+                true,
+                geom,
+                scalars,
+                indices,
+                point_map,
+                range,
+            );
+        }
+        DataSet::StructuredGrid(grid) => {
+            if grid.points.len() >= grid.dimensions[0] * grid.dimensions[1] * grid.dimensions[2] {
+                append_indexed_structured(
+                    grid.dimensions,
+                    &grid.point_data,
+                    &grid.cell_data,
+                    color_by,
+                    |i, j, k| grid.point_coords(i, j, k),
+                    |i, j, k| grid.point_index(i, j, k),
+                    false,
+                    geom,
+                    scalars,
+                    indices,
+                    point_map,
+                    range,
+                );
+            }
+        }
+        DataSet::UnstructuredGrid(ug) => {
+            append_indexed_unstructured(ug, color_by, geom, scalars, indices, point_map, range);
+        }
+        DataSet::MultiBlock(mb) => {
+            for (_, block) in &mb.blocks {
+                append_indexed_dataset(block, color_by, geom, scalars, indices, point_map, range);
+            }
+        }
+    }
+}
+
+fn collect_poly_tris_with_cell(poly: &PolyData) -> Vec<([u32; 3], usize)> {
+    let mut tris_with_cell: Vec<([u32; 3], usize)> = Vec::with_capacity(poly.polys.len() * 2);
+    let poly_base = poly.verts.len() + poly.lines.len();
+    for (pi, p) in poly.polys.iter().enumerate() {
+        if p.len() < 3 {
+            continue;
+        }
+        let cell_idx = poly_base + pi;
+        let v0 = p[0];
+        for k in 1..(p.len() - 1) {
+            tris_with_cell.push(([v0, p[k], p[k + 1]], cell_idx));
+        }
+    }
+    let strip_base = poly_base + poly.polys.len();
+    for (si, s) in poly.strips.iter().enumerate() {
+        if s.len() < 3 {
+            continue;
+        }
+        let cell_idx = strip_base + si;
+        for k in 0..(s.len() - 2) {
+            let tri = if k % 2 == 0 {
+                [s[k], s[k + 1], s[k + 2]]
+            } else {
+                [s[k + 1], s[k], s[k + 2]]
+            };
+            tris_with_cell.push((tri, cell_idx));
+        }
+    }
+    tris_with_cell
+}
+
+fn resolve_poly_normals(poly: &PolyData, tris_with_cell: &[([u32; 3], usize)]) -> Vec<[f32; 3]> {
+    if let Some(arr) = poly
+        .point_data
+        .active_normals_array()
+        .filter(|arr| arr.num_tuples() == poly.points.len())
+    {
+        let n = arr.num_tuples();
+        if n >= PARALLEL_THRESHOLD {
+            (0..n).into_par_iter().map(|i| arr.get_vec3(i)).collect()
+        } else {
+            (0..n).map(|i| arr.get_vec3(i)).collect()
+        }
+    } else {
+        compute_smooth_normals(&poly.points, tris_with_cell)
+    }
+}
+
+fn append_indexed_poly(
+    poly: &PolyData,
+    color_by: &ColorBy,
+    geom: &mut Vec<SurfaceGeomVertex>,
+    scalars_out: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    range: &mut Option<(f64, f64)>,
+) {
+    let tris_with_cell = collect_poly_tris_with_cell(poly);
+    if tris_with_cell.is_empty() {
+        return;
+    }
+
+    let normals = resolve_poly_normals(poly, &tris_with_cell);
+    let (scalars, is_cell) = scalar_lookup(&poly.point_data, &poly.cell_data, color_by);
+    if let Some(sc) = &scalars {
+        merge_range(range, compute_finite_range(sc));
+    }
+
+    let n_pts = poly.points.len();
+    if !is_cell {
+        let base_v = geom.len() as u32;
+        if n_pts >= PARALLEL_THRESHOLD {
+            let new_geom: Vec<SurfaceGeomVertex> = poly
+                .points
+                .par_iter()
+                .zip(normals.par_iter())
+                .map(|(&position, &normal)| SurfaceGeomVertex { position, normal })
+                .collect();
+            geom.extend(new_geom);
+        } else {
+            geom.reserve(n_pts);
+            for (&position, &normal) in poly.points.iter().zip(normals.iter()) {
+                geom.push(SurfaceGeomVertex { position, normal });
+            }
+        }
+        if let Some(sc) = &scalars {
+            scalars_out.reserve(n_pts);
+            let copy_len = sc.len().min(n_pts);
+            scalars_out.extend_from_slice(&sc[..copy_len]);
+            scalars_out.resize(scalars_out.len() + (n_pts - copy_len), 0.0);
+        } else {
+            scalars_out.resize(scalars_out.len() + n_pts, 0.0);
+        }
+        indices.reserve(tris_with_cell.len() * 3);
+        for (tri, _) in tris_with_cell {
+            let [a, b, c] = tri;
+            if (a as usize) < n_pts && (b as usize) < n_pts && (c as usize) < n_pts {
+                indices.push(base_v + a);
+                indices.push(base_v + b);
+                indices.push(base_v + c);
+            }
+        }
+        return;
+    }
+
+    // CellScalar: share vertices within each polygon cell while splitting across cell boundaries.
+    let poly_base = poly.verts.len() + poly.lines.len();
+    for (pi, p) in poly.polys.iter().enumerate() {
+        if p.len() < 3 {
+            continue;
+        }
+        let cell_idx = poly_base + pi;
+        let cell_s = scalars.as_ref().and_then(|sc| sc.get(cell_idx).copied()).unwrap_or(0.0);
+        if p.iter().any(|&idx| (idx as usize) >= n_pts) {
+            continue;
+        }
+        let base_v = geom.len() as u32;
+        for &idx in p {
+            let i = idx as usize;
+            geom.push(SurfaceGeomVertex {
+                position: poly.points[i],
+                normal: normals[i],
+            });
+            scalars_out.push(cell_s);
+        }
+        for k in 1..(p.len() - 1) {
+            indices.push(base_v);
+            indices.push(base_v + k as u32);
+            indices.push(base_v + (k + 1) as u32);
+        }
+    }
+    let strip_base = poly_base + poly.polys.len();
+    for (si, s) in poly.strips.iter().enumerate() {
+        if s.len() < 3 {
+            continue;
+        }
+        let cell_idx = strip_base + si;
+        let cell_s = scalars.as_ref().and_then(|sc| sc.get(cell_idx).copied()).unwrap_or(0.0);
+        if s.iter().any(|&idx| (idx as usize) >= n_pts) {
+            continue;
+        }
+        let base_v = geom.len() as u32;
+        for &idx in s {
+            let i = idx as usize;
+            geom.push(SurfaceGeomVertex {
+                position: poly.points[i],
+                normal: normals[i],
+            });
+            scalars_out.push(cell_s);
+        }
+        for k in 0..(s.len() - 2) {
+            if k % 2 == 0 {
+                indices.push(base_v + k as u32);
+                indices.push(base_v + (k + 1) as u32);
+                indices.push(base_v + (k + 2) as u32);
+            } else {
+                indices.push(base_v + (k + 1) as u32);
+                indices.push(base_v + k as u32);
+                indices.push(base_v + (k + 2) as u32);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_indexed_structured<FCoord, FPointIdx>(
+    dims: [usize; 3],
+    point_data: &FieldData,
+    cell_data: &FieldData,
+    color_by: &ColorBy,
+    coord: FCoord,
+    point_idx: FPointIdx,
+    planar_faces: bool,
+    geom: &mut Vec<SurfaceGeomVertex>,
+    scalars_out: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    point_map: &mut Option<Vec<u32>>,
+    range: &mut Option<(f64, f64)>,
+) where
+    FCoord: Fn(usize, usize, usize) -> [f32; 3],
+    FPointIdx: Fn(usize, usize, usize) -> usize,
+{
+    let [nx, ny, nz] = dims;
+    if nx == 0 || ny == 0 || nz == 0 {
+        return;
+    }
+    let (scalars, is_cell) = scalar_lookup(point_data, cell_data, color_by);
+    if let Some(sc) = &scalars {
+        merge_range(range, compute_finite_range(sc));
+    }
+    let cx = nx.saturating_sub(1).max(1);
+    let cy = ny.saturating_sub(1).max(1);
+
+    // For flat axis-aligned grids (ImageData / RectilinearGrid) with point/solid coloring,
+    // share vertices across each of the 6 flat boundary planes (~4x fewer vertices).
+    if planar_faces && !is_cell {
+        let emit_plane = |nu: usize,
+                          nv: usize,
+                          flip_winding: bool,
+                          pt_at: &dyn Fn(usize, usize) -> (usize, usize, usize),
+                          geom: &mut Vec<SurfaceGeomVertex>,
+                          scalars_out: &mut Vec<f32>,
+                          indices: &mut Vec<u32>,
+                          point_map: &mut Option<Vec<u32>>| {
+            if nu < 2 || nv < 2 {
+                return;
+            }
+            let (i0, j0, k0) = pt_at(0, 0);
+            let (i1, j1, k1) = if flip_winding { pt_at(0, 1) } else { pt_at(1, 0) };
+            let (i2, j2, k2) = pt_at(1, 1);
+            let p0 = Vec3::from_array(coord(i0, j0, k0));
+            let p1 = Vec3::from_array(coord(i1, j1, k1));
+            let p2 = Vec3::from_array(coord(i2, j2, k2));
+            let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Z).to_array();
+
+            let base_v = geom.len() as u32;
+            geom.reserve(nu * nv);
+            scalars_out.reserve(nu * nv);
+            if let Some(map) = point_map.as_mut() {
+                map.reserve(nu * nv);
+            }
+            for v in 0..nv {
+                for u in 0..nu {
+                    let (i, j, k) = pt_at(u, v);
+                    let pidx = point_idx(i, j, k);
+                    geom.push(SurfaceGeomVertex {
+                        position: coord(i, j, k),
+                        normal: n,
+                    });
+                    let s = scalars
+                        .as_ref()
+                        .and_then(|sc| sc.get(pidx).copied())
+                        .unwrap_or(0.0);
+                    scalars_out.push(s);
+                    if let Some(map) = point_map.as_mut() {
+                        map.push(pidx as u32);
+                    }
+                }
+            }
+            indices.reserve((nu - 1) * (nv - 1) * 6);
+            for v in 0..(nv - 1) {
+                for u in 0..(nu - 1) {
+                    let a = base_v + (v * nu + u) as u32;
+                    let b = base_v + (v * nu + u + 1) as u32;
+                    let c = base_v + ((v + 1) * nu + u + 1) as u32;
+                    let d = base_v + ((v + 1) * nu + u) as u32;
+                    if flip_winding {
+                        indices.extend_from_slice(&[a, d, c, a, c, b]);
+                    } else {
+                        indices.extend_from_slice(&[a, b, c, a, c, d]);
+                    }
+                }
+            }
+        };
+
+        if nx > 1 && ny > 1 {
+            if nz > 1 {
+                emit_plane(nx, ny, true, &|u, v| (u, v, 0), geom, scalars_out, indices, point_map);
+                emit_plane(nx, ny, false, &|u, v| (u, v, nz - 1), geom, scalars_out, indices, point_map);
+            } else {
+                emit_plane(nx, ny, false, &|u, v| (u, v, 0), geom, scalars_out, indices, point_map);
+            }
+        }
+        if nx > 1 && nz > 1 {
+            if ny > 1 {
+                emit_plane(nx, nz, true, &|u, v| (u, 0, v), geom, scalars_out, indices, point_map);
+                emit_plane(nx, nz, false, &|u, v| (u, ny - 1, v), geom, scalars_out, indices, point_map);
+            } else {
+                emit_plane(nx, nz, true, &|u, v| (u, 0, v), geom, scalars_out, indices, point_map);
+            }
+        }
+        if ny > 1 && nz > 1 {
+            if nx > 1 {
+                emit_plane(ny, nz, false, &|u, v| (0, u, v), geom, scalars_out, indices, point_map);
+                emit_plane(ny, nz, true, &|u, v| (nx - 1, u, v), geom, scalars_out, indices, point_map);
+            } else {
+                emit_plane(ny, nz, true, &|u, v| (0, u, v), geom, scalars_out, indices, point_map);
+            }
+        }
+        return;
+    }
+
+    // Per-quad indexed emission (4 vertices + 6 indices per boundary quad) for curvilinear grids or CellScalar.
+    let mut emit_quad_indexed = |q: [(usize, usize, usize); 4], ci: usize, cj: usize, ck: usize| {
+        let pts = [
+            coord(q[0].0, q[0].1, q[0].2),
+            coord(q[1].0, q[1].1, q[1].2),
+            coord(q[2].0, q[2].1, q[2].2),
+            coord(q[3].0, q[3].1, q[3].2),
+        ];
+        let p0 = Vec3::from_array(pts[0]);
+        let p1 = Vec3::from_array(pts[1]);
+        let p2 = Vec3::from_array(pts[2]);
+        let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Z).to_array();
+        let base_v = geom.len() as u32;
+        let cidx = ci.min(cx - 1) + cx * (cj.min(cy - 1) + cy * ck);
+        for &(i, j, k) in &q {
+            let pidx = point_idx(i, j, k);
+            geom.push(SurfaceGeomVertex {
+                position: coord(i, j, k),
+                normal: n,
+            });
+            let s = match &scalars {
+                Some(sc) if is_cell => sc.get(cidx).copied().unwrap_or(0.0),
+                Some(sc) => sc.get(pidx).copied().unwrap_or(0.0),
+                None => 0.0,
+            };
+            scalars_out.push(s);
+            if let Some(map) = point_map.as_mut() {
+                map.push(pidx as u32);
+            }
+        }
+        indices.extend_from_slice(&[base_v, base_v + 1, base_v + 2, base_v, base_v + 2, base_v + 3]);
+    };
+
+    for_each_structured_boundary_quad(dims, |q, ci, cj, ck| {
+        emit_quad_indexed(q, ci, cj, ck);
+    });
+}
+
+fn append_indexed_unstructured(
+    ug: &UnstructuredGrid,
+    color_by: &ColorBy,
+    geom: &mut Vec<SurfaceGeomVertex>,
+    scalars_out: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    point_map: &mut Option<Vec<u32>>,
+    range: &mut Option<(f64, f64)>,
+) {
+    let (scalars, is_cell) = scalar_lookup(&ug.point_data, &ug.cell_data, color_by);
+    if let Some(sc) = &scalars {
+        merge_range(range, compute_finite_range(sc));
+    }
+
+    let boundary_faces = extract_unstructured_boundary_faces(ug);
+    let n_pts = ug.points.len();
+    for (face, cell_idx) in boundary_faces {
+        let fverts = face.as_slice();
+        if fverts.len() < 3 || fverts.iter().any(|&v| (v as usize) >= n_pts) {
+            continue;
+        }
+        let p0 = Vec3::from_array(ug.points[fverts[0] as usize]);
+        let p1 = Vec3::from_array(ug.points[fverts[1] as usize]);
+        let p2 = Vec3::from_array(ug.points[fverts[2] as usize]);
+        let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Z).to_array();
+        let base_v = geom.len() as u32;
+        for &vi in fverts {
+            let idx = vi as usize;
+            geom.push(SurfaceGeomVertex {
+                position: ug.points[idx],
+                normal: n,
+            });
+            let s = match &scalars {
+                Some(sc) if is_cell => sc.get(cell_idx).copied().unwrap_or(0.0),
+                Some(sc) => sc.get(idx).copied().unwrap_or(0.0),
+                None => 0.0,
+            };
+            scalars_out.push(s);
+            if let Some(map) = point_map.as_mut() {
+                map.push(vi);
+            }
+        }
+        for k in 1..(fverts.len() - 1) {
+            indices.push(base_v);
+            indices.push(base_v + k as u32);
+            indices.push(base_v + (k + 1) as u32);
+        }
+    }
+}
+
 /// Extracts non-indexed surface triangles (with normals and barycentric coordinates) from any [`DataSet`].
 pub fn prepare_surface(dataset: &DataSet, color_by: &ColorBy) -> PreparedSurface {
     let mut vertices = Vec::new();
@@ -220,22 +790,49 @@ fn emit_triangle(
 
 fn compute_smooth_normals(points: &[[f32; 3]], tris: &[([u32; 3], usize)]) -> Vec<[f32; 3]> {
     let mut acc = vec![Vec3::ZERO; points.len()];
-    for &(tri, _) in tris {
-        let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
-        if a >= points.len() || b >= points.len() || c >= points.len() {
-            continue;
+    if tris.len() >= PARALLEL_THRESHOLD {
+        let face_normals: Vec<(usize, usize, usize, Vec3)> = tris
+            .par_iter()
+            .filter_map(|&(tri, _)| {
+                let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+                if a >= points.len() || b >= points.len() || c >= points.len() {
+                    return None;
+                }
+                let p0 = Vec3::from_array(points[a]);
+                let p1 = Vec3::from_array(points[b]);
+                let p2 = Vec3::from_array(points[c]);
+                Some((a, b, c, (p1 - p0).cross(p2 - p0)))
+            })
+            .collect();
+        for (a, b, c, n) in face_normals {
+            acc[a] += n;
+            acc[b] += n;
+            acc[c] += n;
         }
-        let p0 = Vec3::from_array(points[a]);
-        let p1 = Vec3::from_array(points[b]);
-        let p2 = Vec3::from_array(points[c]);
-        let n = (p1 - p0).cross(p2 - p0);
-        acc[a] += n;
-        acc[b] += n;
-        acc[c] += n;
+    } else {
+        for &(tri, _) in tris {
+            let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            if a >= points.len() || b >= points.len() || c >= points.len() {
+                continue;
+            }
+            let p0 = Vec3::from_array(points[a]);
+            let p1 = Vec3::from_array(points[b]);
+            let p2 = Vec3::from_array(points[c]);
+            let n = (p1 - p0).cross(p2 - p0);
+            acc[a] += n;
+            acc[b] += n;
+            acc[c] += n;
+        }
     }
-    acc.into_iter()
-        .map(|n| n.normalize_or(Vec3::Z).to_array())
-        .collect()
+    if acc.len() >= PARALLEL_THRESHOLD {
+        acc.into_par_iter()
+            .map(|n| n.normalize_or(Vec3::Z).to_array())
+            .collect()
+    } else {
+        acc.into_iter()
+            .map(|n| n.normalize_or(Vec3::Z).to_array())
+            .collect()
+    }
 }
 
 fn append_surface_poly(
@@ -244,68 +841,70 @@ fn append_surface_poly(
     out: &mut Vec<SurfaceVertex>,
     range: &mut Option<(f64, f64)>,
 ) {
-    let mut tris_with_cell: Vec<([u32; 3], usize)> = Vec::with_capacity(poly.polys.len() * 2);
-    let poly_base = poly.verts.len() + poly.lines.len();
-    for (pi, p) in poly.polys.iter().enumerate() {
-        if p.len() < 3 {
-            continue;
-        }
-        let cell_idx = poly_base + pi;
-        let v0 = p[0];
-        for k in 1..(p.len() - 1) {
-            tris_with_cell.push(([v0, p[k], p[k + 1]], cell_idx));
-        }
-    }
-    let strip_base = poly_base + poly.polys.len();
-    for (si, s) in poly.strips.iter().enumerate() {
-        if s.len() < 3 {
-            continue;
-        }
-        let cell_idx = strip_base + si;
-        for k in 0..(s.len() - 2) {
-            let tri = if k % 2 == 0 {
-                [s[k], s[k + 1], s[k + 2]]
-            } else {
-                [s[k + 1], s[k], s[k + 2]]
-            };
-            tris_with_cell.push((tri, cell_idx));
-        }
-    }
-
+    let tris_with_cell = collect_poly_tris_with_cell(poly);
     if tris_with_cell.is_empty() {
         return;
     }
 
-    let provided_normals = poly
-        .point_data
-        .active_normals_array()
-        .filter(|arr| arr.num_tuples() == poly.points.len())
-        .map(|arr| (0..arr.num_tuples()).map(|i| arr.get_vec3(i)).collect::<Vec<_>>());
-    let computed_normals;
-    let normals_ref = match &provided_normals {
-        Some(ns) => ns.as_slice(),
-        None => {
-            computed_normals = compute_smooth_normals(&poly.points, &tris_with_cell);
-            &computed_normals
-        }
-    };
-
+    let normals = resolve_poly_normals(poly, &tris_with_cell);
     let (scalars, is_cell) = scalar_lookup(&poly.point_data, &poly.cell_data, color_by);
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
 
-    out.reserve(tris_with_cell.len() * 3);
-    for (tri, cell_idx) in tris_with_cell {
-        emit_triangle(
-            &poly.points,
-            Some(normals_ref),
-            scalars.as_deref(),
-            is_cell,
-            cell_idx,
-            tri,
-            out,
-        );
+    if tris_with_cell.len() >= PARALLEL_THRESHOLD {
+        let bary = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let points = &poly.points;
+        let normals_slice = normals.as_slice();
+        let scalars_slice = scalars.as_deref();
+        let built: Vec<SurfaceVertex> = tris_with_cell
+            .par_iter()
+            .flat_map_iter(|&(tri, cell_idx)| {
+                let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+                let valid = i0 < points.len() && i1 < points.len() && i2 < points.len();
+                let mut verts = [SurfaceVertex::zeroed(); 3];
+                let count = if valid {
+                    let p0 = Vec3::from_array(points[i0]);
+                    let p1 = Vec3::from_array(points[i1]);
+                    let p2 = Vec3::from_array(points[i2]);
+                    let face_n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Z).to_array();
+                    let indices = [i0, i1, i2];
+                    for k in 0..3 {
+                        let idx = indices[k];
+                        let normal = normals_slice.get(idx).copied().unwrap_or(face_n);
+                        let scalar = match scalars_slice {
+                            Some(sc) if is_cell => sc.get(cell_idx).copied().unwrap_or(0.0),
+                            Some(sc) => sc.get(idx).copied().unwrap_or(0.0),
+                            None => 0.0,
+                        };
+                        verts[k] = SurfaceVertex {
+                            position: points[idx],
+                            normal,
+                            scalar,
+                            barycentric: bary[k],
+                        };
+                    }
+                    3
+                } else {
+                    0
+                };
+                verts.into_iter().take(count)
+            })
+            .collect();
+        out.extend(built);
+    } else {
+        out.reserve(tris_with_cell.len() * 3);
+        for (tri, cell_idx) in tris_with_cell {
+            emit_triangle(
+                &poly.points,
+                Some(&normals),
+                scalars.as_deref(),
+                is_cell,
+                cell_idx,
+                tri,
+                out,
+            );
+        }
     }
 }
 
@@ -321,6 +920,76 @@ fn emit_quad(
         out.push(SurfaceVertex { position: p[a], normal, scalar: s[a], barycentric: bary[0] });
         out.push(SurfaceVertex { position: p[b], normal, scalar: s[b], barycentric: bary[1] });
         out.push(SurfaceVertex { position: p[c], normal, scalar: s[c], barycentric: bary[2] });
+    }
+}
+
+fn for_each_structured_boundary_quad<F>(dims: [usize; 3], mut emit: F)
+where
+    F: FnMut([(usize, usize, usize); 4], usize, usize, usize),
+{
+    let [nx, ny, nz] = dims;
+    if nx == 0 || ny == 0 || nz == 0 {
+        return;
+    }
+    // XY faces (k = 0 and k = nz - 1)
+    if nx > 1 && ny > 1 {
+        let k_planes: &[(usize, usize, bool)] = if nz > 1 {
+            &[(0, 0, true), (nz - 1, nz - 2, false)]
+        } else {
+            &[(0, 0, false)]
+        };
+        for &(k, ck, flip) in k_planes {
+            for j in 0..(ny - 1) {
+                for i in 0..(nx - 1) {
+                    let q = if flip {
+                        [(i, j, k), (i, j + 1, k), (i + 1, j + 1, k), (i + 1, j, k)]
+                    } else {
+                        [(i, j, k), (i + 1, j, k), (i + 1, j + 1, k), (i, j + 1, k)]
+                    };
+                    emit(q, i, j, ck);
+                }
+            }
+        }
+    }
+    // XZ faces (j = 0 and j = ny - 1)
+    if nx > 1 && nz > 1 {
+        let j_planes: &[(usize, usize, bool)] = if ny > 1 {
+            &[(0, 0, false), (ny - 1, ny - 2, true)]
+        } else {
+            &[(0, 0, false)]
+        };
+        for &(j, cj, flip) in j_planes {
+            for k in 0..(nz - 1) {
+                for i in 0..(nx - 1) {
+                    let q = if flip {
+                        [(i, j, k), (i + 1, j, k), (i + 1, j, k + 1), (i, j, k + 1)]
+                    } else {
+                        [(i, j, k), (i, j, k + 1), (i + 1, j, k + 1), (i + 1, j, k)]
+                    };
+                    emit(q, i, cj, k);
+                }
+            }
+        }
+    }
+    // YZ faces (i = 0 and i = nx - 1)
+    if ny > 1 && nz > 1 {
+        let i_planes: &[(usize, usize, bool)] = if nx > 1 {
+            &[(0, 0, true), (nx - 1, nx - 2, false)]
+        } else {
+            &[(0, 0, false)]
+        };
+        for &(i, ci, flip) in i_planes {
+            for k in 0..(nz - 1) {
+                for j in 0..(ny - 1) {
+                    let q = if flip {
+                        [(i, j, k), (i, j, k + 1), (i, j + 1, k + 1), (i, j + 1, k)]
+                    } else {
+                        [(i, j, k), (i, j + 1, k), (i, j + 1, k + 1), (i, j, k + 1)]
+                    };
+                    emit(q, ci, j, k);
+                }
+            }
+        }
     }
 }
 
@@ -360,7 +1029,7 @@ fn append_structured_boundary<FCoord, FPointIdx>(
         }
     };
 
-    let emit_face_quad = |q: [(usize, usize, usize); 4], ci: usize, cj: usize, ck: usize, out: &mut Vec<SurfaceVertex>| {
+    for_each_structured_boundary_quad(dims, |q, ci, cj, ck| {
         let pts = [
             coord(q[0].0, q[0].1, q[0].2),
             coord(q[1].0, q[1].1, q[1].2),
@@ -378,68 +1047,7 @@ fn append_structured_boundary<FCoord, FPointIdx>(
             pt_s(q[3].0, q[3].1, q[3].2, ci, cj, ck),
         ];
         emit_quad(pts, sv, n, out);
-    };
-
-    // XY faces (k = 0 and k = nz - 1)
-    if nx > 1 && ny > 1 {
-        let k_planes: Vec<(usize, usize, bool)> = if nz > 1 {
-            vec![(0, 0, true), (nz - 1, nz - 2, false)]
-        } else {
-            vec![(0, 0, false)]
-        };
-        for (k, ck, flip) in k_planes {
-            for j in 0..(ny - 1) {
-                for i in 0..(nx - 1) {
-                    let q = if flip {
-                        [(i, j, k), (i, j + 1, k), (i + 1, j + 1, k), (i + 1, j, k)]
-                    } else {
-                        [(i, j, k), (i + 1, j, k), (i + 1, j + 1, k), (i, j + 1, k)]
-                    };
-                    emit_face_quad(q, i, j, ck, out);
-                }
-            }
-        }
-    }
-    // XZ faces (j = 0 and j = ny - 1)
-    if nx > 1 && nz > 1 {
-        let j_planes: Vec<(usize, usize, bool)> = if ny > 1 {
-            vec![(0, 0, false), (ny - 1, ny - 2, true)]
-        } else {
-            vec![(0, 0, false)]
-        };
-        for (j, cj, flip) in j_planes {
-            for k in 0..(nz - 1) {
-                for i in 0..(nx - 1) {
-                    let q = if flip {
-                        [(i, j, k), (i + 1, j, k), (i + 1, j, k + 1), (i, j, k + 1)]
-                    } else {
-                        [(i, j, k), (i, j, k + 1), (i + 1, j, k + 1), (i + 1, j, k)]
-                    };
-                    emit_face_quad(q, i, cj, k, out);
-                }
-            }
-        }
-    }
-    // YZ faces (i = 0 and i = nx - 1)
-    if ny > 1 && nz > 1 {
-        let i_planes: Vec<(usize, usize, bool)> = if nx > 1 {
-            vec![(0, 0, true), (nx - 1, nx - 2, false)]
-        } else {
-            vec![(0, 0, false)]
-        };
-        for (i, ci, flip) in i_planes {
-            for k in 0..(nz - 1) {
-                for j in 0..(ny - 1) {
-                    let q = if flip {
-                        [(i, j, k), (i, j, k + 1), (i, j + 1, k + 1), (i, j + 1, k)]
-                    } else {
-                        [(i, j, k), (i, j + 1, k), (i, j + 1, k + 1), (i, j, k + 1)]
-                    };
-                    emit_face_quad(q, ci, j, k, out);
-                }
-            }
-        }
-    }
+    });
 }
 
 fn append_surface_image(
@@ -499,6 +1107,195 @@ fn append_surface_structured(
     );
 }
 
+/// Canonical sorted vertex key for boundary face deduplication (zero-alloc for <=4 verts).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FaceKey {
+    Small([u32; 4], u8),
+    Large(Vec<u32>),
+}
+
+impl FaceKey {
+    #[inline]
+    fn from_small(face: &SmallFace) -> Self {
+        match face {
+            SmallFace::Small(arr, len) => {
+                let mut sorted = *arr;
+                sorted[..(*len as usize)].sort_unstable();
+                Self::Small(sorted, *len)
+            }
+            SmallFace::Large(v) => {
+                let mut sorted = v.clone();
+                sorted.sort_unstable();
+                Self::Large(sorted)
+            }
+        }
+    }
+}
+
+/// Ordered boundary face vertex indices (stack-allocated for triangles/quads).
+enum SmallFace {
+    Small([u32; 4], u8),
+    Large(Vec<u32>),
+}
+
+impl SmallFace {
+    #[inline]
+    fn from_local(pts: &[u32], local: &[usize]) -> Self {
+        if local.len() <= 4 {
+            let mut arr = [0u32; 4];
+            for (k, &li) in local.iter().enumerate() {
+                arr[k] = pts[li];
+            }
+            Self::Small(arr, local.len() as u8)
+        } else {
+            Self::Large(local.iter().map(|&li| pts[li]).collect())
+        }
+    }
+
+    #[inline]
+    fn from_tri(tri: [u32; 3]) -> Self {
+        Self::Small([tri[0], tri[1], tri[2], 0], 3)
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Small(arr, len) => &arr[..(*len as usize)],
+            Self::Large(v) => v.as_slice(),
+        }
+    }
+}
+
+enum FaceEntry {
+    Single { face: SmallFace, cell_idx: usize },
+    Shared,
+}
+
+fn extract_unstructured_boundary_faces(ug: &UnstructuredGrid) -> Vec<(SmallFace, usize)> {
+    let n_cells = ug.num_cells();
+    if n_cells == 0 {
+        return Vec::new();
+    }
+
+    let mut out_faces: Vec<(SmallFace, usize)> = Vec::new();
+
+    // Extract 3D cell faces (parallel for non-trivial grids) and deduplicate via single FxHashMap.
+    if n_cells >= 256 {
+        let candidates: Vec<(FaceKey, SmallFace, usize)> = (0..n_cells)
+            .into_par_iter()
+            .flat_map_iter(|cell_idx| {
+                let ct = ug.cell_types[cell_idx];
+                let pts = ug.cell_points(cell_idx);
+                let mut local = Vec::new();
+                if ct.dimension() == 3 {
+                    for f in ct.faces(pts.len()) {
+                        if f.len() >= 3 {
+                            let face = SmallFace::from_local(pts, &f);
+                            let key = FaceKey::from_small(&face);
+                            local.push((key, face, cell_idx));
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
+
+        let mut face_map: FxHashMap<FaceKey, FaceEntry> =
+            FxHashMap::with_capacity_and_hasher(candidates.len(), Default::default());
+        for (key, face, cell_idx) in candidates {
+            match face_map.get_mut(&key) {
+                Some(entry) => *entry = FaceEntry::Shared,
+                None => {
+                    face_map.insert(key, FaceEntry::Single { face, cell_idx });
+                }
+            }
+        }
+        for cell_idx in 0..n_cells {
+            let ct = ug.cell_types[cell_idx];
+            if ct.dimension() == 2 {
+                let pts = ug.cell_points(cell_idx);
+                if ct == CellType::TriangleStrip {
+                    for k in 0..pts.len().saturating_sub(2) {
+                        let tri = if k % 2 == 0 {
+                            [pts[k], pts[k + 1], pts[k + 2]]
+                        } else {
+                            [pts[k + 1], pts[k], pts[k + 2]]
+                        };
+                        out_faces.push((SmallFace::from_tri(tri), cell_idx));
+                    }
+                } else {
+                    for f in ct.faces(pts.len()) {
+                        if f.len() >= 3 {
+                            out_faces.push((SmallFace::from_local(pts, &f), cell_idx));
+                        }
+                    }
+                }
+            }
+        }
+        let mut boundary_3d: Vec<(SmallFace, usize)> = face_map
+            .into_values()
+            .filter_map(|entry| match entry {
+                FaceEntry::Single { face, cell_idx } => Some((face, cell_idx)),
+                FaceEntry::Shared => None,
+            })
+            .collect();
+        boundary_3d.sort_unstable_by_key(|&(_, cell_idx)| cell_idx);
+        out_faces.extend(boundary_3d);
+    } else {
+        let mut face_map: FxHashMap<FaceKey, FaceEntry> =
+            FxHashMap::with_capacity_and_hasher(n_cells * 4, Default::default());
+        for cell_idx in 0..n_cells {
+            let ct = ug.cell_types[cell_idx];
+            let pts = ug.cell_points(cell_idx);
+            match ct.dimension() {
+                2 => {
+                    if ct == CellType::TriangleStrip {
+                        for k in 0..pts.len().saturating_sub(2) {
+                            let tri = if k % 2 == 0 {
+                                [pts[k], pts[k + 1], pts[k + 2]]
+                            } else {
+                                [pts[k + 1], pts[k], pts[k + 2]]
+                            };
+                            out_faces.push((SmallFace::from_tri(tri), cell_idx));
+                        }
+                    } else {
+                        for f in ct.faces(pts.len()) {
+                            if f.len() >= 3 {
+                                out_faces.push((SmallFace::from_local(pts, &f), cell_idx));
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    for f in ct.faces(pts.len()) {
+                        if f.len() >= 3 {
+                            let face = SmallFace::from_local(pts, &f);
+                            let key = FaceKey::from_small(&face);
+                            match face_map.get_mut(&key) {
+                                Some(entry) => *entry = FaceEntry::Shared,
+                                None => {
+                                    face_map.insert(key, FaceEntry::Single { face, cell_idx });
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut boundary_3d: Vec<(SmallFace, usize)> = face_map
+            .into_values()
+            .filter_map(|entry| match entry {
+                FaceEntry::Single { face, cell_idx } => Some((face, cell_idx)),
+                FaceEntry::Shared => None,
+            })
+            .collect();
+        boundary_3d.sort_unstable_by_key(|&(_, cell_idx)| cell_idx);
+        out_faces.extend(boundary_3d);
+    }
+    out_faces
+}
+
 fn append_surface_unstructured(
     ug: &UnstructuredGrid,
     color_by: &ColorBy,
@@ -510,62 +1307,20 @@ fn append_surface_unstructured(
         merge_range(range, compute_finite_range(sc));
     }
 
-    // Track 3D cell faces by sorted vertex tuple so interior shared faces cancel out.
-    let mut face_map: HashMap<Vec<u32>, (Vec<u32>, usize)> = HashMap::new();
-    let mut face_counts: HashMap<Vec<u32>, usize> = HashMap::new();
-    let mut surface_tris: Vec<([u32; 3], usize)> = Vec::new();
-
-    for cell_idx in 0..ug.num_cells() {
-        let ct = ug.cell_types[cell_idx];
-        let pts = ug.cell_points(cell_idx);
-        match ct.dimension() {
-            2 => {
-                if ct == CellType::TriangleStrip {
-                    for k in 0..pts.len().saturating_sub(2) {
-                        let tri = if k % 2 == 0 {
-                            [pts[k], pts[k + 1], pts[k + 2]]
-                        } else {
-                            [pts[k + 1], pts[k], pts[k + 2]]
-                        };
-                        surface_tris.push((tri, cell_idx));
-                    }
-                } else {
-                    for local_face in ct.faces(pts.len()) {
-                        if local_face.len() < 3 {
-                            continue;
-                        }
-                        let v0 = pts[local_face[0]];
-                        for k in 1..(local_face.len() - 1) {
-                            surface_tris.push(([v0, pts[local_face[k]], pts[local_face[k + 1]]], cell_idx));
-                        }
-                    }
-                }
-            }
-            3 => {
-                for local_face in ct.faces(pts.len()) {
-                    let global: Vec<u32> = local_face.iter().map(|&li| pts[li]).collect();
-                    let mut key = global.clone();
-                    key.sort_unstable();
-                    *face_counts.entry(key.clone()).or_insert(0) += 1;
-                    face_map.entry(key).or_insert((global, cell_idx));
-                }
-            }
-            _ => {}
+    let boundary_faces = extract_unstructured_boundary_faces(ug);
+    let mut surface_tris: Vec<([u32; 3], usize)> = Vec::with_capacity(boundary_faces.len() * 2);
+    for (face, cell_idx) in boundary_faces {
+        let f = face.as_slice();
+        if f.len() < 3 {
+            continue;
+        }
+        let v0 = f[0];
+        for k in 1..(f.len() - 1) {
+            surface_tris.push(([v0, f[k], f[k + 1]], cell_idx));
         }
     }
 
-    for (key, count) in face_counts {
-        if count == 1
-            && let Some((face, cell_idx)) = face_map.remove(&key)
-            && face.len() >= 3
-        {
-            let v0 = face[0];
-            for k in 1..(face.len() - 1) {
-                surface_tris.push(([v0, face[k], face[k + 1]], cell_idx));
-            }
-        }
-    }
-
+    out.reserve(surface_tris.len() * 3);
     for (tri, cell_idx) in surface_tris {
         emit_triangle(
             &ug.points,
@@ -590,6 +1345,72 @@ pub fn prepare_wireframe(dataset: &DataSet, color_by: &ColorBy) -> PreparedLines
     }
 }
 
+#[inline]
+fn pack_edge_key(a: u32, b: u32) -> u64 {
+    if a < b {
+        ((a as u64) << 32) | (b as u64)
+    } else {
+        ((b as u64) << 32) | (a as u64)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_structured_wireframe<FCoord, FPointIdx>(
+    dims: [usize; 3],
+    point_data: &FieldData,
+    cell_data: &FieldData,
+    color_by: &ColorBy,
+    coord: FCoord,
+    point_idx: FPointIdx,
+    out: &mut Vec<LineVertex>,
+    range: &mut Option<(f64, f64)>,
+) where
+    FCoord: Fn(usize, usize, usize) -> [f32; 3],
+    FPointIdx: Fn(usize, usize, usize) -> usize,
+{
+    let [nx, ny, nz] = dims;
+    if nx == 0 || ny == 0 || nz == 0 {
+        return;
+    }
+    let (scalars, is_cell) = scalar_lookup(point_data, cell_data, color_by);
+    if let Some(sc) = &scalars {
+        merge_range(range, compute_finite_range(sc));
+    }
+    let cx = nx.saturating_sub(1).max(1);
+    let cy = ny.saturating_sub(1).max(1);
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+
+    for_each_structured_boundary_quad(dims, |q, ci, cj, ck| {
+        let cidx = ci.min(cx - 1) + cx * (cj.min(cy - 1) + cy * ck);
+        for k in 0..4 {
+            let va = q[k];
+            let vb = q[(k + 1) % 4];
+            let ia = point_idx(va.0, va.1, va.2);
+            let ib = point_idx(vb.0, vb.1, vb.2);
+            if seen.insert(pack_edge_key(ia as u32, ib as u32)) {
+                let sa = match &scalars {
+                    Some(sc) if is_cell => sc.get(cidx).copied().unwrap_or(0.0),
+                    Some(sc) => sc.get(ia).copied().unwrap_or(0.0),
+                    None => 0.0,
+                };
+                let sb = match &scalars {
+                    Some(sc) if is_cell => sc.get(cidx).copied().unwrap_or(0.0),
+                    Some(sc) => sc.get(ib).copied().unwrap_or(0.0),
+                    None => 0.0,
+                };
+                out.push(LineVertex {
+                    position: coord(va.0, va.1, va.2),
+                    scalar: sa,
+                });
+                out.push(LineVertex {
+                    position: coord(vb.0, vb.1, vb.2),
+                    scalar: sb,
+                });
+            }
+        }
+    });
+}
+
 fn append_wireframe_dataset(
     dataset: &DataSet,
     color_by: &ColorBy,
@@ -602,14 +1423,14 @@ fn append_wireframe_dataset(
             if let Some(sc) = &scalars {
                 merge_range(range, compute_finite_range(sc));
             }
-            let mut seen = HashSet::new();
+            let mut seen: FxHashSet<u64> =
+                FxHashSet::with_capacity_and_hasher(poly.polys.len() * 3, Default::default());
             let mut push_edge = |a: u32, b: u32, cell_idx: usize| {
                 let (ia, ib) = (a as usize, b as usize);
                 if ia >= poly.points.len() || ib >= poly.points.len() {
                     return;
                 }
-                let key = if a < b { (a, b) } else { (b, a) };
-                if seen.insert(key) {
+                if seen.insert(pack_edge_key(a, b)) {
                     let sa = match &scalars {
                         Some(sc) if is_cell => sc.get(cell_idx).copied().unwrap_or(0.0),
                         Some(sc) => sc.get(ia).copied().unwrap_or(0.0),
@@ -655,14 +1476,14 @@ fn append_wireframe_dataset(
             if let Some(sc) = &scalars {
                 merge_range(range, compute_finite_range(sc));
             }
-            let mut seen = HashSet::new();
+            let mut seen: FxHashSet<u64> =
+                FxHashSet::with_capacity_and_hasher(ug.num_cells() * 4, Default::default());
             let mut push_edge = |a: u32, b: u32, cell_idx: usize| {
                 let (ia, ib) = (a as usize, b as usize);
                 if ia >= ug.points.len() || ib >= ug.points.len() {
                     return;
                 }
-                let key = if a < b { (a, b) } else { (b, a) };
-                if seen.insert(key) {
+                if seen.insert(pack_edge_key(a, b)) {
                     let sa = match &scalars {
                         Some(sc) if is_cell => sc.get(cell_idx).copied().unwrap_or(0.0),
                         Some(sc) => sc.get(ia).copied().unwrap_or(0.0),
@@ -693,14 +1514,42 @@ fn append_wireframe_dataset(
                 }
             }
         }
-        DataSet::ImageData(_) | DataSet::RectilinearGrid(_) | DataSet::StructuredGrid(_) => {
-            let surf = prepare_surface(dataset, color_by);
-            merge_range(range, Some(surf.scalar_range));
-            for tri in surf.vertices.as_chunks::<3>().0 {
-                for (a, b) in [(0, 1), (1, 2), (2, 0)] {
-                    out.push(LineVertex { position: tri[a].position, scalar: tri[a].scalar });
-                    out.push(LineVertex { position: tri[b].position, scalar: tri[b].scalar });
-                }
+        DataSet::ImageData(img) => {
+            append_structured_wireframe(
+                img.dimensions,
+                &img.point_data,
+                &img.cell_data,
+                color_by,
+                |i, j, k| img.point_coords(i, j, k),
+                |i, j, k| img.point_index(i, j, k),
+                out,
+                range,
+            );
+        }
+        DataSet::RectilinearGrid(rect) => {
+            append_structured_wireframe(
+                rect.dimensions(),
+                &rect.point_data,
+                &rect.cell_data,
+                color_by,
+                |i, j, k| rect.point_coords(i, j, k),
+                |i, j, k| rect.point_index(i, j, k),
+                out,
+                range,
+            );
+        }
+        DataSet::StructuredGrid(grid) => {
+            if grid.points.len() >= grid.dimensions[0] * grid.dimensions[1] * grid.dimensions[2] {
+                append_structured_wireframe(
+                    grid.dimensions,
+                    &grid.point_data,
+                    &grid.cell_data,
+                    color_by,
+                    |i, j, k| grid.point_coords(i, j, k),
+                    |i, j, k| grid.point_index(i, j, k),
+                    out,
+                    range,
+                );
             }
         }
         DataSet::MultiBlock(mb) => {
@@ -736,10 +1585,78 @@ fn append_points_slice(
     if let Some(sc) = &scalars {
         merge_range(range, compute_finite_range(sc));
     }
-    out.reserve(points.len());
-    for (i, &pos) in points.iter().enumerate() {
-        let scalar = scalars.as_ref().and_then(|s| s.get(i).copied()).unwrap_or(0.0);
-        out.push(PointInstance { position: pos, scalar });
+    if points.len() >= PARALLEL_THRESHOLD {
+        let sc_ref = scalars.as_deref();
+        let built: Vec<PointInstance> = points
+            .par_iter()
+            .enumerate()
+            .map(|(i, &position)| PointInstance {
+                position,
+                scalar: sc_ref.and_then(|s| s.get(i).copied()).unwrap_or(0.0),
+            })
+            .collect();
+        out.extend(built);
+    } else {
+        out.reserve(points.len());
+        for (i, &pos) in points.iter().enumerate() {
+            let scalar = scalars.as_ref().and_then(|s| s.get(i).copied()).unwrap_or(0.0);
+            out.push(PointInstance { position: pos, scalar });
+        }
+    }
+}
+
+fn append_points_grid<FCoord>(
+    dims: [usize; 3],
+    point_data: &FieldData,
+    color_by: &ColorBy,
+    coord: FCoord,
+    out: &mut Vec<PointInstance>,
+    range: &mut Option<(f64, f64)>,
+) where
+    FCoord: Fn(usize, usize, usize) -> [f32; 3] + Sync,
+{
+    let [nx, ny, nz] = dims;
+    let total = nx * ny * nz;
+    if total == 0 {
+        return;
+    }
+    let scalars = match color_by {
+        ColorBy::PointScalar { array, component } => extract_scalars(point_data, array, *component),
+        _ => None,
+    };
+    if let Some(sc) = &scalars {
+        merge_range(range, compute_finite_range(sc));
+    }
+    if total >= PARALLEL_THRESHOLD {
+        let sc_ref = scalars.as_deref();
+        let built: Vec<PointInstance> = (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                let i = idx % nx;
+                let rem = idx / nx;
+                let j = rem % ny;
+                let k = rem / ny;
+                PointInstance {
+                    position: coord(i, j, k),
+                    scalar: sc_ref.and_then(|s| s.get(idx).copied()).unwrap_or(0.0),
+                }
+            })
+            .collect();
+        out.extend(built);
+    } else {
+        out.reserve(total);
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let idx = i + nx * (j + ny * k);
+                    let scalar = scalars.as_ref().and_then(|s| s.get(idx).copied()).unwrap_or(0.0);
+                    out.push(PointInstance {
+                        position: coord(i, j, k),
+                        scalar,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -754,12 +1671,24 @@ fn append_points_dataset(
             append_points_slice(&poly.points, &poly.point_data, color_by, out, range);
         }
         DataSet::ImageData(img) => {
-            let pts = img.all_points();
-            append_points_slice(&pts, &img.point_data, color_by, out, range);
+            append_points_grid(
+                img.dimensions,
+                &img.point_data,
+                color_by,
+                |i, j, k| img.point_coords(i, j, k),
+                out,
+                range,
+            );
         }
         DataSet::RectilinearGrid(rect) => {
-            let pts = rect.all_points();
-            append_points_slice(&pts, &rect.point_data, color_by, out, range);
+            append_points_grid(
+                rect.dimensions(),
+                &rect.point_data,
+                color_by,
+                |i, j, k| rect.point_coords(i, j, k),
+                out,
+                range,
+            );
         }
         DataSet::StructuredGrid(grid) => {
             append_points_slice(&grid.points, &grid.point_data, color_by, out, range);

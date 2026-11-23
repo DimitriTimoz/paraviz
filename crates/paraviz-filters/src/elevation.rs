@@ -1,6 +1,6 @@
 //! Elevation scalar projection filter (`ElevationFilter`, equivalent to `vtkElevationFilter`).
 
-use crate::util::dataset_points;
+use crate::util::GridPoints;
 use glam::Vec3;
 use paraviz_core::{DataArray, DataSet, Filter, MultiBlockDataSet, PipelineError};
 use rayon::prelude::*;
@@ -60,11 +60,12 @@ impl Filter for ElevationFilter {
             ));
         }
 
-        let pts = dataset_points(input)?;
+        let pts = GridPoints::from_dataset(input)?;
         let inv_len_sq = 1.0 / len_sq;
-        let scalars: Vec<f32> = pts
-            .par_iter()
-            .map(|&p| {
+        let scalars: Vec<f32> = (0..pts.len())
+            .into_par_iter()
+            .map(|idx| {
+                let p = pts.at_linear(idx);
                 let t = (Vec3::from_array(p) - low).dot(diff) * inv_len_sq;
                 t.clamp(0.0, 1.0)
             })

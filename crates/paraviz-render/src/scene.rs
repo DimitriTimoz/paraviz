@@ -13,6 +13,7 @@ pub enum Representation {
     SurfaceWithEdges,
     Wireframe,
     Points,
+    PointGaussian,
     Volume,
     Outline,
 }
@@ -58,6 +59,9 @@ pub struct ActorStyle {
     pub volume_tf: TransferFunction,
     pub volume_step_size: f32,
     pub volume_shading: bool,
+    /// Optional live 3D clipping plane `(origin, normal)` applied during volume raymarching.
+    #[serde(default)]
+    pub volume_clip_plane: Option<([f32; 3], [f32; 3])>,
 }
 
 impl Default for ActorStyle {
@@ -81,6 +85,7 @@ impl Default for ActorStyle {
             volume_tf: TransferFunction::default(),
             volume_step_size: 0.5,
             volume_shading: true,
+            volume_clip_plane: None,
         }
     }
 }
@@ -113,6 +118,14 @@ pub struct SceneSettings {
     pub bg_bottom: [f32; 3],
     pub show_axes_gizmo: bool,
     pub show_bounding_box: bool,
+    #[serde(default)]
+    pub show_axes_grid: bool,
+    /// Clear background to alpha=0 (no skybox) for transparent PNG/GIF exports.
+    #[serde(default)]
+    pub transparent_background: bool,
+    /// Composite a ParaView-style Scalar Color Bar with min/mid/max labels onto headless/screenshot outputs.
+    #[serde(default)]
+    pub show_scalar_bar: bool,
     pub edl_enabled: bool,
     pub edl_strength: f32,
     pub msaa_samples: u32,
@@ -125,6 +138,9 @@ impl Default for SceneSettings {
             bg_bottom: [0.27, 0.32, 0.41],
             show_axes_gizmo: true,
             show_bounding_box: false,
+            show_axes_grid: false,
+            transparent_background: false,
+            show_scalar_bar: false,
             edl_enabled: false,
             edl_strength: 1.0,
             msaa_samples: 1,
@@ -161,6 +177,8 @@ pub struct RenderScene {
     pub actors: Vec<SceneActor>,
     pub settings: SceneSettings,
     pub widgets: Vec<ViewportWidget>,
+    /// Optional 3D world-space selection highlight marker (from Spreadsheet or 3D pick).
+    pub selection_highlight: Option<[f32; 3]>,
 }
 
 impl RenderScene {

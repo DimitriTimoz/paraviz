@@ -1,11 +1,12 @@
 //! WebGPU Compute Marching Cubes engine (`GpuContourEngine`) extracting watertight
 //! isosurfaces directly on the GPU from [`ImageData`] scalar grids into [`PolyData`].
 
+use crate::fxhash::{FxHashMap, FxHasher};
 use crate::renderer::RenderError;
 use bytemuck::{Pod, Zeroable};
-use paraviz_core::{DataArray, ImageData, PolyData};
-use std::collections::HashMap;
-use std::sync::Arc;
+use paraviz_core::{ArrayData, DataArray, ImageData, PolyData};
+use std::hash::Hasher;
+use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -195,6 +196,15 @@ fn mc_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+struct CachedScalarVolume {
+    dims: [usize; 3],
+    scalar_name: String,
+    array_ptr: usize,
+    array_len: usize,
+    fingerprint: u64,
+    scalar_buf: Arc<wgpu::Buffer>,
+}
+
 /// GPU Marching Cubes contour engine using a WebGPU compute pipeline.
 pub struct GpuContourEngine {
     device: Arc<wgpu::Device>,
@@ -203,6 +213,7 @@ pub struct GpuContourEngine {
     pipeline: wgpu::ComputePipeline,
     edge_table_buf: wgpu::Buffer,
     tri_table_buf: wgpu::Buffer,
+    volume_cache: Mutex<Option<CachedScalarVolume>>,
 }
 
 impl GpuContourEngine {
@@ -337,7 +348,70 @@ impl GpuContourEngine {
             pipeline,
             edge_table_buf,
             tri_table_buf,
+            volume_cache: Mutex::new(None),
         }
+    }
+
+    fn get_or_upload_scalar_buffer(
+        &self,
+        dims: [usize; 3],
+        arr: &DataArray,
+    ) -> Arc<wgpu::Buffer> {
+        let (array_ptr, array_len) = array_ptr_and_len(arr);
+        let fingerprint = compute_scalar_fingerprint(arr);
+
+        if let Ok(guard) = self.volume_cache.lock()
+            && let Some(cached) = guard.as_ref()
+            && cached.dims == dims
+            && cached.scalar_name == arr.name
+            && cached.array_ptr == array_ptr
+            && cached.array_len == array_len
+            && cached.fingerprint == fingerprint
+        {
+            return Arc::clone(&cached.scalar_buf);
+        }
+
+        let expected_pts = dims[0] * dims[1] * dims[2];
+        let scalar_buf = if let ArrayData::F32(v) = &arr.data
+            && arr.num_components == 1
+            && v.len() == expected_pts
+        {
+            Arc::new(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("paraviz-mc-scalars"),
+                        contents: bytemuck::cast_slice(v),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }),
+            )
+        } else {
+            let mut scalars = arr.to_scalar_f32(None);
+            if scalars.len() < expected_pts {
+                scalars.resize(expected_pts, 0.0);
+            } else if scalars.len() > expected_pts {
+                scalars.truncate(expected_pts);
+            }
+            Arc::new(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("paraviz-mc-scalars"),
+                        contents: bytemuck::cast_slice(&scalars),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }),
+            )
+        };
+
+        if let Ok(mut guard) = self.volume_cache.lock() {
+            *guard = Some(CachedScalarVolume {
+                dims,
+                scalar_name: arr.name.clone(),
+                array_ptr,
+                array_len,
+                fingerprint,
+                scalar_buf: Arc::clone(&scalar_buf),
+            });
+        }
+        scalar_buf
     }
 
     /// Extracts an isosurface at `iso_value` from `image` (`field_name` or active scalars if empty)
@@ -363,20 +437,7 @@ impl GpuContourEngine {
             return Ok(PolyData::new());
         };
         let scalar_name = arr.name.clone();
-
-        let expected_pts = nx * ny * nz;
-        let mut scalars = arr.to_scalar_f32(None);
-        if scalars.len() < expected_pts {
-            scalars.resize(expected_pts, 0.0);
-        } else if scalars.len() > expected_pts {
-            scalars.truncate(expected_pts);
-        }
-
-        let scalar_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("paraviz-mc-scalars"),
-            contents: bytemuck::cast_slice(&scalars),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let scalar_buf = self.get_or_upload_scalar_buffer(image.dimensions, arr);
 
         let cx = (nx - 1) as u32;
         let cy = (ny - 1) as u32;
@@ -410,8 +471,9 @@ impl GpuContourEngine {
             return Ok(PolyData::new());
         }
 
-        // Weld vertices by canonical grid edge key so the output PolyData is a closed 2-manifold.
-        let mut edge_to_vid: HashMap<u64, u32> = HashMap::with_capacity(raw_verts.len());
+        // Weld vertices by canonical grid edge key using FxHashMap so the output PolyData is a closed 2-manifold.
+        let mut edge_to_vid: FxHashMap<u64, u32> =
+            FxHashMap::with_capacity_and_hasher(raw_verts.len(), Default::default());
         let mut points: Vec<[f32; 3]> = Vec::with_capacity(raw_verts.len() / 2);
         let mut normals: Vec<[f32; 3]> = Vec::with_capacity(raw_verts.len() / 2);
         let mut out_scalars: Vec<f32> = Vec::with_capacity(raw_verts.len() / 2);
@@ -626,6 +688,40 @@ impl GpuContourEngine {
         staging.unmap();
         Ok(out)
     }
+}
+
+fn array_ptr_and_len(arr: &DataArray) -> (usize, usize) {
+    let ptr = match &arr.data {
+        ArrayData::F32(v) => v.as_ptr() as usize,
+        ArrayData::F64(v) => v.as_ptr() as usize,
+        ArrayData::I8(v) => v.as_ptr() as usize,
+        ArrayData::I16(v) => v.as_ptr() as usize,
+        ArrayData::I32(v) => v.as_ptr() as usize,
+        ArrayData::I64(v) => v.as_ptr() as usize,
+        ArrayData::U8(v) => v.as_ptr() as usize,
+        ArrayData::U16(v) => v.as_ptr() as usize,
+        ArrayData::U32(v) => v.as_ptr() as usize,
+        ArrayData::U64(v) => v.as_ptr() as usize,
+    };
+    (ptr, arr.data.len())
+}
+
+fn compute_scalar_fingerprint(arr: &DataArray) -> u64 {
+    let mut h = FxHasher::default();
+    let len = arr.data.len();
+    h.write_usize(len);
+    h.write_usize(arr.num_components);
+    if len > 0 {
+        let samples = 16usize;
+        let step = (len / samples).max(1);
+        let mut i = 0;
+        while i < len {
+            h.write_u64(arr.data.get_f64(i).to_bits());
+            i += step;
+        }
+        h.write_u64(arr.data.get_f64(len - 1).to_bits());
+    }
+    h.finish()
 }
 
 /// Complete 256-entry Marching Cubes edge intersection bitmask table (Paul Bourke).

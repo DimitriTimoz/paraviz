@@ -8,10 +8,14 @@ use serde::{Deserialize, Serialize};
 pub enum ScalarType {
     F32,
     F64,
+    I8,
+    I16,
     I32,
-    U32,
     I64,
     U8,
+    U16,
+    U32,
+    U64,
 }
 
 impl ScalarType {
@@ -20,10 +24,14 @@ impl ScalarType {
         match self {
             Self::F32 => "Float32",
             Self::F64 => "Float64",
+            Self::I8 => "Int8",
+            Self::I16 => "Int16",
             Self::I32 => "Int32",
-            Self::U32 => "UInt32",
             Self::I64 => "Int64",
             Self::U8 => "UInt8",
+            Self::U16 => "UInt16",
+            Self::U32 => "UInt32",
+            Self::U64 => "UInt64",
         }
     }
 
@@ -32,10 +40,24 @@ impl ScalarType {
         match self {
             Self::F32 => "float",
             Self::F64 => "double",
+            Self::I8 => "char",
+            Self::I16 => "short",
             Self::I32 => "int",
-            Self::U32 => "unsigned_int",
             Self::I64 => "vtktypeint64",
             Self::U8 => "unsigned_char",
+            Self::U16 => "unsigned_short",
+            Self::U32 => "unsigned_int",
+            Self::U64 => "vtktypeuint64",
+        }
+    }
+
+    /// Byte width of one scalar element.
+    pub fn byte_size(self) -> usize {
+        match self {
+            Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 => 2,
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F64 | Self::I64 | Self::U64 => 8,
         }
     }
 }
@@ -45,10 +67,14 @@ impl ScalarType {
 pub enum ArrayData {
     F32(Vec<f32>),
     F64(Vec<f64>),
+    I8(Vec<i8>),
+    I16(Vec<i16>),
     I32(Vec<i32>),
-    U32(Vec<u32>),
     I64(Vec<i64>),
     U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
 }
 
 impl ArrayData {
@@ -57,10 +83,14 @@ impl ArrayData {
         match self {
             Self::F32(v) => v.len(),
             Self::F64(v) => v.len(),
+            Self::I8(v) => v.len(),
+            Self::I16(v) => v.len(),
             Self::I32(v) => v.len(),
-            Self::U32(v) => v.len(),
             Self::I64(v) => v.len(),
             Self::U8(v) => v.len(),
+            Self::U16(v) => v.len(),
+            Self::U32(v) => v.len(),
+            Self::U64(v) => v.len(),
         }
     }
 
@@ -74,10 +104,14 @@ impl ArrayData {
         match self {
             Self::F32(_) => ScalarType::F32,
             Self::F64(_) => ScalarType::F64,
+            Self::I8(_) => ScalarType::I8,
+            Self::I16(_) => ScalarType::I16,
             Self::I32(_) => ScalarType::I32,
-            Self::U32(_) => ScalarType::U32,
             Self::I64(_) => ScalarType::I64,
             Self::U8(_) => ScalarType::U8,
+            Self::U16(_) => ScalarType::U16,
+            Self::U32(_) => ScalarType::U32,
+            Self::U64(_) => ScalarType::U64,
         }
     }
 
@@ -87,10 +121,14 @@ impl ArrayData {
         match self {
             Self::F32(v) => v[idx] as f64,
             Self::F64(v) => v[idx],
+            Self::I8(v) => v[idx] as f64,
+            Self::I16(v) => v[idx] as f64,
             Self::I32(v) => v[idx] as f64,
-            Self::U32(v) => v[idx] as f64,
             Self::I64(v) => v[idx] as f64,
             Self::U8(v) => v[idx] as f64,
+            Self::U16(v) => v[idx] as f64,
+            Self::U32(v) => v[idx] as f64,
+            Self::U64(v) => v[idx] as f64,
         }
     }
 
@@ -99,10 +137,14 @@ impl ArrayData {
         match self {
             Self::F32(v) => v.clone(),
             Self::F64(v) => v.iter().map(|&x| x as f32).collect(),
+            Self::I8(v) => v.iter().map(|&x| x as f32).collect(),
+            Self::I16(v) => v.iter().map(|&x| x as f32).collect(),
             Self::I32(v) => v.iter().map(|&x| x as f32).collect(),
-            Self::U32(v) => v.iter().map(|&x| x as f32).collect(),
             Self::I64(v) => v.iter().map(|&x| x as f32).collect(),
             Self::U8(v) => v.iter().map(|&x| x as f32).collect(),
+            Self::U16(v) => v.iter().map(|&x| x as f32).collect(),
+            Self::U32(v) => v.iter().map(|&x| x as f32).collect(),
+            Self::U64(v) => v.iter().map(|&x| x as f32).collect(),
         }
     }
 
@@ -111,10 +153,14 @@ impl ArrayData {
         match self {
             Self::F32(v) => v.iter().map(|&x| x as f64).collect(),
             Self::F64(v) => v.clone(),
+            Self::I8(v) => v.iter().map(|&x| x as f64).collect(),
+            Self::I16(v) => v.iter().map(|&x| x as f64).collect(),
             Self::I32(v) => v.iter().map(|&x| x as f64).collect(),
-            Self::U32(v) => v.iter().map(|&x| x as f64).collect(),
             Self::I64(v) => v.iter().map(|&x| x as f64).collect(),
             Self::U8(v) => v.iter().map(|&x| x as f64).collect(),
+            Self::U16(v) => v.iter().map(|&x| x as f64).collect(),
+            Self::U32(v) => v.iter().map(|&x| x as f64).collect(),
+            Self::U64(v) => v.iter().map(|&x| x as f64).collect(),
         }
     }
 }
@@ -273,49 +319,26 @@ impl DataArray {
     /// Samples a subset of tuple indices, producing a new `DataArray`.
     pub fn gather(&self, indices: &[usize]) -> Self {
         let nc = self.num_components;
+        macro_rules! gather_typed {
+            ($v:expr, $variant:ident) => {{
+                let mut out = Vec::with_capacity(indices.len() * nc);
+                for &idx in indices {
+                    out.extend_from_slice(&$v[idx * nc..(idx + 1) * nc]);
+                }
+                ArrayData::$variant(out)
+            }};
+        }
         let data = match &self.data {
-            ArrayData::F32(v) => {
-                let mut out = Vec::with_capacity(indices.len() * nc);
-                for &idx in indices {
-                    out.extend_from_slice(&v[idx * nc..(idx + 1) * nc]);
-                }
-                ArrayData::F32(out)
-            }
-            ArrayData::F64(v) => {
-                let mut out = Vec::with_capacity(indices.len() * nc);
-                for &idx in indices {
-                    out.extend_from_slice(&v[idx * nc..(idx + 1) * nc]);
-                }
-                ArrayData::F64(out)
-            }
-            ArrayData::I32(v) => {
-                let mut out = Vec::with_capacity(indices.len() * nc);
-                for &idx in indices {
-                    out.extend_from_slice(&v[idx * nc..(idx + 1) * nc]);
-                }
-                ArrayData::I32(out)
-            }
-            ArrayData::U32(v) => {
-                let mut out = Vec::with_capacity(indices.len() * nc);
-                for &idx in indices {
-                    out.extend_from_slice(&v[idx * nc..(idx + 1) * nc]);
-                }
-                ArrayData::U32(out)
-            }
-            ArrayData::I64(v) => {
-                let mut out = Vec::with_capacity(indices.len() * nc);
-                for &idx in indices {
-                    out.extend_from_slice(&v[idx * nc..(idx + 1) * nc]);
-                }
-                ArrayData::I64(out)
-            }
-            ArrayData::U8(v) => {
-                let mut out = Vec::with_capacity(indices.len() * nc);
-                for &idx in indices {
-                    out.extend_from_slice(&v[idx * nc..(idx + 1) * nc]);
-                }
-                ArrayData::U8(out)
-            }
+            ArrayData::F32(v) => gather_typed!(v, F32),
+            ArrayData::F64(v) => gather_typed!(v, F64),
+            ArrayData::I8(v) => gather_typed!(v, I8),
+            ArrayData::I16(v) => gather_typed!(v, I16),
+            ArrayData::I32(v) => gather_typed!(v, I32),
+            ArrayData::I64(v) => gather_typed!(v, I64),
+            ArrayData::U8(v) => gather_typed!(v, U8),
+            ArrayData::U16(v) => gather_typed!(v, U16),
+            ArrayData::U32(v) => gather_typed!(v, U32),
+            ArrayData::U64(v) => gather_typed!(v, U64),
         };
         Self::new(self.name.clone(), nc, data)
     }

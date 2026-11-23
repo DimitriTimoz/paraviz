@@ -3,7 +3,8 @@
 
 use glam::Vec3;
 use paraviz_core::{
-    AttributeAssociation, DataArray, DataSet, FieldData, Filter, MultiBlockDataSet, PipelineError,
+    ArrayData, AttributeAssociation, DataArray, DataSet, FieldData, Filter, ImageData,
+    MultiBlockDataSet, PipelineError, RectilinearGrid,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -67,7 +68,7 @@ impl Filter for CalculatorFilter {
 
         match self.association {
             AttributeAssociation::Point => {
-                let coords = dataset_point_coords(input)?;
+                let coords = dataset_point_coords(input);
                 let fd = input.point_data().ok_or_else(|| {
                     PipelineError::ExecutionFailed("Dataset has no point_data".into())
                 })?;
@@ -75,7 +76,7 @@ impl Filter for CalculatorFilter {
                 out.point_data_mut().unwrap().add_array(arr);
             }
             AttributeAssociation::Cell => {
-                let coords = dataset_cell_centroids(input)?;
+                let coords = dataset_cell_centroids(input);
                 let fd = input.cell_data().ok_or_else(|| {
                     PipelineError::ExecutionFailed("Dataset has no cell_data".into())
                 })?;
@@ -93,18 +94,98 @@ impl Filter for CalculatorFilter {
     }
 }
 
-fn dataset_point_coords(ds: &DataSet) -> Result<Vec<[f32; 3]>, PipelineError> {
+enum CoordSource<'a> {
+    Explicit(&'a [[f32; 3]]),
+    ImagePoints(&'a ImageData),
+    RectilinearPoints(&'a RectilinearGrid),
+    ImageCellCentroids(&'a ImageData),
+    RectilinearCellCentroids(&'a RectilinearGrid),
+    Owned(Vec<[f32; 3]>),
+}
+
+impl<'a> CoordSource<'a> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Explicit(pts) => pts.len(),
+            Self::ImagePoints(img) => img.num_points(),
+            Self::RectilinearPoints(rg) => rg.num_points(),
+            Self::ImageCellCentroids(img) => img.num_cells(),
+            Self::RectilinearCellCentroids(rg) => {
+                let [nx, ny, nz] = rg.dimensions();
+                if nx == 0 || ny == 0 || nz == 0 {
+                    0
+                } else {
+                    rg.num_cells()
+                }
+            }
+            Self::Owned(pts) => pts.len(),
+        }
+    }
+
+    #[inline]
+    fn at(&self, idx: usize) -> [f32; 3] {
+        match self {
+            Self::Explicit(pts) => pts[idx],
+            Self::ImagePoints(img) => {
+                let [nx, ny, _] = img.dimensions;
+                let i = idx % nx;
+                let rem = idx / nx;
+                let j = rem % ny;
+                let k = rem / ny;
+                img.point_coords(i, j, k)
+            }
+            Self::RectilinearPoints(rg) => {
+                let [nx, ny, _] = rg.dimensions();
+                let i = idx % nx;
+                let rem = idx / nx;
+                let j = rem % ny;
+                let k = rem / ny;
+                rg.point_coords(i, j, k)
+            }
+            Self::ImageCellCentroids(img) => {
+                let [nx, ny, nz] = img.dimensions;
+                let cx = nx.saturating_sub(1).max(1);
+                let cy = ny.saturating_sub(1).max(1);
+                let i = idx % cx;
+                let rem = idx / cx;
+                let j = rem % cy;
+                let k = rem / cy;
+                let x = img.origin[0] + (i as f64 + if nx > 1 { 0.5 } else { 0.0 }) * img.spacing[0];
+                let y = img.origin[1] + (j as f64 + if ny > 1 { 0.5 } else { 0.0 }) * img.spacing[1];
+                let z = img.origin[2] + (k as f64 + if nz > 1 { 0.5 } else { 0.0 }) * img.spacing[2];
+                [x as f32, y as f32, z as f32]
+            }
+            Self::RectilinearCellCentroids(rg) => {
+                let [nx, ny, nz] = rg.dimensions();
+                let cx = nx.saturating_sub(1).max(1);
+                let cy = ny.saturating_sub(1).max(1);
+                let i = idx % cx;
+                let rem = idx / cx;
+                let j = rem % cy;
+                let k = rem / cy;
+                let x = if nx > 1 { 0.5 * (rg.x_coords[i] + rg.x_coords[i + 1]) } else { rg.x_coords[0] };
+                let y = if ny > 1 { 0.5 * (rg.y_coords[j] + rg.y_coords[j + 1]) } else { rg.y_coords[0] };
+                let z = if nz > 1 { 0.5 * (rg.z_coords[k] + rg.z_coords[k + 1]) } else { rg.z_coords[0] };
+                [x, y, z]
+            }
+            Self::Owned(pts) => pts[idx],
+        }
+    }
+}
+
+fn dataset_point_coords(ds: &DataSet) -> CoordSource<'_> {
     match ds {
-        DataSet::PolyData(pd) => Ok(pd.points.clone()),
-        DataSet::ImageData(img) => Ok(img.all_points()),
-        DataSet::RectilinearGrid(rg) => Ok(rg.all_points()),
-        DataSet::StructuredGrid(sg) => Ok(sg.points.clone()),
-        DataSet::UnstructuredGrid(ug) => Ok(ug.points.clone()),
+        DataSet::PolyData(pd) => CoordSource::Explicit(&pd.points),
+        DataSet::ImageData(img) => CoordSource::ImagePoints(img),
+        DataSet::RectilinearGrid(rg) => CoordSource::RectilinearPoints(rg),
+        DataSet::StructuredGrid(sg) => CoordSource::Explicit(&sg.points),
+        DataSet::UnstructuredGrid(ug) => CoordSource::Explicit(&ug.points),
         DataSet::MultiBlock(_) => unreachable!(),
     }
 }
 
-fn dataset_cell_centroids(ds: &DataSet) -> Result<Vec<[f32; 3]>, PipelineError> {
+fn dataset_cell_centroids(ds: &DataSet) -> CoordSource<'_> {
     match ds {
         DataSet::PolyData(pd) => {
             let mut c = Vec::with_capacity(pd.num_cells());
@@ -120,44 +201,10 @@ fn dataset_cell_centroids(ds: &DataSet) -> Result<Vec<[f32; 3]>, PipelineError> 
             for strip in &pd.strips {
                 c.push(avg_pts(&pd.points, strip));
             }
-            Ok(c)
+            CoordSource::Owned(c)
         }
-        DataSet::ImageData(img) => {
-            let [nx, ny, nz] = img.dimensions;
-            let cx = nx.saturating_sub(1).max(1);
-            let cy = ny.saturating_sub(1).max(1);
-            let cz = nz.saturating_sub(1).max(1);
-            let mut out = Vec::with_capacity(img.num_cells());
-            for k in 0..cz {
-                for j in 0..cy {
-                    for i in 0..cx {
-                        let x = img.origin[0] + (i as f64 + if nx > 1 { 0.5 } else { 0.0 }) * img.spacing[0];
-                        let y = img.origin[1] + (j as f64 + if ny > 1 { 0.5 } else { 0.0 }) * img.spacing[1];
-                        let z = img.origin[2] + (k as f64 + if nz > 1 { 0.5 } else { 0.0 }) * img.spacing[2];
-                        out.push([x as f32, y as f32, z as f32]);
-                    }
-                }
-            }
-            Ok(out)
-        }
-        DataSet::RectilinearGrid(rg) => {
-            let [nx, ny, nz] = rg.dimensions();
-            let cx = nx.saturating_sub(1).max(1);
-            let cy = ny.saturating_sub(1).max(1);
-            let cz = nz.saturating_sub(1).max(1);
-            let mut out = Vec::with_capacity(cx * cy * cz);
-            for k in 0..cz {
-                let z = if nz > 1 { 0.5 * (rg.z_coords[k] + rg.z_coords[k + 1]) } else { rg.z_coords[0] };
-                for j in 0..cy {
-                    let y = if ny > 1 { 0.5 * (rg.y_coords[j] + rg.y_coords[j + 1]) } else { rg.y_coords[0] };
-                    for i in 0..cx {
-                        let x = if nx > 1 { 0.5 * (rg.x_coords[i] + rg.x_coords[i + 1]) } else { rg.x_coords[0] };
-                        out.push([x, y, z]);
-                    }
-                }
-            }
-            Ok(out)
-        }
+        DataSet::ImageData(img) => CoordSource::ImageCellCentroids(img),
+        DataSet::RectilinearGrid(rg) => CoordSource::RectilinearCellCentroids(rg),
         DataSet::StructuredGrid(sg) => {
             let [nx, ny, nz] = sg.dimensions;
             let cx = nx.saturating_sub(1).max(1);
@@ -181,11 +228,13 @@ fn dataset_cell_centroids(ds: &DataSet) -> Result<Vec<[f32; 3]>, PipelineError> 
                     }
                 }
             }
-            Ok(out)
+            CoordSource::Owned(out)
         }
-        DataSet::UnstructuredGrid(ug) => Ok((0..ug.num_cells())
-            .map(|c| avg_pts(&ug.points, ug.cell_points(c)))
-            .collect()),
+        DataSet::UnstructuredGrid(ug) => CoordSource::Owned(
+            (0..ug.num_cells())
+                .map(|c| avg_pts(&ug.points, ug.cell_points(c)))
+                .collect(),
+        ),
         DataSet::MultiBlock(_) => unreachable!(),
     }
 }
@@ -203,7 +252,7 @@ fn avg_pts(pts: &[[f32; 3]], indices: &[u32]) -> [f32; 3] {
 
 fn eval_ast_on_field(
     ast: &Expr,
-    coords: &[[f32; 3]],
+    coords: &CoordSource<'_>,
     fd: &FieldData,
     result_name: &str,
 ) -> Result<DataArray, PipelineError> {
@@ -211,29 +260,25 @@ fn eval_ast_on_field(
     if n == 0 {
         return Ok(DataArray::scalars_f32(result_name, Vec::new()));
     }
-    // Probe sample 0 to validate variables and determine scalar vs vector output.
-    let first = eval_expr(ast, 0, coords[0], fd)?;
+    let bound = bind_expr(ast, fd, n)?;
+    // Probe sample 0 to determine scalar vs vector output.
+    let first = eval_bound(&bound, 0, coords);
     match first {
         Val::Scalar(_) => {
             let vals: Vec<f32> = (0..n)
                 .into_par_iter()
-                .map(|i| match eval_expr(ast, i, coords[i], fd) {
-                    Ok(Val::Scalar(v)) => Ok(v as f32),
-                    Ok(Val::Vec3(v)) => Ok(v[0] as f32),
-                    Err(e) => Err(e),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|i| eval_bound(&bound, i, coords).as_scalar() as f32)
+                .collect();
             Ok(DataArray::scalars_f32(result_name, vals))
         }
         Val::Vec3(_) => {
             let vals: Vec<[f32; 3]> = (0..n)
                 .into_par_iter()
-                .map(|i| match eval_expr(ast, i, coords[i], fd) {
-                    Ok(Val::Vec3(v)) => Ok([v[0] as f32, v[1] as f32, v[2] as f32]),
-                    Ok(Val::Scalar(v)) => Ok([v as f32, v as f32, v as f32]),
-                    Err(e) => Err(e),
+                .map(|i| match eval_bound(&bound, i, coords) {
+                    Val::Vec3(v) => [v[0] as f32, v[1] as f32, v[2] as f32],
+                    Val::Scalar(v) => [v as f32, v as f32, v as f32],
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect();
             Ok(DataArray::vectors_f32(result_name, vals))
         }
     }
@@ -527,36 +572,113 @@ fn parse_expression(expr: &str) -> Result<Expr, PipelineError> {
     Ok(ast)
 }
 
-fn eval_expr(expr: &Expr, idx: usize, coord: [f32; 3], fd: &FieldData) -> Result<Val, PipelineError> {
+#[derive(Clone, Copy)]
+enum BoundSlice<'a> {
+    F32(&'a [f32]),
+    F64(&'a [f64]),
+    I8(&'a [i8]),
+    I16(&'a [i16]),
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+    U32(&'a [u32]),
+    U64(&'a [u64]),
+}
+
+impl<'a> BoundSlice<'a> {
+    #[inline]
+    fn from_array_data(data: &'a ArrayData) -> Self {
+        match data {
+            ArrayData::F32(v) => Self::F32(v),
+            ArrayData::F64(v) => Self::F64(v),
+            ArrayData::I8(v) => Self::I8(v),
+            ArrayData::I16(v) => Self::I16(v),
+            ArrayData::I32(v) => Self::I32(v),
+            ArrayData::I64(v) => Self::I64(v),
+            ArrayData::U8(v) => Self::U8(v),
+            ArrayData::U16(v) => Self::U16(v),
+            ArrayData::U32(v) => Self::U32(v),
+            ArrayData::U64(v) => Self::U64(v),
+        }
+    }
+
+    #[inline]
+    fn get_f64(self, idx: usize) -> f64 {
+        match self {
+            Self::F32(v) => v[idx] as f64,
+            Self::F64(v) => v[idx],
+            Self::I8(v) => v[idx] as f64,
+            Self::I16(v) => v[idx] as f64,
+            Self::I32(v) => v[idx] as f64,
+            Self::I64(v) => v[idx] as f64,
+            Self::U8(v) => v[idx] as f64,
+            Self::U16(v) => v[idx] as f64,
+            Self::U32(v) => v[idx] as f64,
+            Self::U64(v) => v[idx] as f64,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BuiltinFn {
+    Mag,
+    Sin,
+    Cos,
+    Tan,
+    Sqrt,
+    Abs,
+    Exp,
+    Ln,
+    Min,
+    Max,
+    Clamp,
+}
+
+enum BoundExpr<'a> {
+    Num(f64),
+    CoordX,
+    CoordY,
+    CoordZ,
+    Coords,
+    ScalarArray { slice: BoundSlice<'a>, nc: usize },
+    Vec3Array { slice: BoundSlice<'a>, nc: usize },
+    Neg(Box<BoundExpr<'a>>),
+    Bin(BinOp, Box<BoundExpr<'a>>, Box<BoundExpr<'a>>),
+    Call(BuiltinFn, Vec<BoundExpr<'a>>),
+}
+
+fn bind_expr<'a>(
+    expr: &Expr,
+    fd: &'a FieldData,
+    expected_len: usize,
+) -> Result<BoundExpr<'a>, PipelineError> {
     match expr {
-        Expr::Num(v) => Ok(Val::Scalar(*v)),
+        Expr::Num(v) => Ok(BoundExpr::Num(*v)),
         Expr::Ident(name) => match name.as_str() {
-            "coordsX" => Ok(Val::Scalar(coord[0] as f64)),
-            "coordsY" => Ok(Val::Scalar(coord[1] as f64)),
-            "coordsZ" => Ok(Val::Scalar(coord[2] as f64)),
-            "coords" => Ok(Val::Vec3([coord[0] as f64, coord[1] as f64, coord[2] as f64])),
+            "coordsX" => Ok(BoundExpr::CoordX),
+            "coordsY" => Ok(BoundExpr::CoordY),
+            "coordsZ" => Ok(BoundExpr::CoordZ),
+            "coords" => Ok(BoundExpr::Coords),
             _ => {
                 if let Some(arr) = fd.get(name) {
-                    if idx >= arr.num_tuples() {
+                    if expected_len > arr.num_tuples() {
                         return Err(PipelineError::ExecutionFailed(format!(
                             "Array '{name}' length ({}) does not match dataset size",
                             arr.num_tuples()
                         )));
                     }
-                    if arr.num_components >= 3 {
-                        let base = idx * arr.num_components;
-                        Ok(Val::Vec3([
-                            arr.data.get_f64(base),
-                            arr.data.get_f64(base + 1),
-                            arr.data.get_f64(base + 2),
-                        ]))
+                    let slice = BoundSlice::from_array_data(&arr.data);
+                    let nc = arr.num_components;
+                    if nc >= 3 {
+                        Ok(BoundExpr::Vec3Array { slice, nc })
                     } else {
-                        Ok(Val::Scalar(arr.get_scalar(idx)))
+                        Ok(BoundExpr::ScalarArray { slice, nc })
                     }
                 } else {
                     match name.as_str() {
-                        "pi" | "PI" => Ok(Val::Scalar(std::f64::consts::PI)),
-                        "e" | "E" => Ok(Val::Scalar(std::f64::consts::E)),
+                        "pi" | "PI" => Ok(BoundExpr::Num(std::f64::consts::PI)),
+                        "e" | "E" => Ok(BoundExpr::Num(std::f64::consts::E)),
                         _ => Err(PipelineError::ExecutionFailed(format!(
                             "Unknown variable or array '{name}' in CalculatorFilter"
                         ))),
@@ -564,26 +686,81 @@ fn eval_expr(expr: &Expr, idx: usize, coord: [f32; 3], fd: &FieldData) -> Result
                 }
             }
         },
-        Expr::Neg(inner) => match eval_expr(inner, idx, coord, fd)? {
-            Val::Scalar(s) => Ok(Val::Scalar(-s)),
-            Val::Vec3(v) => Ok(Val::Vec3([-v[0], -v[1], -v[2]])),
+        Expr::Neg(inner) => Ok(BoundExpr::Neg(Box::new(bind_expr(inner, fd, expected_len)?))),
+        Expr::Bin(op, a, b) => Ok(BoundExpr::Bin(
+            *op,
+            Box::new(bind_expr(a, fd, expected_len)?),
+            Box::new(bind_expr(b, fd, expected_len)?),
+        )),
+        Expr::Call(fn_name, args) => {
+            let (builtin, expected_arity) = match fn_name.as_str() {
+                "mag" => (BuiltinFn::Mag, 1),
+                "sin" => (BuiltinFn::Sin, 1),
+                "cos" => (BuiltinFn::Cos, 1),
+                "tan" => (BuiltinFn::Tan, 1),
+                "sqrt" => (BuiltinFn::Sqrt, 1),
+                "abs" => (BuiltinFn::Abs, 1),
+                "exp" => (BuiltinFn::Exp, 1),
+                "ln" => (BuiltinFn::Ln, 1),
+                "min" => (BuiltinFn::Min, 2),
+                "max" => (BuiltinFn::Max, 2),
+                "clamp" => (BuiltinFn::Clamp, 3),
+                _ => {
+                    return Err(PipelineError::ExecutionFailed(format!(
+                        "Unknown function '{fn_name}' in CalculatorFilter"
+                    )));
+                }
+            };
+            check_arity(fn_name, args, expected_arity)?;
+            let bound_args = args
+                .iter()
+                .map(|a| bind_expr(a, fd, expected_len))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(BoundExpr::Call(builtin, bound_args))
+        }
+    }
+}
+
+#[inline]
+fn eval_bound(expr: &BoundExpr<'_>, idx: usize, coords: &CoordSource<'_>) -> Val {
+    match expr {
+        BoundExpr::Num(v) => Val::Scalar(*v),
+        BoundExpr::CoordX => Val::Scalar(coords.at(idx)[0] as f64),
+        BoundExpr::CoordY => Val::Scalar(coords.at(idx)[1] as f64),
+        BoundExpr::CoordZ => Val::Scalar(coords.at(idx)[2] as f64),
+        BoundExpr::Coords => {
+            let c = coords.at(idx);
+            Val::Vec3([c[0] as f64, c[1] as f64, c[2] as f64])
+        }
+        BoundExpr::ScalarArray { slice, nc } => Val::Scalar(slice.get_f64(idx * *nc)),
+        BoundExpr::Vec3Array { slice, nc } => {
+            let base = idx * *nc;
+            Val::Vec3([
+                slice.get_f64(base),
+                slice.get_f64(base + 1),
+                slice.get_f64(base + 2),
+            ])
+        }
+        BoundExpr::Neg(inner) => match eval_bound(inner, idx, coords) {
+            Val::Scalar(s) => Val::Scalar(-s),
+            Val::Vec3(v) => Val::Vec3([-v[0], -v[1], -v[2]]),
         },
-        Expr::Bin(op, a, b) => {
-            let va = eval_expr(a, idx, coord, fd)?;
-            let vb = eval_expr(b, idx, coord, fd)?;
+        BoundExpr::Bin(op, a, b) => {
+            let va = eval_bound(a, idx, coords);
+            let vb = eval_bound(b, idx, coords);
             match (op, va, vb) {
                 (BinOp::Add, Val::Vec3(u), Val::Vec3(v)) => {
-                    Ok(Val::Vec3([u[0] + v[0], u[1] + v[1], u[2] + v[2]]))
+                    Val::Vec3([u[0] + v[0], u[1] + v[1], u[2] + v[2]])
                 }
                 (BinOp::Sub, Val::Vec3(u), Val::Vec3(v)) => {
-                    Ok(Val::Vec3([u[0] - v[0], u[1] - v[1], u[2] - v[2]]))
+                    Val::Vec3([u[0] - v[0], u[1] - v[1], u[2] - v[2]])
                 }
                 (BinOp::Mul, Val::Vec3(u), Val::Scalar(s))
                 | (BinOp::Mul, Val::Scalar(s), Val::Vec3(u)) => {
-                    Ok(Val::Vec3([u[0] * s, u[1] * s, u[2] * s]))
+                    Val::Vec3([u[0] * s, u[1] * s, u[2] * s])
                 }
                 (BinOp::Div, Val::Vec3(u), Val::Scalar(s)) => {
-                    Ok(Val::Vec3([u[0] / s, u[1] / s, u[2] / s]))
+                    Val::Vec3([u[0] / s, u[1] / s, u[2] / s])
                 }
                 _ => {
                     let sa = va.as_scalar();
@@ -595,65 +772,35 @@ fn eval_expr(expr: &Expr, idx: usize, coord: [f32; 3], fd: &FieldData) -> Result
                         BinOp::Div => sa / sb,
                         BinOp::Pow => sa.powf(sb),
                     };
-                    Ok(Val::Scalar(r))
+                    Val::Scalar(r)
                 }
             }
         }
-        Expr::Call(fn_name, args) => match fn_name.as_str() {
-            "mag" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.mag()))
+        BoundExpr::Call(builtin, args) => match builtin {
+            BuiltinFn::Mag => Val::Scalar(eval_bound(&args[0], idx, coords).mag()),
+            BuiltinFn::Sin => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().sin()),
+            BuiltinFn::Cos => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().cos()),
+            BuiltinFn::Tan => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().tan()),
+            BuiltinFn::Sqrt => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().sqrt()),
+            BuiltinFn::Abs => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().abs()),
+            BuiltinFn::Exp => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().exp()),
+            BuiltinFn::Ln => Val::Scalar(eval_bound(&args[0], idx, coords).as_scalar().ln()),
+            BuiltinFn::Min => {
+                let a = eval_bound(&args[0], idx, coords).as_scalar();
+                let b = eval_bound(&args[1], idx, coords).as_scalar();
+                Val::Scalar(a.min(b))
             }
-            "sin" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().sin()))
+            BuiltinFn::Max => {
+                let a = eval_bound(&args[0], idx, coords).as_scalar();
+                let b = eval_bound(&args[1], idx, coords).as_scalar();
+                Val::Scalar(a.max(b))
             }
-            "cos" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().cos()))
+            BuiltinFn::Clamp => {
+                let x = eval_bound(&args[0], idx, coords).as_scalar();
+                let lo = eval_bound(&args[1], idx, coords).as_scalar();
+                let hi = eval_bound(&args[2], idx, coords).as_scalar();
+                Val::Scalar(x.clamp(lo, hi))
             }
-            "tan" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().tan()))
-            }
-            "sqrt" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().sqrt()))
-            }
-            "abs" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().abs()))
-            }
-            "exp" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().exp()))
-            }
-            "ln" => {
-                check_arity(fn_name, args, 1)?;
-                Ok(Val::Scalar(eval_expr(&args[0], idx, coord, fd)?.as_scalar().ln()))
-            }
-            "min" => {
-                check_arity(fn_name, args, 2)?;
-                let a = eval_expr(&args[0], idx, coord, fd)?.as_scalar();
-                let b = eval_expr(&args[1], idx, coord, fd)?.as_scalar();
-                Ok(Val::Scalar(a.min(b)))
-            }
-            "max" => {
-                check_arity(fn_name, args, 2)?;
-                let a = eval_expr(&args[0], idx, coord, fd)?.as_scalar();
-                let b = eval_expr(&args[1], idx, coord, fd)?.as_scalar();
-                Ok(Val::Scalar(a.max(b)))
-            }
-            "clamp" => {
-                check_arity(fn_name, args, 3)?;
-                let x = eval_expr(&args[0], idx, coord, fd)?.as_scalar();
-                let lo = eval_expr(&args[1], idx, coord, fd)?.as_scalar();
-                let hi = eval_expr(&args[2], idx, coord, fd)?.as_scalar();
-                Ok(Val::Scalar(x.clamp(lo, hi)))
-            }
-            _ => Err(PipelineError::ExecutionFailed(format!(
-                "Unknown function '{fn_name}' in CalculatorFilter"
-            ))),
         },
     }
 }
@@ -666,4 +813,41 @@ fn check_arity(name: &str, args: &[Expr], expected: usize) -> Result<(), Pipelin
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calculator_evaluates_rectilinear_coords_and_arrays_without_all_points() {
+        let mut rg = RectilinearGrid {
+            x_coords: vec![1.0, 3.0],
+            y_coords: vec![2.0, 4.0],
+            z_coords: vec![0.0, 5.0],
+            ..Default::default()
+        };
+        let n = rg.num_points();
+        let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        rg.point_data.set_scalars(DataArray::scalars_f32("p", vals));
+
+        let filter = CalculatorFilter::new(
+            "mag(coords) + p",
+            "out",
+            AttributeAssociation::Point,
+        );
+        let out = filter.apply(&DataSet::RectilinearGrid(rg.clone())).unwrap();
+        let out_arr = out.point_data().unwrap().get("out").unwrap();
+        assert_eq!(out_arr.num_tuples(), n);
+        for k in 0..2 {
+            for j in 0..2 {
+                for i in 0..2 {
+                    let idx = rg.point_index(i, j, k);
+                    let c = rg.point_coords(i, j, k);
+                    let expected = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt() + idx as f32;
+                    assert!((out_arr.get_scalar(idx) as f32 - expected).abs() < 1e-5);
+                }
+            }
+        }
+    }
 }

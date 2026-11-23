@@ -1,11 +1,10 @@
 //! Topological edge extraction filter (`ExtractEdgesFilter`, equivalent to `vtkExtractEdges`).
 
-use crate::util::{canonical_edge_key, dataset_points, structured_cells};
+use crate::util::{canonical_edge_key, structured_cells, FxHashSet, GridPoints};
 use paraviz_core::{
     CellType, DataSet, Filter, MultiBlockDataSet, PipelineError, PolyData,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 /// Extracts all unique topological edges of a dataset's cells as `PolyData` line segments,
 /// preserving `point_data` and `field_data`.
@@ -33,9 +32,9 @@ impl Filter for ExtractEdgesFilter {
             return Ok(DataSet::MultiBlock(out));
         }
 
-        let points = dataset_points(input)?;
-        let n_pts = points.len();
-        let mut seen: HashSet<u64> = HashSet::new();
+        let grid_pts = GridPoints::from_dataset(input)?;
+        let n_pts = grid_pts.len();
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
         let mut edges: Vec<(u32, u32)> = Vec::new();
 
         let mut push_edge = |a: u32, b: u32| {
@@ -102,7 +101,7 @@ impl Filter for ExtractEdgesFilter {
         let lines: Vec<Vec<u32>> = edges.into_iter().map(|(a, b)| vec![a, b]).collect();
 
         Ok(DataSet::PolyData(PolyData {
-            points,
+            points: grid_pts.to_vec_par(),
             lines,
             point_data: input.point_data().cloned().unwrap_or_default(),
             field_data: input.field_data().cloned().unwrap_or_default(),

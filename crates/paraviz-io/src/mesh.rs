@@ -1341,10 +1341,13 @@ pub fn write_ply_with_format(
 
 fn scalar_type_to_ply(st: ScalarType) -> PlyType {
     match st {
+        ScalarType::I8 => PlyType::I8,
         ScalarType::U8 => PlyType::U8,
+        ScalarType::I16 => PlyType::I16,
+        ScalarType::U16 => PlyType::U16,
         ScalarType::I32 => PlyType::I32,
         ScalarType::U32 => PlyType::U32,
-        ScalarType::I64 => PlyType::F64,
+        ScalarType::I64 | ScalarType::U64 => PlyType::F64,
         ScalarType::F32 => PlyType::F32,
         ScalarType::F64 => PlyType::F64,
     }
@@ -1403,10 +1406,27 @@ fn write_ply_f64(w: &mut impl Write, fmt: PlyFormat, v: f64) -> Result<()> {
 
 fn write_ply_scalar_at(w: &mut impl Write, fmt: PlyFormat, arr: &DataArray, idx: usize) -> Result<()> {
     match &arr.data {
+        ArrayData::I8(v) => match fmt {
+            PlyFormat::Ascii => write!(w, "{}", v[idx]).map_err(Into::into),
+            PlyFormat::BinaryLittleEndian | PlyFormat::BinaryBigEndian => {
+                w.write_all(&v[idx].to_le_bytes()).map_err(Into::into)
+            }
+        },
         ArrayData::U8(v) => write_ply_u8(w, fmt, v[idx]),
+        ArrayData::I16(v) => match fmt {
+            PlyFormat::Ascii => write!(w, "{}", v[idx]).map_err(Into::into),
+            PlyFormat::BinaryLittleEndian => w.write_all(&v[idx].to_le_bytes()).map_err(Into::into),
+            PlyFormat::BinaryBigEndian => w.write_all(&v[idx].to_be_bytes()).map_err(Into::into),
+        },
+        ArrayData::U16(v) => match fmt {
+            PlyFormat::Ascii => write!(w, "{}", v[idx]).map_err(Into::into),
+            PlyFormat::BinaryLittleEndian => w.write_all(&v[idx].to_le_bytes()).map_err(Into::into),
+            PlyFormat::BinaryBigEndian => w.write_all(&v[idx].to_be_bytes()).map_err(Into::into),
+        },
         ArrayData::I32(v) => write_ply_i32(w, fmt, v[idx]),
         ArrayData::U32(v) => write_ply_u32(w, fmt, v[idx]),
         ArrayData::I64(v) => write_ply_f64(w, fmt, v[idx] as f64),
+        ArrayData::U64(v) => write_ply_f64(w, fmt, v[idx] as f64),
         ArrayData::F32(v) => write_ply_f32(w, fmt, v[idx]),
         ArrayData::F64(v) => write_ply_f64(w, fmt, v[idx]),
     }

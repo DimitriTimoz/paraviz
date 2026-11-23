@@ -2,7 +2,9 @@
 //! equivalent to `vtkAppendFilter` and `vtkAppendPolyData`).
 
 use crate::util::{dataset_to_unstructured, merge_polydata_refs, merge_unstructured_refs};
-use paraviz_core::{DataSet, Filter, PipelineError, PolyData, UnstructuredGrid};
+use paraviz_core::{
+    DataSet, Filter, MultiInputFilter, PipelineError, PolyData, UnstructuredGrid,
+};
 use serde::{Deserialize, Serialize};
 
 /// Combines multiple `PolyData` meshes into a merged `PolyData`, or mixed/volumetric
@@ -35,6 +37,20 @@ impl Filter for AppendDatasetsFilter {
     fn apply(&self, input: &DataSet) -> Result<DataSet, PipelineError> {
         let mut refs = Vec::with_capacity(1 + self.additional_inputs.len());
         refs.push(input);
+        for extra in &self.additional_inputs {
+            refs.push(extra);
+        }
+        append_datasets(&refs)
+    }
+}
+
+impl MultiInputFilter for AppendDatasetsFilter {
+    fn name(&self) -> &str {
+        "AppendDatasetsFilter"
+    }
+
+    fn apply_multi(&self, inputs: &[&DataSet]) -> Result<DataSet, PipelineError> {
+        let mut refs: Vec<&DataSet> = inputs.to_vec();
         for extra in &self.additional_inputs {
             refs.push(extra);
         }

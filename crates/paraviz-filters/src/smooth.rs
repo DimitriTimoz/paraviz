@@ -1,12 +1,11 @@
 //! Surface mesh smoothing filter (`SmoothFilter`) supporting Laplacian and
 //! Taubin non-shrinking smoothing on `PolyData`.
 
-use crate::util::canonical_edge_key;
+use crate::util::{canonical_edge_key, FxHashMap, FxHashSet};
 use glam::Vec3;
 use paraviz_core::{DataSet, Filter, MultiBlockDataSet, PipelineError, PolyData};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 /// Mesh smoothing algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -78,8 +77,8 @@ impl SmoothFilter {
         }
 
         // Build adjacency list and detect boundary vertices from polygons/strips.
-        let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-        let mut edge_counts: HashMap<u64, usize> = HashMap::new();
+        let mut neighbors: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); n];
+        let mut edge_counts: FxHashMap<u64, usize> = FxHashMap::default();
 
         let mut add_poly_edges = |poly: &[u32]| {
             if poly.len() < 2 {

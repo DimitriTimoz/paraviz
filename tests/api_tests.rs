@@ -41,6 +41,10 @@ fn fluent_pipeline_render_and_state_roundtrip() {
     let trace = pv.to_rust_trace();
     assert!(trace.contains("add_source_cfg"));
     assert!(trace.contains("add_filter_cfg"));
+    assert!(trace.contains("SourceConfig::from_json"));
+    assert!(trace.contains("FilterConfig::from_json"));
+    assert!(trace.contains("ColorMapPreset::Viridis"));
+    assert!(trace.contains("color_by_point(\"RTData\")"));
 }
 
 #[test]
@@ -104,4 +108,9 @@ fn gpu_compute_contour_picking_and_glb_export() {
     pv.export_glb(gpu_iso, &out_glb, true).unwrap();
     assert!(fs::metadata(&out_glb).unwrap().len() > 100);
     let _ = fs::remove_file(&out_glb);
+
+    // State JSON roundtrip should also preserve custom/in-memory nodes (like gpu_iso)
+    let state_json = pv.save_state_json().unwrap();
+    let restored = ParaViz::load_state_json(&state_json).unwrap();
+    assert_eq!(restored.nodes().len(), 2);
 }

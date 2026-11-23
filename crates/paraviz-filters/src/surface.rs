@@ -1,13 +1,12 @@
 //! Surface extraction filter (`ExtractSurface`, equivalent to `vtkDataSetSurfaceFilter` / `vtkGeometryFilter`).
 
-use crate::util::{compact_polydata_points, merge_polydata};
+use crate::util::{compact_polydata_points, fx_map_with_capacity, merge_polydata, FxHashMap, GridPoints};
 use paraviz_core::{
     CellType, DataSet, FieldData, Filter, ImageData, PipelineError, PolyData, RectilinearGrid,
     StructuredGrid, UnstructuredGrid,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Extracts the outer boundary surface of any dataset into a renderable [`PolyData`].
 ///
@@ -69,7 +68,7 @@ pub fn extract_surface(input: &DataSet) -> Result<PolyData, PipelineError> {
 
 fn extract_structured_grid_topology(
     dims: [usize; 3],
-    points: Vec<[f32; 3]>,
+    points: GridPoints<'_>,
     point_data: &FieldData,
     cell_data: &FieldData,
 ) -> PolyData {
@@ -83,7 +82,7 @@ fn extract_structured_grid_topology(
     // Handle degenerate 0D/1D/2D structured grids cleanly.
     if nx == 1 && ny == 1 && nz == 1 {
         return PolyData {
-            points,
+            points: vec![points.at_ijk(0, 0, 0)],
             verts: vec![0],
             point_data: point_data.clone(),
             cell_data: cell_data.clone(),
@@ -94,14 +93,14 @@ fn extract_structured_grid_topology(
         let count = nx * ny * nz;
         let line: Vec<u32> = (0..count as u32).collect();
         return PolyData {
-            points,
+            points: points.to_vec_par(),
             lines: vec![line],
             point_data: point_data.clone(),
             ..Default::default()
         };
     }
 
-    // 2D grid (one dimension == 1)
+    // 2D grid (one dimension == 1): all points belong to the boundary surface.
     if nx == 1 || ny == 1 || nz == 1 {
         let mut polys = Vec::new();
         let mut cell_indices = Vec::new();
@@ -149,7 +148,7 @@ fn extract_structured_grid_topology(
             cell_data.gather(&cell_indices)
         };
         return PolyData {
-            points,
+            points: points.to_vec_par(),
             polys,
             point_data: point_data.clone(),
             cell_data: cdata,
@@ -157,7 +156,68 @@ fn extract_structured_grid_topology(
         };
     }
 
-    // Full 3D grid: extract only the 6 boundary faces (equivalent to skipping all shared interior faces).
+    // Full 3D grid: materialize only the outer 6 boundary face vertices directly
+    // in ascending linear `(k, j, i)` order, skipping all interior points.
+    let slice_full = nx * ny;
+    let slice_ring = 2 * nx + 2 * (ny - 2);
+    let boundary_count = 2 * slice_full + (nz - 2) * slice_ring;
+
+    let mut boundary_points = Vec::with_capacity(boundary_count);
+    let has_pdata = !point_data.is_empty();
+    let mut old_pt_indices = if has_pdata {
+        Vec::with_capacity(boundary_count)
+    } else {
+        Vec::new()
+    };
+
+    let mut push_boundary_pt = |i: usize, j: usize, k: usize| {
+        boundary_points.push(points.at_ijk(i, j, k));
+        if has_pdata {
+            old_pt_indices.push(i + nx * (j + ny * k));
+        }
+    };
+
+    for k in 0..nz {
+        if k == 0 || k == nz - 1 {
+            for j in 0..ny {
+                for i in 0..nx {
+                    push_boundary_pt(i, j, k);
+                }
+            }
+        } else {
+            for j in 0..ny {
+                if j == 0 || j == ny - 1 {
+                    for i in 0..nx {
+                        push_boundary_pt(i, j, k);
+                    }
+                } else {
+                    push_boundary_pt(0, j, k);
+                    push_boundary_pt(nx - 1, j, k);
+                }
+            }
+        }
+    }
+
+    // Maps any boundary `(i, j, k)` directly to its compacted index in `0..boundary_count`.
+    let b_idx = |i: usize, j: usize, k: usize| -> u32 {
+        let idx = if k == 0 {
+            i + nx * j
+        } else if k == nz - 1 {
+            slice_full + (nz - 2) * slice_ring + i + nx * j
+        } else {
+            let base = slice_full + (k - 1) * slice_ring;
+            if j == 0 {
+                base + i
+            } else if j == ny - 1 {
+                base + nx + 2 * (ny - 2) + i
+            } else {
+                debug_assert!(i == 0 || i == nx - 1);
+                base + nx + (j - 1) * 2 + usize::from(i == nx - 1)
+            }
+        };
+        idx as u32
+    };
+
     let cx = nx - 1;
     let cy = ny - 1;
     let cz = nz - 1;
@@ -171,18 +231,18 @@ fn extract_structured_grid_topology(
     for k in 0..cz {
         for j in 0..cy {
             polys.push(vec![
-                pt_idx(0, j, k),
-                pt_idx(0, j, k + 1),
-                pt_idx(0, j + 1, k + 1),
-                pt_idx(0, j + 1, k),
+                b_idx(0, j, k),
+                b_idx(0, j, k + 1),
+                b_idx(0, j + 1, k + 1),
+                b_idx(0, j + 1, k),
             ]);
             cell_indices.push(cell_idx(0, j, k));
 
             polys.push(vec![
-                pt_idx(nx - 1, j, k),
-                pt_idx(nx - 1, j + 1, k),
-                pt_idx(nx - 1, j + 1, k + 1),
-                pt_idx(nx - 1, j, k + 1),
+                b_idx(nx - 1, j, k),
+                b_idx(nx - 1, j + 1, k),
+                b_idx(nx - 1, j + 1, k + 1),
+                b_idx(nx - 1, j, k + 1),
             ]);
             cell_indices.push(cell_idx(cx - 1, j, k));
         }
@@ -191,18 +251,18 @@ fn extract_structured_grid_topology(
     for k in 0..cz {
         for i in 0..cx {
             polys.push(vec![
-                pt_idx(i, 0, k),
-                pt_idx(i + 1, 0, k),
-                pt_idx(i + 1, 0, k + 1),
-                pt_idx(i, 0, k + 1),
+                b_idx(i, 0, k),
+                b_idx(i + 1, 0, k),
+                b_idx(i + 1, 0, k + 1),
+                b_idx(i, 0, k + 1),
             ]);
             cell_indices.push(cell_idx(i, 0, k));
 
             polys.push(vec![
-                pt_idx(i, ny - 1, k),
-                pt_idx(i, ny - 1, k + 1),
-                pt_idx(i + 1, ny - 1, k + 1),
-                pt_idx(i + 1, ny - 1, k),
+                b_idx(i, ny - 1, k),
+                b_idx(i, ny - 1, k + 1),
+                b_idx(i + 1, ny - 1, k + 1),
+                b_idx(i + 1, ny - 1, k),
             ]);
             cell_indices.push(cell_idx(i, cy - 1, k));
         }
@@ -211,42 +271,47 @@ fn extract_structured_grid_topology(
     for j in 0..cy {
         for i in 0..cx {
             polys.push(vec![
-                pt_idx(i, j, 0),
-                pt_idx(i, j + 1, 0),
-                pt_idx(i + 1, j + 1, 0),
-                pt_idx(i + 1, j, 0),
+                b_idx(i, j, 0),
+                b_idx(i, j + 1, 0),
+                b_idx(i + 1, j + 1, 0),
+                b_idx(i + 1, j, 0),
             ]);
             cell_indices.push(cell_idx(i, j, 0));
 
             polys.push(vec![
-                pt_idx(i, j, nz - 1),
-                pt_idx(i + 1, j, nz - 1),
-                pt_idx(i + 1, j + 1, nz - 1),
-                pt_idx(i, j + 1, nz - 1),
+                b_idx(i, j, nz - 1),
+                b_idx(i + 1, j, nz - 1),
+                b_idx(i + 1, j + 1, nz - 1),
+                b_idx(i, j + 1, nz - 1),
             ]);
             cell_indices.push(cell_idx(i, j, cz - 1));
         }
     }
 
+    let pdata = if has_pdata {
+        point_data.gather(&old_pt_indices)
+    } else {
+        FieldData::new()
+    };
     let cdata = if cell_data.is_empty() {
         FieldData::new()
     } else {
         cell_data.gather(&cell_indices)
     };
 
-    compact_polydata_points(PolyData {
-        points,
+    PolyData {
+        points: boundary_points,
         polys,
-        point_data: point_data.clone(),
+        point_data: pdata,
         cell_data: cdata,
         ..Default::default()
-    })
+    }
 }
 
 fn extract_image_surface(img: &ImageData) -> PolyData {
     extract_structured_grid_topology(
         img.dimensions,
-        img.all_points(),
+        GridPoints::Image(img),
         &img.point_data,
         &img.cell_data,
     )
@@ -255,7 +320,7 @@ fn extract_image_surface(img: &ImageData) -> PolyData {
 fn extract_rectilinear_surface(rg: &RectilinearGrid) -> PolyData {
     extract_structured_grid_topology(
         rg.dimensions(),
-        rg.all_points(),
+        GridPoints::Rectilinear(rg),
         &rg.point_data,
         &rg.cell_data,
     )
@@ -264,24 +329,34 @@ fn extract_rectilinear_surface(rg: &RectilinearGrid) -> PolyData {
 fn extract_structured_surface(sg: &StructuredGrid) -> PolyData {
     extract_structured_grid_topology(
         sg.dimensions,
-        sg.points.clone(),
+        GridPoints::from_structured(&sg.points, sg.dimensions),
         &sg.point_data,
         &sg.cell_data,
     )
 }
 
-/// Canonical sorted vertex key for triangle/quad faces (zero-allocation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FaceKey4([u32; 4]);
+/// Canonical sorted vertex key for polygonal faces (zero-allocation up to 4 vertices,
+/// exact sorted `Vec<u32>` comparison for >4-vertex polygons).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FaceKey {
+    Small([u32; 4], u8),
+    Large(Vec<u32>),
+}
 
-impl FaceKey4 {
+impl FaceKey {
     #[inline]
     fn from_slice(verts: &[u32]) -> Self {
-        let mut key = [u32::MAX; 4];
-        let len = verts.len().min(4);
-        key[..len].copy_from_slice(&verts[..len]);
-        key[..len].sort_unstable();
-        Self(key)
+        if verts.len() <= 4 {
+            let mut key = [u32::MAX; 4];
+            let len = verts.len();
+            key[..len].copy_from_slice(verts);
+            key[..len].sort_unstable();
+            Self::Small(key, len as u8)
+        } else {
+            let mut key = verts.to_vec();
+            key.sort_unstable();
+            Self::Large(key)
+        }
     }
 }
 
@@ -300,7 +375,7 @@ fn extract_unstructured_surface(ug: &UnstructuredGrid) -> PolyData {
     }
 
     // Extract faces of 3D cells in parallel.
-    let face_candidates: Vec<(FaceKey4, Vec<u32>, usize)> = (0..n_cells)
+    let face_candidates: Vec<(FaceKey, Vec<u32>, usize)> = (0..n_cells)
         .into_par_iter()
         .flat_map_iter(|cell_idx| {
             let ct = ug.cell_types[cell_idx];
@@ -309,7 +384,7 @@ fn extract_unstructured_surface(ug: &UnstructuredGrid) -> PolyData {
             if ct.dimension() == 3 {
                 for f in ct.faces(pts.len()) {
                     let verts: Vec<u32> = f.into_iter().map(|li| pts[li]).collect();
-                    let key = FaceKey4::from_slice(&verts);
+                    let key = FaceKey::from_slice(&verts);
                     local.push((key, verts, cell_idx));
                 }
             }
@@ -317,8 +392,8 @@ fn extract_unstructured_surface(ug: &UnstructuredGrid) -> PolyData {
         })
         .collect();
 
-    let mut face_map: HashMap<FaceKey4, FaceEntry> =
-        HashMap::with_capacity(face_candidates.len());
+    let mut face_map: FxHashMap<FaceKey, FaceEntry> =
+        fx_map_with_capacity(face_candidates.len());
     for (key, verts, cell_idx) in face_candidates {
         match face_map.get_mut(&key) {
             Some(entry) => {
@@ -398,4 +473,46 @@ fn extract_unstructured_surface(ug: &UnstructuredGrid) -> PolyData {
         cell_data,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paraviz_core::DataArray;
+
+    #[test]
+    fn face_key_distinguishes_polygons_with_more_than_four_vertices() {
+        // Two pentagons sharing the first 4 vertices [0, 1, 2, 3] must NOT collide.
+        let k1 = FaceKey::from_slice(&[0, 1, 2, 3, 4]);
+        let k2 = FaceKey::from_slice(&[0, 1, 2, 3, 5]);
+        assert_ne!(k1, k2);
+
+        // Same pentagon in reversed/rotated winding order must match.
+        let k1_rev = FaceKey::from_slice(&[4, 3, 2, 1, 0]);
+        assert_eq!(k1, k1_rev);
+
+        // Quad vs pentagon sharing first 4 vertices must NOT collide.
+        let q = FaceKey::from_slice(&[0, 1, 2, 3]);
+        assert_ne!(q, k1);
+    }
+
+    #[test]
+    fn extract_image_surface_materializes_only_outer_boundary_vertices() {
+        let mut img = ImageData::new([4, 5, 6], [1.0, 2.0, 3.0], [0.5, 1.0, 2.0]);
+        let pts = img.all_points();
+        let scalars: Vec<f32> = pts.iter().map(|p| p[0] + p[1] + p[2]).collect();
+        img.point_data.set_scalars(DataArray::scalars_f32("s", scalars));
+
+        let pd = extract_image_surface(&img);
+        // 4*5*6 = 120 total points; 2*3*4 = 24 interior points => 96 boundary points.
+        assert_eq!(pd.points.len(), 96);
+        assert_eq!(pd.point_data.get("s").unwrap().num_tuples(), 96);
+        // 2*(3*4 + 3*5 + 4*5) = 2*(12 + 15 + 20) = 94 boundary quad faces.
+        assert_eq!(pd.polys.len(), 94);
+        let s_arr = pd.point_data.get("s").unwrap();
+        for (idx, p) in pd.points.iter().enumerate() {
+            let expected = p[0] + p[1] + p[2];
+            assert!((s_arr.get_scalar(idx) as f32 - expected).abs() < 1e-5);
+        }
+    }
 }

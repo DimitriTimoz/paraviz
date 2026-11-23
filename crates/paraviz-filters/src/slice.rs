@@ -1,9 +1,9 @@
 //! Arbitrary plane slicing filter (`SliceFilter`, equivalent to `vtkCutter`).
 
-use crate::contour::{contour_tetrahedron, interp_edge};
+use crate::contour::{contour_tetrahedron, contour_tetrahedron_pts, interp_edge};
 use crate::util::{
     canonical_edge_key, compact_polydata_points, deduplicate_edge_triangles,
-    interpolate_field_data_edges, merge_polydata, EdgeTri,
+    interpolate_field_data_edges, merge_polydata, EdgeTri, FxHashMap, GridPoints,
 };
 use glam::Vec3;
 use paraviz_core::{
@@ -11,7 +11,6 @@ use paraviz_core::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Cuts any dataset with an arbitrary plane `(origin, normal)`.
 ///
@@ -56,7 +55,7 @@ impl Filter for SliceFilter {
         let pd = match input {
             DataSet::ImageData(img) => slice_structured(
                 img.dimensions,
-                &img.all_points(),
+                GridPoints::Image(img),
                 &img.point_data,
                 &img.cell_data,
                 CellType::Voxel,
@@ -66,7 +65,7 @@ impl Filter for SliceFilter {
             ),
             DataSet::RectilinearGrid(rg) => slice_structured(
                 rg.dimensions(),
-                &rg.all_points(),
+                GridPoints::Rectilinear(rg),
                 &rg.point_data,
                 &rg.cell_data,
                 CellType::Voxel,
@@ -76,7 +75,7 @@ impl Filter for SliceFilter {
             ),
             DataSet::StructuredGrid(sg) => slice_structured(
                 sg.dimensions,
-                &sg.points,
+                GridPoints::from_structured(&sg.points, sg.dimensions),
                 &sg.point_data,
                 &sg.cell_data,
                 CellType::Hexahedron,
@@ -111,10 +110,44 @@ fn signed_dists(points: &[[f32; 3]], origin: Vec3, normal: Vec3) -> Vec<f64> {
         .collect()
 }
 
+fn grid_signed_dists(points: GridPoints<'_>, origin: Vec3, normal: Vec3) -> Vec<f64> {
+    match points {
+        GridPoints::Explicit { points, .. } => signed_dists(points, origin, normal),
+        GridPoints::Image(img) => {
+            let [nx, ny, nz] = img.dimensions;
+            (0..(nx * ny * nz))
+                .into_par_iter()
+                .map(|idx| {
+                    let i = idx % nx;
+                    let rem = idx / nx;
+                    let j = rem % ny;
+                    let k = rem / ny;
+                    let p = img.point_coords(i, j, k);
+                    (Vec3::from_array(p) - origin).dot(normal) as f64
+                })
+                .collect()
+        }
+        GridPoints::Rectilinear(rg) => {
+            let [nx, ny, nz] = rg.dimensions();
+            (0..(nx * ny * nz))
+                .into_par_iter()
+                .map(|idx| {
+                    let i = idx % nx;
+                    let rem = idx / nx;
+                    let j = rem % ny;
+                    let k = rem / ny;
+                    let p = rg.point_coords(i, j, k);
+                    (Vec3::from_array(p) - origin).dot(normal) as f64
+                })
+                .collect()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn slice_structured(
     dims: [usize; 3],
-    points: &[[f32; 3]],
+    points: GridPoints<'_>,
     point_data: &FieldData,
     cell_data: &FieldData,
     cell_type: CellType,
@@ -126,7 +159,7 @@ fn slice_structured(
     if nx < 2 || ny < 2 || nz < 2 || points.is_empty() {
         return PolyData::new();
     }
-    let dists = signed_dists(points, origin, normal);
+    let dists = grid_signed_dists(points, origin, normal);
     let cx = nx - 1;
     let cy = ny - 1;
     let cz = nz - 1;
@@ -158,10 +191,39 @@ fn slice_structured(
         }
     };
 
+    let corner_coords = |i: usize, j: usize, k: usize| -> [[f32; 3]; 8] {
+        match cell_type {
+            CellType::Voxel => [
+                points.at_ijk(i, j, k),
+                points.at_ijk(i + 1, j, k),
+                points.at_ijk(i, j + 1, k),
+                points.at_ijk(i + 1, j + 1, k),
+                points.at_ijk(i, j, k + 1),
+                points.at_ijk(i + 1, j, k + 1),
+                points.at_ijk(i, j + 1, k + 1),
+                points.at_ijk(i + 1, j + 1, k + 1),
+            ],
+            _ => [
+                points.at_ijk(i, j, k),
+                points.at_ijk(i + 1, j, k),
+                points.at_ijk(i + 1, j + 1, k),
+                points.at_ijk(i, j + 1, k),
+                points.at_ijk(i, j, k + 1),
+                points.at_ijk(i + 1, j, k + 1),
+                points.at_ijk(i + 1, j + 1, k + 1),
+                points.at_ijk(i, j + 1, k + 1),
+            ],
+        }
+    };
+
     if crinkle {
         let faces = cell_type.faces(8);
         let mut polys = Vec::new();
         let mut cell_ids = Vec::new();
+        let mut pt_map: FxHashMap<usize, u32> = FxHashMap::default();
+        let mut out_points = Vec::new();
+        let mut old_pt_indices = Vec::new();
+
         for cell_idx in 0..total_cells {
             let k = cell_idx / (cx * cy);
             let rem = cell_idx % (cx * cy);
@@ -175,24 +237,42 @@ fn slice_structured(
                 mx = mx.max(dists[vi]);
             }
             if mn <= 0.0 && mx >= 0.0 {
+                let c_pts = corner_coords(i, j, k);
                 for f in &faces {
-                    polys.push(f.iter().map(|&li| c[li] as u32).collect());
+                    let face_verts: Vec<u32> = f
+                        .iter()
+                        .map(|&li| {
+                            let global_vi = c[li];
+                            *pt_map.entry(global_vi).or_insert_with(|| {
+                                let id = out_points.len() as u32;
+                                out_points.push(c_pts[li]);
+                                old_pt_indices.push(global_vi);
+                                id
+                            })
+                        })
+                        .collect();
+                    polys.push(face_verts);
                     cell_ids.push(cell_idx);
                 }
             }
         }
+        let pdata = if point_data.is_empty() {
+            FieldData::new()
+        } else {
+            point_data.gather(&old_pt_indices)
+        };
         let cdata = if cell_data.is_empty() {
             FieldData::new()
         } else {
             cell_data.gather(&cell_ids)
         };
-        let mut pd = compact_polydata_points(PolyData {
-            points: points.to_vec(),
+        let mut pd = PolyData {
+            points: out_points,
             polys,
-            point_data: point_data.clone(),
+            point_data: pdata,
             cell_data: cdata,
             ..Default::default()
-        });
+        };
         if pd.point_data.active_normals_array().is_none() && !pd.polys.is_empty() {
             pd.compute_normals();
         }
@@ -217,11 +297,18 @@ fn slice_structured(
             if mn > 0.0 || mx < 0.0 {
                 return Vec::new();
             }
+            let c_pts = corner_coords(i, j, k);
             let mut local = Vec::new();
             for tet in &tets {
                 let tv = [c[tet[0]], c[tet[1]], c[tet[2]], c[tet[3]]];
                 let dv = [dists[tv[0]], dists[tv[1]], dists[tv[2]], dists[tv[3]]];
-                contour_tetrahedron(points, tv, dv, 0.0, &mut local);
+                let t_pts = [
+                    c_pts[tet[0]],
+                    c_pts[tet[1]],
+                    c_pts[tet[2]],
+                    c_pts[tet[3]],
+                ];
+                contour_tetrahedron_pts(t_pts, tv, dv, 0.0, &mut local);
             }
             local
         })
@@ -348,7 +435,7 @@ fn slice_polydata(pd: &PolyData, origin: Vec3, normal: Vec3, crinkle: bool) -> P
 
     // Slice triangles/polygons by the plane into line segments.
     let tris = pd.triangulate();
-    let mut edge_map: HashMap<u64, u32> = HashMap::new();
+    let mut edge_map: FxHashMap<u64, u32> = FxHashMap::default();
     let mut out_pts: Vec<[f32; 3]> = Vec::new();
     let mut out_edges: Vec<(usize, usize, f64)> = Vec::new();
     let mut lines: Vec<Vec<u32>> = Vec::new();

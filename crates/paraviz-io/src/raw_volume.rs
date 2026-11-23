@@ -29,10 +29,12 @@ pub enum RawScalarType {
 impl From<ScalarType> for RawScalarType {
     fn from(st: ScalarType) -> Self {
         match st {
-            ScalarType::U8 => Self::U8,
+            ScalarType::I8 | ScalarType::U8 => Self::U8,
+            ScalarType::I16 => Self::I16,
+            ScalarType::U16 => Self::U16,
             ScalarType::I32 => Self::I32,
             ScalarType::U32 => Self::U32,
-            ScalarType::I64 => Self::I64,
+            ScalarType::I64 | ScalarType::U64 => Self::I64,
             ScalarType::F32 => Self::F32,
             ScalarType::F64 => Self::F64,
         }

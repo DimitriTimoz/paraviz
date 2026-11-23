@@ -9,22 +9,36 @@
 //! - Delimited point clouds (`.csv`, `.tsv`)
 
 pub mod csv;
+pub mod ensight;
 pub mod error;
+pub mod gif;
 pub mod gltf;
+pub mod html_viewer;
+pub mod medical_volume;
 pub mod mesh;
+pub mod nifti;
+pub mod openfoam;
 pub mod raw_volume;
 pub mod vtk_legacy;
 pub mod vtk_xml;
+pub mod xdmf;
 
+pub use ensight::read_ensight_case;
 pub use error::{IoError, Result};
+pub use gif::{encode_animated_gif_bytes, write_animated_gif};
 pub use gltf::write_glb;
+pub use html_viewer::{encode_html_viewer, write_html_viewer};
+pub use medical_volume::{read_metaimage, read_nrrd, write_metaimage};
 pub use mesh::PlyFormat;
+pub use nifti::{read_nifti, write_nifti};
+pub use openfoam::read_openfoam;
 pub use raw_volume::{
     read_raw_volume, read_raw_volume_i16, read_raw_volume_u16, read_raw_volume_with_type,
     RawEndian, RawScalarType, RawVolumeDescriptor,
 };
 pub use vtk_legacy::VtkLegacyFormat;
 pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
+pub use xdmf::read_xdmf;
 
 use paraviz_core::{DataSet, PipelineError, PipelineInfo, Source};
 use std::fs::File;
@@ -37,6 +51,9 @@ pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
     if !path.exists() {
         return Err(IoError::MissingFile(path.to_path_buf()));
     }
+    if path.is_dir() && path.join("constant").join("polyMesh").is_dir() {
+        return openfoam::read_openfoam(path);
+    }
 
     let ext = path
         .extension()
@@ -48,6 +65,11 @@ pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
     let magic_lossy = String::from_utf8_lossy(&magic);
     let magic_str = magic_lossy.trim_start();
 
+    let full_lower = path.to_string_lossy().to_ascii_lowercase();
+    if full_lower.ends_with(".nii.gz") || ext == "nii" {
+        return Ok(DataSet::ImageData(nifti::read_nifti(path)?));
+    }
+
     match ext.as_str() {
         "vtk" => {
             if magic_str.starts_with('<') {
@@ -56,18 +78,26 @@ pub fn read_dataset(path: impl AsRef<Path>) -> Result<DataSet> {
                 vtk_legacy::read_vtk_legacy(path)
             }
         }
-        "vtp" | "vti" | "vtu" | "vtr" | "vts" | "vtm" | "pvd" | "pvtp" | "pvti" | "pvtu" => {
-            vtk_xml::read_vtk_xml(path)
-        }
+        "vtp" | "vti" | "vtu" | "vtr" | "vts" | "vtm" | "pvd" | "pvtp" | "pvti" | "pvtu"
+        | "pvtr" | "pvts" => vtk_xml::read_vtk_xml(path),
+        "nrrd" | "nhdr" => Ok(DataSet::ImageData(medical_volume::read_nrrd(path)?)),
+        "mhd" | "mha" => Ok(DataSet::ImageData(medical_volume::read_metaimage(path)?)),
+        "case" => ensight::read_ensight_case(path),
+        "xdmf" | "xmf" => xdmf::read_xdmf(path),
+        "foam" => openfoam::read_openfoam(path),
         "stl" => Ok(DataSet::PolyData(mesh::read_stl(path)?)),
         "obj" => Ok(DataSet::PolyData(mesh::read_obj(path)?)),
         "ply" => Ok(DataSet::PolyData(mesh::read_ply(path)?)),
         "csv" | "tsv" => Ok(DataSet::PolyData(csv::read_csv(path)?)),
         _ => {
-            if magic_str.starts_with("# vtk DataFile Version") {
+            if path.file_name().and_then(|s| s.to_str()) == Some("controlDict") {
+                openfoam::read_openfoam(path)
+            } else if magic_str.starts_with("# vtk DataFile Version") {
                 vtk_legacy::read_vtk_legacy(path)
             } else if magic_str.starts_with("<?xml") || magic_str.starts_with("<VTKFile") {
                 vtk_xml::read_vtk_xml(path)
+            } else if magic_str.starts_with("NRRD") {
+                Ok(DataSet::ImageData(medical_volume::read_nrrd(path)?))
             } else if magic_str.starts_with("ply\n") || magic_str.starts_with("ply\r\n") {
                 Ok(DataSet::PolyData(mesh::read_ply(path)?))
             } else if magic_str.starts_with("solid") && magic_str.contains("facet") {
@@ -126,6 +156,39 @@ pub fn write_dataset(path: impl AsRef<Path>, dataset: &DataSet) -> Result<()> {
             DataSet::PolyData(p) => gltf::write_glb(path, p, None, None),
             other => Err(IoError::UnsupportedFormat(format!(
                 "GLB writer requires PolyData, got {}",
+                other.type_name()
+            ))),
+        },
+        "html" | "htm" => match dataset {
+            DataSet::PolyData(p) => html_viewer::write_html_viewer(
+                path,
+                p,
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ParaViz"),
+                None,
+                None,
+            ),
+            other => Err(IoError::UnsupportedFormat(format!(
+                "HTML viewer writer requires PolyData, got {}",
+                other.type_name()
+            ))),
+        },
+        "nii" | "gz" if path.to_string_lossy().to_ascii_lowercase().ends_with(".nii")
+            || path.to_string_lossy().to_ascii_lowercase().ends_with(".nii.gz") =>
+        {
+            match dataset {
+                DataSet::ImageData(img) => nifti::write_nifti(path, img),
+                other => Err(IoError::UnsupportedFormat(format!(
+                    "NIfTI writer requires ImageData, got {}",
+                    other.type_name()
+                ))),
+            }
+        }
+        "mha" => match dataset {
+            DataSet::ImageData(img) => medical_volume::write_metaimage(path, img),
+            other => Err(IoError::UnsupportedFormat(format!(
+                "MetaImage writer requires ImageData, got {}",
                 other.type_name()
             ))),
         },

@@ -1,11 +1,10 @@
 //! Feature edge extraction filter (`FeatureEdgesFilter`, equivalent to `vtkFeatureEdges`).
 
 use crate::surface::extract_surface;
-use crate::util::{canonical_edge_key, compact_polydata_points, polygon_area_normal};
+use crate::util::{canonical_edge_key, compact_polydata_points, polygon_area_normal, FxHashMap};
 use glam::Vec3;
 use paraviz_core::{DataSet, Filter, MultiBlockDataSet, PipelineError, PolyData};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Extracts boundary, sharp dihedral (> `feature_angle_deg`), and non-manifold edges
 /// from `PolyData` or surface-extracted volumetric grids into `PolyData` line segments.
@@ -65,7 +64,7 @@ impl FeatureEdgesFilter {
             return PolyData::new();
         }
 
-        let mut edge_faces: HashMap<u64, (u32, u32, Vec<Vec3>)> = HashMap::new();
+        let mut edge_faces: FxHashMap<u64, (u32, u32, Vec<Vec3>)> = FxHashMap::default();
         let mut add_face = |poly: &[u32]| {
             let m = poly.len();
             if m < 3 || poly.iter().any(|&v| (v as usize) >= n_pts) {

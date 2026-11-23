@@ -17,7 +17,8 @@ pub use dataset::{
 };
 pub use field::{AttributeAssociation, FieldData};
 pub use pipeline::{
-    BoxedFilter, BoxedSource, Filter, NodeId, PipelineError, PipelineGraph, PipelineInfo, Source,
+    BoxedFilter, BoxedMultiFilter, BoxedSource, Filter, MultiInputFilter, NodeId, PipelineError,
+    PipelineGraph, PipelineInfo, Source,
 };
 
 use thiserror::Error;

@@ -7,19 +7,239 @@ use paraviz_core::{
     RectilinearGrid, StructuredGrid, UnstructuredGrid,
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 
-/// Extracts the point coordinates of any concrete single-block `DataSet`.
-pub(crate) fn dataset_points(ds: &DataSet) -> Result<Vec<[f32; 3]>, PipelineError> {
-    match ds {
-        DataSet::PolyData(pd) => Ok(pd.points.clone()),
-        DataSet::ImageData(img) => Ok(img.all_points()),
-        DataSet::RectilinearGrid(rg) => Ok(rg.all_points()),
-        DataSet::StructuredGrid(sg) => Ok(sg.points.clone()),
-        DataSet::UnstructuredGrid(ug) => Ok(ug.points.clone()),
-        DataSet::MultiBlock(_) => Err(PipelineError::ExecutionFailed(
-            "Expected single-block dataset, got MultiBlock".into(),
-        )),
+const FX_HASH_K: u64 = 0x517cc1b727220a95;
+
+/// Fast non-cryptographic 64-bit FxHash hasher for integer and small-tuple keys.
+#[derive(Default)]
+pub(crate) struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add_to_hash(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_HASH_K);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            let chunk = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+            self.add_to_hash(chunk);
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            let chunk = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+            self.add_to_hash(chunk as u64);
+            bytes = &bytes[4..];
+        }
+        if bytes.len() >= 2 {
+            let chunk = u16::from_ne_bytes(bytes[..2].try_into().unwrap());
+            self.add_to_hash(chunk as u64);
+            bytes = &bytes[2..];
+        }
+        if let Some(&b) = bytes.first() {
+            self.add_to_hash(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add_to_hash(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_i8(&mut self, i: i8) {
+        self.add_to_hash(i as u8 as u64);
+    }
+
+    #[inline]
+    fn write_i16(&mut self, i: i16) {
+        self.add_to_hash(i as u16 as u64);
+    }
+
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.add_to_hash(i as u32 as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_isize(&mut self, i: isize) {
+        self.add_to_hash(i as u64);
+    }
+}
+
+pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
+pub(crate) type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+pub(crate) type FxHashSet<K> = HashSet<K, FxBuildHasher>;
+
+#[inline]
+pub(crate) fn fx_map_with_capacity<K, V>(cap: usize) -> FxHashMap<K, V> {
+    HashMap::with_capacity_and_hasher(cap, FxBuildHasher::default())
+}
+
+/// Zero-allocation point coordinate lookup for explicit and implicit grids.
+#[derive(Clone, Copy)]
+pub(crate) enum GridPoints<'a> {
+    Explicit {
+        points: &'a [[f32; 3]],
+        nx: usize,
+        ny: usize,
+    },
+    Image(&'a ImageData),
+    Rectilinear(&'a RectilinearGrid),
+}
+
+impl<'a> GridPoints<'a> {
+    #[inline]
+    pub(crate) fn from_dataset(ds: &'a DataSet) -> Result<Self, PipelineError> {
+        match ds {
+            DataSet::PolyData(pd) => Ok(Self::Explicit {
+                points: &pd.points,
+                nx: pd.points.len(),
+                ny: 1,
+            }),
+            DataSet::ImageData(img) => Ok(Self::Image(img)),
+            DataSet::RectilinearGrid(rg) => Ok(Self::Rectilinear(rg)),
+            DataSet::StructuredGrid(sg) => Ok(Self::Explicit {
+                points: &sg.points,
+                nx: sg.dimensions[0],
+                ny: sg.dimensions[1],
+            }),
+            DataSet::UnstructuredGrid(ug) => Ok(Self::Explicit {
+                points: &ug.points,
+                nx: ug.points.len(),
+                ny: 1,
+            }),
+            DataSet::MultiBlock(_) => Err(PipelineError::ExecutionFailed(
+                "Expected single-block dataset, got MultiBlock".into(),
+            )),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_structured(points: &'a [[f32; 3]], dims: [usize; 3]) -> Self {
+        Self::Explicit {
+            points,
+            nx: dims[0],
+            ny: dims[1],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Explicit { points, .. } => points.len(),
+            Self::Image(img) => img.num_points(),
+            Self::Rectilinear(rg) => rg.num_points(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn at_ijk(self, i: usize, j: usize, k: usize) -> [f32; 3] {
+        match self {
+            Self::Explicit { points, nx, ny } => points[i + nx * (j + ny * k)],
+            Self::Image(img) => img.point_coords(i, j, k),
+            Self::Rectilinear(rg) => rg.point_coords(i, j, k),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn at_linear(self, idx: usize) -> [f32; 3] {
+        match self {
+            Self::Explicit { points, .. } => points[idx],
+            Self::Image(img) => {
+                let [nx, ny, _] = img.dimensions;
+                let i = idx % nx;
+                let rem = idx / nx;
+                let j = rem % ny;
+                let k = rem / ny;
+                img.point_coords(i, j, k)
+            }
+            Self::Rectilinear(rg) => {
+                let [nx, ny, _] = rg.dimensions();
+                let i = idx % nx;
+                let rem = idx / nx;
+                let j = rem % ny;
+                let k = rem / ny;
+                rg.point_coords(i, j, k)
+            }
+        }
+    }
+
+    /// Materializes all points in parallel when an owned `Vec<[f32; 3]>` output buffer is required.
+    pub(crate) fn to_vec_par(self) -> Vec<[f32; 3]> {
+        match self {
+            Self::Explicit { points, .. } => points.to_vec(),
+            Self::Image(img) => {
+                let [nx, ny, nz] = img.dimensions;
+                let n = nx * ny * nz;
+                (0..n)
+                    .into_par_iter()
+                    .map(|idx| {
+                        let i = idx % nx;
+                        let rem = idx / nx;
+                        let j = rem % ny;
+                        let k = rem / ny;
+                        img.point_coords(i, j, k)
+                    })
+                    .collect()
+            }
+            Self::Rectilinear(rg) => {
+                let [nx, ny, nz] = rg.dimensions();
+                let n = nx * ny * nz;
+                (0..n)
+                    .into_par_iter()
+                    .map(|idx| {
+                        let i = idx % nx;
+                        let rem = idx / nx;
+                        let j = rem % ny;
+                        let k = rem / ny;
+                        rg.point_coords(i, j, k)
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -510,7 +730,7 @@ pub(crate) fn dataset_to_unstructured(ds: &DataSet) -> Result<UnstructuredGrid, 
         }
         DataSet::ImageData(img) => {
             let mut ug = UnstructuredGrid::new();
-            ug.points = img.all_points();
+            ug.points = GridPoints::Image(img).to_vec_par();
             for (ct, verts) in structured_cells(img.dimensions, true) {
                 ug.push_cell(ct, &verts);
             }
@@ -521,7 +741,7 @@ pub(crate) fn dataset_to_unstructured(ds: &DataSet) -> Result<UnstructuredGrid, 
         }
         DataSet::RectilinearGrid(rg) => {
             let mut ug = UnstructuredGrid::new();
-            ug.points = rg.all_points();
+            ug.points = GridPoints::Rectilinear(rg).to_vec_par();
             for (ct, verts) in structured_cells(rg.dimensions(), true) {
                 ug.push_cell(ct, &verts);
             }
@@ -939,6 +1159,25 @@ impl<'a> SpatialSampler<'a> {
         }
     }
 
+    /// Samples all point-data arrays at `pos`, returning one `Vec<f64>` tuple per array.
+    pub(crate) fn sample_all_fields(&self, pos: Vec3) -> Option<Vec<Vec<f64>>> {
+        let weights = self.sample_weights(pos)?;
+        let fd = self.field_data();
+        let mut out = Vec::with_capacity(fd.arrays().len());
+        for arr in fd.arrays() {
+            let nc = arr.num_components;
+            let mut tuple = vec![0.0f64; nc];
+            for &(idx, w) in &weights {
+                let base = idx * nc;
+                for c in 0..nc {
+                    tuple[c] += arr.data.get_f64(base + c) * w;
+                }
+            }
+            out.push(tuple);
+        }
+        Some(out)
+    }
+
     /// Samples a 3D vector array at `pos`.
     pub(crate) fn sample_vec3(&self, array: &DataArray, pos: Vec3) -> Option<Vec3> {
         let weights = self.sample_weights(pos)?;
@@ -1124,7 +1363,7 @@ pub(crate) fn deduplicate_edge_triangles(
         return (points, edges, tris);
     }
 
-    let mut map: HashMap<u64, u32> = HashMap::with_capacity(raw_tris.len() * 2);
+    let mut map: FxHashMap<u64, u32> = fx_map_with_capacity(raw_tris.len() * 2);
     let mut points = Vec::with_capacity(raw_tris.len() * 2);
     let mut edges = Vec::with_capacity(raw_tris.len() * 2);
     let mut tris = Vec::with_capacity(raw_tris.len());

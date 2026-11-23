@@ -183,6 +183,14 @@ pub(crate) fn parse_pvd_index(content: &str, base_dir: &Path) -> Result<Vec<(f64
     Ok(entries)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XmlCompressor {
+    None,
+    Zlib,
+    Lz4,
+    Lzma,
+}
+
 /// Parses VTK XML bytes with `base_dir` for resolving external `.vtm` / `.pvd` references.
 pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
     let extracted = extract_appended_data(bytes);
@@ -195,7 +203,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
     let mut file_type = String::new();
     let mut byte_order = ByteOrder::LittleEndian;
     let mut header_type = HeaderType::UInt32;
-    let mut compressed = false;
+    let mut compressor = XmlCompressor::None;
 
     type ImageMeta = ([usize; 3], [f64; 3], [f64; 3], [isize; 6]);
     type PieceCellsTuple = (Option<Vec<u32>>, Option<Vec<u32>>, Option<Vec<u8>>);
@@ -266,7 +274,13 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                                     };
                                 }
                                 "compressor" if val.contains("ZLib") => {
-                                    compressed = true;
+                                    compressor = XmlCompressor::Zlib;
+                                }
+                                "compressor" if val.contains("LZ4") => {
+                                    compressor = XmlCompressor::Lz4;
+                                }
+                                "compressor" if val.contains("LZMA") => {
+                                    compressor = XmlCompressor::Lzma;
                                 }
                                 _ => {}
                             }
@@ -436,7 +450,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                             "",
                             byte_order,
                             header_type,
-                            compressed,
+                            compressor,
                             &extracted,
                         )?;
                         route_decoded_array(
@@ -477,7 +491,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                                 &pa.text_buf,
                                 byte_order,
                                 header_type,
-                                compressed,
+                                compressor,
                                 &extracted,
                             )?;
                             route_decoded_array(
@@ -631,6 +645,22 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
         "PUnstructuredGrid" => {
             read_pvtu(base_dir, &parallel_pieces, active_point_attrs, active_cell_attrs)
         }
+        "PRectilinearGrid" | "PStructuredGrid" => {
+            let mut mb = MultiBlockDataSet::new();
+            for (idx, piece) in parallel_pieces.iter().enumerate() {
+                let fp = base_dir.join(&piece.source);
+                if !fp.exists() {
+                    return Err(IoError::MissingFile(fp));
+                }
+                let ds = crate::read_dataset(&fp)?;
+                mb.add_block(format!("piece_{idx}"), ds);
+            }
+            if mb.blocks.len() == 1 {
+                Ok(mb.blocks.remove(0).1)
+            } else {
+                Ok(DataSet::MultiBlock(mb))
+            }
+        }
         other => Err(IoError::UnsupportedFormat(format!(
             "Unsupported VTK XML type '{other}'"
         ))),
@@ -643,7 +673,10 @@ struct ParallelPiece {
 }
 
 fn is_parallel_file_type(ft: &str) -> bool {
-    matches!(ft, "PPolyData" | "PImageData" | "PUnstructuredGrid")
+    matches!(
+        ft,
+        "PPolyData" | "PImageData" | "PUnstructuredGrid" | "PRectilinearGrid" | "PStructuredGrid"
+    )
 }
 
 type ImageMetaTuple = ([usize; 3], [f64; 3], [f64; 3], [isize; 6]);
@@ -1024,10 +1057,14 @@ fn allocate_zeroed_array_data(st: ScalarType, len: usize) -> ArrayData {
     match st {
         ScalarType::F32 => ArrayData::F32(vec![0.0; len]),
         ScalarType::F64 => ArrayData::F64(vec![0.0; len]),
+        ScalarType::I8 => ArrayData::I8(vec![0; len]),
+        ScalarType::I16 => ArrayData::I16(vec![0; len]),
         ScalarType::I32 => ArrayData::I32(vec![0; len]),
-        ScalarType::U32 => ArrayData::U32(vec![0; len]),
         ScalarType::I64 => ArrayData::I64(vec![0; len]),
         ScalarType::U8 => ArrayData::U8(vec![0; len]),
+        ScalarType::U16 => ArrayData::U16(vec![0; len]),
+        ScalarType::U32 => ArrayData::U32(vec![0; len]),
+        ScalarType::U64 => ArrayData::U64(vec![0; len]),
     }
 }
 
@@ -1035,10 +1072,14 @@ fn append_array_data(dst: &mut ArrayData, src: &ArrayData) {
     match (dst, src) {
         (ArrayData::F32(d), ArrayData::F32(s)) => d.extend_from_slice(s),
         (ArrayData::F64(d), ArrayData::F64(s)) => d.extend_from_slice(s),
+        (ArrayData::I8(d), ArrayData::I8(s)) => d.extend_from_slice(s),
+        (ArrayData::I16(d), ArrayData::I16(s)) => d.extend_from_slice(s),
         (ArrayData::I32(d), ArrayData::I32(s)) => d.extend_from_slice(s),
-        (ArrayData::U32(d), ArrayData::U32(s)) => d.extend_from_slice(s),
         (ArrayData::I64(d), ArrayData::I64(s)) => d.extend_from_slice(s),
         (ArrayData::U8(d), ArrayData::U8(s)) => d.extend_from_slice(s),
+        (ArrayData::U16(d), ArrayData::U16(s)) => d.extend_from_slice(s),
+        (ArrayData::U32(d), ArrayData::U32(s)) => d.extend_from_slice(s),
+        (ArrayData::U64(d), ArrayData::U64(s)) => d.extend_from_slice(s),
         (dst_any, src_any) => {
             let mut promoted = dst_any.to_f64_vec();
             promoted.extend(src_any.to_f64_vec());
@@ -1243,10 +1284,14 @@ fn route_decoded_array(
 
 fn array_to_u32(arr: &DataArray) -> Vec<u32> {
     match &arr.data {
+        ArrayData::I8(v) => v.iter().map(|&x| x as u32).collect(),
+        ArrayData::U8(v) => v.iter().map(|&x| x as u32).collect(),
+        ArrayData::I16(v) => v.iter().map(|&x| x as u32).collect(),
+        ArrayData::U16(v) => v.iter().map(|&x| x as u32).collect(),
         ArrayData::U32(v) => v.clone(),
         ArrayData::I32(v) => v.iter().map(|&x| x as u32).collect(),
         ArrayData::I64(v) => v.iter().map(|&x| x as u32).collect(),
-        ArrayData::U8(v) => v.iter().map(|&x| x as u32).collect(),
+        ArrayData::U64(v) => v.iter().map(|&x| x as u32).collect(),
         ArrayData::F32(v) => v.iter().map(|&x| x as u32).collect(),
         ArrayData::F64(v) => v.iter().map(|&x| x as u32).collect(),
     }
@@ -1415,14 +1460,14 @@ fn decode_data_array(
     text: &str,
     byte_order: ByteOrder,
     header_type: HeaderType,
-    compressed: bool,
+    compressor: XmlCompressor,
     extracted: &ExtractedAppended<'_>,
 ) -> Result<DataArray> {
     let data = match format {
         ArrayFormat::Ascii => decode_ascii_values(text, dt)?,
         ArrayFormat::Binary => {
             let decoded = decode_vtk_base64_stream(text)?;
-            let raw = decode_vtk_binary_block(&decoded, byte_order, header_type, compressed)?;
+            let raw = decode_vtk_binary_block(&decoded, byte_order, header_type, compressor)?;
             bytes_to_array_data(&raw, dt, byte_order)?
         }
         ArrayFormat::Appended => match extracted.encoding {
@@ -1437,7 +1482,7 @@ fn decode_data_array(
                     &extracted.data[offset..],
                     byte_order,
                     header_type,
-                    compressed,
+                    compressor,
                 )?;
                 bytes_to_array_data(&raw, dt, byte_order)?
             }
@@ -1452,7 +1497,7 @@ fn decode_data_array(
                     &extracted.data[offset..],
                     byte_order,
                     header_type,
-                    compressed,
+                    compressor,
                 )?;
                 bytes_to_array_data(&raw, dt, byte_order)?
             }
@@ -1491,7 +1536,7 @@ fn decode_appended_base64_block(
     slice: &[u8],
     byte_order: ByteOrder,
     header_type: HeaderType,
-    compressed: bool,
+    compressor: XmlCompressor,
 ) -> Result<Vec<u8>> {
     let s = std::str::from_utf8(slice)
         .map_err(|e| IoError::Parse(format!("Invalid UTF-8 in base64 AppendedData: {e}")))?;
@@ -1507,7 +1552,7 @@ fn decode_appended_base64_block(
         .filter(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
         .collect();
 
-    if !compressed {
+    if compressor == XmlCompressor::None {
         let hdr_b64_len = word_sz.div_ceil(3) * 4;
         if b64_only.len() < hdr_b64_len {
             return Err(IoError::InvalidData(
@@ -1569,7 +1614,7 @@ fn decode_appended_base64_block(
                     BASE64.decode(&b64_only[total_hdr_b64_len..total_hdr_b64_len + pay_b64_len])?;
                 combined.extend_from_slice(&pay[..comp_total.min(pay.len())]);
             }
-            decode_vtk_binary_block(&combined, byte_order, header_type, true)
+            decode_vtk_binary_block(&combined, byte_order, header_type, compressor)
         } else {
             let total_b64_len = (total_hdr_bytes + comp_total).div_ceil(3) * 4;
             if total_b64_len > b64_only.len() {
@@ -1578,7 +1623,7 @@ fn decode_appended_base64_block(
                 ));
             }
             let combined = BASE64.decode(&b64_only[..total_b64_len])?;
-            decode_vtk_binary_block(&combined, byte_order, header_type, true)
+            decode_vtk_binary_block(&combined, byte_order, header_type, compressor)
         }
     }
 }
@@ -1587,7 +1632,7 @@ fn decode_vtk_binary_block(
     bytes: &[u8],
     byte_order: ByteOrder,
     header_type: HeaderType,
-    compressed: bool,
+    compressor: XmlCompressor,
 ) -> Result<Vec<u8>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -1596,7 +1641,7 @@ fn decode_vtk_binary_block(
         HeaderType::UInt32 => 4,
         HeaderType::UInt64 => 8,
     };
-    if !compressed {
+    if compressor == XmlCompressor::None {
         if bytes.len() < word_sz {
             return Err(IoError::InvalidData("VTK binary block missing header".into()));
         }
@@ -1616,8 +1661,8 @@ fn decode_vtk_binary_block(
             ));
         }
         let num_blocks = read_header_word(bytes, 0, byte_order, header_type)?;
-        let _block_size = read_header_word(bytes, word_sz, byte_order, header_type)?;
-        let _last_block_size = read_header_word(bytes, 2 * word_sz, byte_order, header_type)?;
+        let block_size = read_header_word(bytes, word_sz, byte_order, header_type)?;
+        let last_block_size = read_header_word(bytes, 2 * word_sz, byte_order, header_type)?;
         let header_end = (3 + num_blocks) * word_sz;
         if bytes.len() < header_end {
             return Err(IoError::InvalidData(
@@ -1630,11 +1675,41 @@ fn decode_vtk_binary_block(
             let c_len = read_header_word(bytes, (3 + b) * word_sz, byte_order, header_type)?;
             if cursor + c_len > bytes.len() {
                 return Err(IoError::InvalidData(
-                    "VTK zlib compressed block truncated".into(),
+                    "VTK compressed block truncated".into(),
                 ));
             }
-            let mut decoder = ZlibDecoder::new(&bytes[cursor..cursor + c_len]);
-            decoder.read_to_end(&mut out)?;
+            let block_slice = &bytes[cursor..cursor + c_len];
+            let expected_uncompressed = if b + 1 == num_blocks {
+                last_block_size
+            } else {
+                block_size
+            };
+            match compressor {
+                XmlCompressor::Zlib => {
+                    let mut decoder = ZlibDecoder::new(block_slice);
+                    decoder.read_to_end(&mut out)?;
+                }
+                XmlCompressor::Lz4 => {
+                    let decompressed =
+                        lz4_flex::block::decompress(block_slice, expected_uncompressed).map_err(
+                            |e| IoError::InvalidData(format!("VTK LZ4 decompress error: {e}")),
+                        )?;
+                    out.extend_from_slice(&decompressed);
+                }
+                XmlCompressor::Lzma => {
+                    let mut cur = std::io::Cursor::new(block_slice);
+                    // VTK LZMA uses xz container format; fallback to raw lzma if needed
+                    let start_len = out.len();
+                    if lzma_rs::xz_decompress(&mut cur, &mut out).is_err() {
+                        out.truncate(start_len);
+                        let mut cur2 = std::io::Cursor::new(block_slice);
+                        lzma_rs::lzma_decompress(&mut cur2, &mut out).map_err(|e| {
+                            IoError::InvalidData(format!("VTK LZMA decompress error: {e}"))
+                        })?;
+                    }
+                }
+                XmlCompressor::None => unreachable!(),
+            }
             cursor += c_len;
         }
         Ok(out)
@@ -2342,7 +2417,22 @@ fn encode_vtk_binary_block(raw: &[u8], compressed: bool) -> Result<Vec<u8>> {
 
 fn array_data_to_le_bytes(data: &ArrayData) -> Vec<u8> {
     match data {
+        ArrayData::I8(v) => v.iter().map(|&x| x as u8).collect(),
         ArrayData::U8(v) => v.clone(),
+        ArrayData::I16(v) => {
+            let mut out = Vec::with_capacity(v.len() * 2);
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        }
+        ArrayData::U16(v) => {
+            let mut out = Vec::with_capacity(v.len() * 2);
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        }
         ArrayData::I32(v) => {
             let mut out = Vec::with_capacity(v.len() * 4);
             for &x in v {
@@ -2358,6 +2448,13 @@ fn array_data_to_le_bytes(data: &ArrayData) -> Vec<u8> {
             out
         }
         ArrayData::I64(v) => {
+            let mut out = Vec::with_capacity(v.len() * 8);
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        }
+        ArrayData::U64(v) => {
             let mut out = Vec::with_capacity(v.len() * 8);
             for &x in v {
                 out.extend_from_slice(&x.to_le_bytes());
@@ -2383,10 +2480,14 @@ fn array_data_to_le_bytes(data: &ArrayData) -> Vec<u8> {
 
 fn write_ascii_array(w: &mut impl Write, arr: &DataArray) -> Result<()> {
     match &arr.data {
+        ArrayData::I8(v) => write_joined(w, v),
         ArrayData::U8(v) => write_joined(w, v),
+        ArrayData::I16(v) => write_joined(w, v),
+        ArrayData::U16(v) => write_joined(w, v),
         ArrayData::I32(v) => write_joined(w, v),
         ArrayData::U32(v) => write_joined(w, v),
         ArrayData::I64(v) => write_joined(w, v),
+        ArrayData::U64(v) => write_joined(w, v),
         ArrayData::F32(v) => write_joined(w, v),
         ArrayData::F64(v) => write_joined(w, v),
     }

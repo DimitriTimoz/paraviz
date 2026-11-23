@@ -8,5 +8,6 @@ description = "Core VTK-inspired scientific data model, colormaps, transfer func
 [dependencies]
 glam.workspace = true
 rayon.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 thiserror.workspace = true

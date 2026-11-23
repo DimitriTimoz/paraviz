@@ -493,3 +493,157 @@ fn gpu_compute_marching_cubes_watertight_sphere() {
         "expected watertight closed 2-manifold with every edge having degree 2"
     );
 }
+
+#[test]
+fn edl_with_4x_msaa_renders_cleanly_and_differs_from_1x() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let sphere = Arc::new(DataSet::PolyData(make_uv_sphere_polydata(1.0, 24, 36)));
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = true;
+    let mut actor = SceneActor::new(100, "sphere", sphere);
+    actor.style.color_by = ColorBy::Solid([0.75, 0.78, 0.85, 1.0]);
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::Isometric, &scene.bounds());
+
+    scene.settings.edl_enabled = true;
+    scene.settings.edl_strength = 2.0;
+    scene.settings.msaa_samples = 1;
+    let rgba_edl_1x = renderer.render_to_rgba(&scene, 160, 160).expect("EDL 1x");
+
+    scene.settings.msaa_samples = 4;
+    let rgba_edl_4x = renderer.render_to_rgba(&scene, 160, 160).expect("EDL 4x MSAA");
+
+    scene.settings.edl_enabled = false;
+    let rgba_no_edl_4x = renderer.render_to_rgba(&scene, 160, 160).expect("no-EDL 4x MSAA");
+
+    assert_ne!(rgba_edl_1x, rgba_edl_4x, "4x MSAA + EDL should anti-alias edges compared to 1x EDL");
+    assert_ne!(rgba_edl_4x, rgba_no_edl_4x, "EDL should still shade under 4x MSAA");
+}
+
+#[test]
+fn wide_lines_render_thicker_than_1px() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let dataset = Arc::new(make_box_polydata());
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = false;
+    scene.settings.bg_top = [0.0, 0.0, 0.0];
+    scene.settings.bg_bottom = [0.0, 0.0, 0.0];
+    let mut actor = SceneActor::new(101, "wire_box", dataset);
+    actor.style.representation = Representation::Wireframe;
+    actor.style.color_by = ColorBy::Solid([1.0, 1.0, 1.0, 1.0]);
+    actor.style.line_width = 1.0;
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::Isometric, &scene.bounds());
+
+    let count_lit = |rgba: &[u8]| -> usize {
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[0] > 30 || px[1] > 30 || px[2] > 30)
+            .count()
+    };
+
+    let rgba_1px = renderer.render_to_rgba(&scene, 160, 160).expect("1px wireframe");
+    let lit_1px = count_lit(&rgba_1px);
+
+    scene.actors[0].style.line_width = 6.0;
+    let rgba_6px = renderer.render_to_rgba(&scene, 160, 160).expect("6px wireframe");
+    let lit_6px = count_lit(&rgba_6px);
+
+    assert!(lit_1px > 50, "1px wireframe should draw visible pixels");
+    assert!(
+        lit_6px > lit_1px * 2,
+        "6px wide lines ({lit_6px} px) should cover >2x pixels of 1px lines ({lit_1px} px)"
+    );
+}
+
+#[test]
+fn indexed_surface_scalar_recolor_and_dynamic_overlays() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let mut poly = make_uv_sphere_polydata(1.0, 20, 32);
+    let x_vals: Vec<f32> = poly.points.iter().map(|p| p[0]).collect();
+    poly.point_data
+        .add_array(DataArray::scalars_f32("x_coord", x_vals));
+    let ds = Arc::new(DataSet::PolyData(poly));
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_bounding_box = true;
+    let mut actor = SceneActor::new(102, "recolor_sphere", ds);
+    actor.style.representation = Representation::Surface;
+    actor.style.color_by = ColorBy::PointScalar {
+        array: "height".into(),
+        component: None,
+    };
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::Isometric, &scene.bounds());
+
+    // Frame 1: height scalar + bbox
+    let rgba_height = renderer.render_to_rgba(&scene, 128, 128).expect("height frame");
+
+    // Frame 2: recolor via split scalar buffer without rebuilding position/normal/index buffers + add widgets
+    scene.actors[0].style.color_by = ColorBy::PointScalar {
+        array: "x_coord".into(),
+        component: None,
+    };
+    scene.widgets = vec![ViewportWidget::Box {
+        min: [-1.1, -1.1, -1.1],
+        max: [1.1, 1.1, 1.1],
+    }];
+    let rgba_x = renderer.render_to_rgba(&scene, 128, 128).expect("x_coord frame");
+    assert_ne!(rgba_height, rgba_x);
+
+    // Frame 3: solid color + larger widget buffer (triggers DynamicVertexBuffer growth)
+    scene.actors[0].style.color_by = ColorBy::Solid([0.8, 0.2, 0.2, 1.0]);
+    scene.widgets.push(ViewportWidget::Sphere {
+        center: [0.0, 0.0, 0.0],
+        radius: 1.2,
+    });
+    let rgba_solid = renderer.render_to_rgba(&scene, 128, 128).expect("solid frame");
+    assert_ne!(rgba_x, rgba_solid);
+}
+
+#[test]
+fn unstructured_prep_compute_cache_and_parallel_picking() {
+    // 1. UnstructuredGrid surface extraction (two adjacent hex cells share interior face -> 10 boundary quads)
+    let mut ug = paraviz_core::UnstructuredGrid::new();
+    ug.points = vec![
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0],
+        [2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [2.0, 0.0, 1.0], [2.0, 1.0, 1.0],
+    ];
+    ug.push_cell(paraviz_core::CellType::Hexahedron, &[0, 1, 2, 3, 4, 5, 6, 7]);
+    ug.push_cell(paraviz_core::CellType::Hexahedron, &[1, 8, 9, 2, 5, 10, 11, 6]);
+    let ug_ds = Arc::new(DataSet::UnstructuredGrid(ug));
+    let indexed = paraviz_render::mesh_prep::prepare_surface_indexed(&ug_ds, &ColorBy::default());
+    // 10 outer quad faces * 6 indices = 60 indices, 10 * 4 = 40 vertices
+    assert_eq!(indexed.indices.len(), 60);
+    assert_eq!(indexed.geom_vertices.len(), 40);
+
+    // 2. Repeated GPU Marching Cubes calls at multiple isovalues (exercises cached scalar volume buffer)
+    let engine = GpuContourEngine::new_headless().expect("compute init");
+    let ds = make_sphere_imagedata(20);
+    let img = ds.as_image_data().unwrap();
+    let p1 = engine.contour_imagedata(img, "density", 0.3).expect("iso 0.3");
+    let p2 = engine.contour_imagedata(img, "density", 0.5).expect("iso 0.5");
+    assert!(!p1.polys.is_empty());
+    assert!(!p2.polys.is_empty());
+    assert!(p1.points.len() > p2.points.len(), "smaller isovalue should yield larger sphere");
+
+    // 3. High-triangle (>2000 tris) PolyData Rayon parallel picking + cached UnstructuredGrid picking
+    let hi_sphere = Arc::new(DataSet::PolyData(make_uv_sphere_polydata(1.0, 40, 60)));
+    let mut scene = RenderScene::new();
+    scene.add_actor(SceneActor::new(201, "hi_sphere", hi_sphere));
+    scene.camera.apply_preset(CameraPreset::PosZ, &scene.bounds());
+    let hit = pick_scene(&scene, 100.0, 100.0, 200, 200).expect("hit high-poly sphere");
+    assert_eq!(hit.actor_id, 201);
+    assert!((Vec3::from_array(hit.world_pos).length() - 1.0).abs() < 0.03);
+
+    let mut ug_scene = RenderScene::new();
+    ug_scene.add_actor(SceneActor::new(202, "ug_box", ug_ds));
+    ug_scene.camera.apply_preset(CameraPreset::Isometric, &ug_scene.bounds());
+    let ug_hit1 = pick_scene(&ug_scene, 100.0, 100.0, 200, 200).expect("first ug pick");
+    let ug_hit2 = pick_scene(&ug_scene, 100.0, 100.0, 200, 200).expect("cached ug pick");
+    assert_eq!(ug_hit1, ug_hit2);
+}

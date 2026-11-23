@@ -82,6 +82,12 @@ struct VsIn {
     @location(3) barycentric: vec3<f32>,
 };
 
+struct VsInIndexed {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) scalar: f32,
+};
+
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
@@ -99,6 +105,18 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal = (u.model * vec4<f32>(in.normal, 0.0)).xyz;
     out.scalar = in.scalar;
     out.barycentric = in.barycentric;
+    return out;
+}
+
+@vertex
+fn vs_indexed(in: VsInIndexed) -> VsOut {
+    var out: VsOut;
+    let wp = (u.model * vec4<f32>(in.position, 1.0)).xyz;
+    out.clip_pos = u.view_proj * vec4<f32>(wp, 1.0);
+    out.world_pos = wp;
+    out.normal = (u.model * vec4<f32>(in.normal, 0.0)).xyz;
+    out.scalar = in.scalar;
+    out.barycentric = vec3<f32>(1.0, 1.0, 1.0);
     return out;
 }
 
@@ -183,7 +201,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
 }
 "#;
 
-/// Wireframe and bounding-box outline line shader.
+/// Wireframe and bounding-box screen-space quad-expanded wide line shader (6 vertices per segment instance).
 pub const LINE_WGSL: &str = r#"
 struct LineUniforms {
     view_proj: mat4x4<f32>,
@@ -194,9 +212,8 @@ struct LineUniforms {
     use_colormap: u32,
     log_scale: u32,
     opacity: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    line_width: f32,
+    viewport_size: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -208,8 +225,10 @@ var lut_tex: texture_2d<f32>;
 var lut_sampler: sampler;
 
 struct VsIn {
-    @location(0) position: vec3<f32>,
-    @location(1) scalar: f32,
+    @location(0) pos_a: vec3<f32>,
+    @location(1) scalar_a: f32,
+    @location(2) pos_b: vec3<f32>,
+    @location(3) scalar_b: f32,
 };
 
 struct VsOut {
@@ -218,10 +237,71 @@ struct VsOut {
 };
 
 @vertex
-fn vs_main(in: VsIn) -> VsOut {
+fn vs_main(in: VsIn, @builtin(vertex_index) vid: u32) -> VsOut {
     var out: VsOut;
-    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
-    out.scalar = in.scalar;
+    var clip_a = u.view_proj * vec4<f32>(in.pos_a, 1.0);
+    var clip_b = u.view_proj * vec4<f32>(in.pos_b, 1.0);
+    var sa = in.scalar_a;
+    var sb = in.scalar_b;
+
+    // Guard against endpoints behind the near plane (clip.z < 0 or clip.w <= 0).
+    let eps: f32 = 1e-5;
+    if ((clip_a.w <= eps || clip_a.z < 0.0) && (clip_b.w <= eps || clip_b.z < 0.0)) {
+        out.clip_pos = vec4<f32>(0.0, 0.0, -2.0, 1.0);
+        out.scalar = sa;
+        return out;
+    }
+    if (clip_a.z < 0.0) {
+        let t = clamp(clip_a.z / (clip_a.z - clip_b.z), 0.0, 1.0);
+        clip_a = mix(clip_a, clip_b, t);
+        sa = mix(sa, sb, t);
+    } else if (clip_b.z < 0.0) {
+        let t = clamp(clip_b.z / (clip_b.z - clip_a.z), 0.0, 1.0);
+        clip_b = mix(clip_b, clip_a, t);
+        sb = mix(sb, sa, t);
+    }
+    if (clip_a.w <= eps) {
+        let t = clamp((eps - clip_a.w) / max(clip_b.w - clip_a.w, eps), 0.0, 1.0);
+        clip_a = mix(clip_a, clip_b, t);
+        sa = mix(sa, sb, t);
+    } else if (clip_b.w <= eps) {
+        let t = clamp((eps - clip_b.w) / max(clip_a.w - clip_b.w, eps), 0.0, 1.0);
+        clip_b = mix(clip_b, clip_a, t);
+        sb = mix(sb, sa, t);
+    }
+
+    let half_vp = 0.5 * max(u.viewport_size, vec2<f32>(1.0));
+    let scr_a = (clip_a.xy / clip_a.w) * half_vp;
+    let scr_b = (clip_b.xy / clip_b.w) * half_vp;
+    let delta = scr_b - scr_a;
+    let seg_len = length(delta);
+    var dir = vec2<f32>(1.0, 0.0);
+    if (seg_len > 1e-4) {
+        dir = delta / seg_len;
+    }
+    let perp = vec2<f32>(-dir.y, dir.x);
+
+    // 2 triangles forming quad: (0, -1), (1, -1), (1, 1), (0, -1), (1, 1), (0, 1)
+    var end_ts = array<f32, 6>(0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
+    var sides = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
+    let end_t = end_ts[vid];
+    let side = sides[vid];
+
+    let width_px = max(u.line_width, 1.0);
+    let half_width = width_px * 0.5;
+    let cap = select(0.0, half_width, width_px > 1.05);
+
+    let base_clip = mix(clip_a, clip_b, end_t);
+    let along = select(-cap, cap, end_t > 0.5);
+    let offset_px = dir * along + perp * (side * half_width);
+    let offset_ndc = offset_px / half_vp;
+
+    out.clip_pos = vec4<f32>(
+        base_clip.xy + offset_ndc * base_clip.w,
+        base_clip.z,
+        base_clip.w,
+    );
+    out.scalar = mix(sa, sb, end_t);
     return out;
 }
 
@@ -389,6 +469,8 @@ struct VolumeUniforms {
     log_scale: u32,
     opacity: f32,
     max_steps: u32,
+    clip_origin: vec4<f32>,
+    clip_normal: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -516,6 +598,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             break;
         }
         let pos = ro + rd * t;
+        if (u.clip_origin.w > 0.5) {
+            if (dot(pos - u.clip_origin.xyz, u.clip_normal.xyz) < 0.0) {
+                t = t + step_w;
+                continue;
+            }
+        }
         let val = sample_trilinear(pos);
         let tf = sample_tf(val);
         let raw_a = clamp(tf.a * u.opacity, 0.0, 0.999);
@@ -646,10 +734,40 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// 3D Viewport Widget overlay shader (per-vertex RGBA for crisp wireframes and translucent guides).
+/// 4x MSAA Depth Resolve shader writing minimum sample depth into a 1x Depth32Float texture for EDL.
+pub const DEPTH_RESOLVE_WGSL: &str = r#"
+@group(0) @binding(0)
+var msaa_depth: texture_depth_multisampled_2d;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    return vec4<f32>(positions[vid], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    let dims = vec2<i32>(textureDimensions(msaa_depth));
+    let px = clamp(vec2<i32>(pos.xy), vec2<i32>(0), dims - vec2<i32>(1));
+    let d0 = textureLoad(msaa_depth, px, 0);
+    let d1 = textureLoad(msaa_depth, px, 1);
+    let d2 = textureLoad(msaa_depth, px, 2);
+    let d3 = textureLoad(msaa_depth, px, 3);
+    return min(min(d0, d1), min(d2, d3));
+}
+"#;
+
+/// 3D Viewport Widget overlay shader (per-vertex RGBA for crisp quad-expanded wide wireframes and translucent guides).
 pub const WIDGET_WGSL: &str = r#"
 struct WidgetUniforms {
     view_proj: mat4x4<f32>,
+    viewport_size: vec2<f32>,
+    line_width: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0)
@@ -658,6 +776,13 @@ var<uniform> u: WidgetUniforms;
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
+};
+
+struct VsLineIn {
+    @location(0) pos_a: vec3<f32>,
+    @location(1) col_a: vec4<f32>,
+    @location(2) pos_b: vec3<f32>,
+    @location(3) col_b: vec4<f32>,
 };
 
 struct VsOut {
@@ -670,6 +795,73 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
     out.color = in.color;
+    return out;
+}
+
+@vertex
+fn vs_line(in: VsLineIn, @builtin(vertex_index) vid: u32) -> VsOut {
+    var out: VsOut;
+    var clip_a = u.view_proj * vec4<f32>(in.pos_a, 1.0);
+    var clip_b = u.view_proj * vec4<f32>(in.pos_b, 1.0);
+    var ca = in.col_a;
+    var cb = in.col_b;
+
+    let eps: f32 = 1e-5;
+    if ((clip_a.w <= eps || clip_a.z < 0.0) && (clip_b.w <= eps || clip_b.z < 0.0)) {
+        out.clip_pos = vec4<f32>(0.0, 0.0, -2.0, 1.0);
+        out.color = ca;
+        return out;
+    }
+    if (clip_a.z < 0.0) {
+        let t = clamp(clip_a.z / (clip_a.z - clip_b.z), 0.0, 1.0);
+        clip_a = mix(clip_a, clip_b, t);
+        ca = mix(ca, cb, t);
+    } else if (clip_b.z < 0.0) {
+        let t = clamp(clip_b.z / (clip_b.z - clip_a.z), 0.0, 1.0);
+        clip_b = mix(clip_b, clip_a, t);
+        cb = mix(cb, ca, t);
+    }
+    if (clip_a.w <= eps) {
+        let t = clamp((eps - clip_a.w) / max(clip_b.w - clip_a.w, eps), 0.0, 1.0);
+        clip_a = mix(clip_a, clip_b, t);
+        ca = mix(ca, cb, t);
+    } else if (clip_b.w <= eps) {
+        let t = clamp((eps - clip_b.w) / max(clip_a.w - clip_b.w, eps), 0.0, 1.0);
+        clip_b = mix(clip_b, clip_a, t);
+        cb = mix(cb, ca, t);
+    }
+
+    let half_vp = 0.5 * max(u.viewport_size, vec2<f32>(1.0));
+    let scr_a = (clip_a.xy / clip_a.w) * half_vp;
+    let scr_b = (clip_b.xy / clip_b.w) * half_vp;
+    let delta = scr_b - scr_a;
+    let seg_len = length(delta);
+    var dir = vec2<f32>(1.0, 0.0);
+    if (seg_len > 1e-4) {
+        dir = delta / seg_len;
+    }
+    let perp = vec2<f32>(-dir.y, dir.x);
+
+    var end_ts = array<f32, 6>(0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
+    var sides = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
+    let end_t = end_ts[vid];
+    let side = sides[vid];
+
+    let width_px = max(u.line_width, 1.0);
+    let half_width = width_px * 0.5;
+    let cap = select(0.0, half_width, width_px > 1.05);
+
+    let base_clip = mix(clip_a, clip_b, end_t);
+    let along = select(-cap, cap, end_t > 0.5);
+    let offset_px = dir * along + perp * (side * half_width);
+    let offset_ndc = offset_px / half_vp;
+
+    out.clip_pos = vec4<f32>(
+        base_clip.xy + offset_ndc * base_clip.w,
+        base_clip.z,
+        base_clip.w,
+    );
+    out.color = mix(ca, cb, end_t);
     return out;
 }
 

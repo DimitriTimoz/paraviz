@@ -10,14 +10,24 @@
 //!   `GyroidSource`, `PointCloudSource`).
 //! - [`filters`] (`paraviz-filters`): Parallel (`rayon`) scientific visualization filters
 //!   (`ExtractSurface`, `ContourFilter`, `SliceFilter`, `ClipFilter`, `ThresholdFilter`,
-//!   `StreamTracerFilter`, `TubeFilter`, `GlyphFilter`, `WarpByVectorFilter`,
-//!   `WarpByScalarFilter`, `GradientFilter`, `CalculatorFilter`, `SmoothFilter`,
-//!   `TransformFilter`, `ProbeOverLineFilter`).
+//!   `IsoVolumeFilter`, `StreamTracerFilter`, `TubeFilter`, `GlyphFilter`, `WarpByVectorFilter`,
+//!   `WarpByScalarFilter`, `GradientFilter`, `CalculatorFilter`, `SmoothFilter`, `DecimateFilter`,
+//!   `Delaunay2DFilter`, `Delaunay3DFilter`, `ResampleToImageFilter`, `ResampleWithDatasetFilter`,
+//!   `IntegrateVariablesFilter`, `ExtractBlockFilter`, `TemporalStatisticsFilter`,
+//!   `TransformFilter`, `ProbeOverLineFilter`, `FeatureEdgesFilter`, `ConnectivityFilter`,
+//!   `ShrinkFilter`, `CellCentersFilter`, `ReflectFilter`, `GenerateNormalsFilter`,
+//!   `ElevationFilter`, `TriangulateFilter`, `ExtractEdgesFilter`, `CleanPolyDataFilter`,
+//!   `AppendDatasetsFilter`).
 //! - [`io`] (`paraviz-io`): Legacy VTK (`.vtk`), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`,
-//!   `.vtm`, `.pvd`), `.stl`, `.obj`, `.ply`, and `.csv` readers/writers.
-//! - [`render`] (`paraviz-render`): WebGPU (`wgpu`) rendering engine supporting Surface,
-//!   single-pass barycentric SurfaceWithEdges, Wireframe, Points (sphere impostors),
-//!   3D Volume raymarching, Outline, and 3D Orientation Axes Gizmo.
+//!   `.vtm`, `.pvd`, `.pvtp`, `.pvti`, `.pvtu`, `.pvtr`, `.pvts`), `.stl`, `.obj`, `.ply`, `.csv`/`.tsv`,
+//!   binary glTF 2.0 (`.glb`), raw 3D volumes (`.raw`), NIfTI-1 (`.nii`, `.nii.gz`),
+//!   NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), EnSight Gold (`.case`), XDMF (`.xdmf`),
+//!   and OpenFOAM `polyMesh` readers/writers.
+//! - [`render`] (`paraviz-render`): WebGPU (`wgpu`) rendering engine supporting `Surface`,
+//!   single-pass barycentric `SurfaceWithEdges`, `Wireframe`, `Points` (sphere impostors),
+//!   `PointGaussian`, 3D `Volume` raymarching (`R32Float` + IGN jittering), `Outline`,
+//!   4x MSAA, Eye-Dome Lighting (`EDL`), 3D raycast picking (`pick_scene`), GPU Compute Marching
+//!   Cubes (`GpuContourEngine`), 3D `ViewportWidget` overlays, and 3D Orientation Axes Gizmo.
 //! - [`session`] (`ParaViz`): Ergonomic high-level Rust API for building pipelines, styling
 //!   actors, saving/loading state, generating Rust traces, and headless PNG/RGBA rendering.
 //!
@@ -58,25 +68,30 @@ pub use session::{
 pub mod prelude {
     pub use crate::core::{
         AttributeAssociation, BoundingBox, CellType, ColorMap, ColorMapPreset, DataArray, DataSet,
-        FieldData, Filter, ImageData, MultiBlockDataSet, NodeId, OpacityPoint, PipelineGraph,
+        FieldData, Filter, ImageData, MultiBlockDataSet, MultiInputFilter, NodeId, OpacityPoint, PipelineGraph,
         PolyData, RectilinearGrid, Source, StructuredGrid, TransferFunction, UnstructuredGrid,
     };
     pub use crate::demos::DemoPreset;
     pub use crate::filters::{
-        append_datasets, compute_histogram, AppendDatasetsFilter, CalculatorFilter,
-        CellCentersFilter, CellDataToPointDataFilter, CleanPolyDataFilter, ClipFilter,
-        ConnectivityFilter, ContourFilter, ElevationFilter, ExtractEdgesFilter, ExtractSurface,
-        FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter, GlyphShape, GradientFilter,
-        HistogramResult, ImplicitFunction, IntegrationDirection, Integrator,
-        PointDataToCellDataFilter, ProbeOverLineFilter, ReflectFilter, ReflectPlane, ScaleMode,
-        SeedSource, ShrinkFilter, SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter,
-        ThresholdFilter, TransformFilter, TriangulateFilter, TubeFilter, WarpByScalarFilter,
-        WarpByVectorFilter,
+        append_datasets, compute_histogram, interpolate_datasets, AddTimeStepsFilter,
+        AppendDatasetsFilter, CalculatorFilter, CellCentersFilter, CellDataToPointDataFilter,
+        CleanPolyDataFilter, ClipFilter, ConnectivityFilter, ContourFilter, DecimateFilter,
+        Delaunay2DFilter, Delaunay3DFilter, ElevationFilter, ExtractBlockFilter,
+        ExtractEdgesFilter, ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter,
+        GlyphShape, GradientFilter, HistogramResult, ImplicitFunction, IntegrateVariablesFilter,
+        IntegrationDirection, Integrator, IsoVolumeFilter, PointDataToCellDataFilter,
+        ProbeOverLineFilter, ReflectFilter, ReflectPlane, ResampleToImageFilter,
+        ResampleWithDatasetFilter, ScaleMode, SeedSource, ShrinkFilter, SliceFilter, SmoothFilter,
+        SmoothingMethod, StreamTracerFilter, StreamTracerWithCustomSource,
+        TemporalStatisticsFilter, ThresholdFilter, TransformFilter, TriangulateFilter, TubeFilter,
+        WarpByScalarFilter, WarpByVectorFilter,
     };
     pub use crate::io::{
-        read_dataset, read_pvd_series, read_raw_volume, write_dataset, write_glb,
-        write_pvd_series, PvdSeriesSource, RawEndian, RawScalarType, RawVolumeDescriptor,
-        VtkFileSource,
+        encode_animated_gif_bytes, encode_html_viewer, read_dataset, read_ensight_case,
+        read_metaimage, read_nifti, read_nrrd, read_openfoam, read_pvd_series, read_raw_volume,
+        read_xdmf, write_animated_gif, write_dataset, write_glb, write_html_viewer,
+        write_metaimage, write_nifti, write_pvd_series, PvdSeriesSource, RawEndian, RawScalarType,
+        RawVolumeDescriptor, VtkFileSource,
     };
     pub use crate::render::{
         pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,

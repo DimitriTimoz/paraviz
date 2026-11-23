@@ -1316,10 +1316,14 @@ fn write_array_data(w: &mut impl Write, arr: &DataArray, format: VtkLegacyFormat
             match &arr.data {
                 ArrayData::F32(v) => write_ascii_vals(w, v, nc)?,
                 ArrayData::F64(v) => write_ascii_vals(w, v, nc)?,
+                ArrayData::I8(v) => write_ascii_vals(w, v, nc)?,
+                ArrayData::I16(v) => write_ascii_vals(w, v, nc)?,
                 ArrayData::I32(v) => write_ascii_vals(w, v, nc)?,
-                ArrayData::U32(v) => write_ascii_vals(w, v, nc)?,
                 ArrayData::I64(v) => write_ascii_vals(w, v, nc)?,
                 ArrayData::U8(v) => write_ascii_vals(w, v, nc)?,
+                ArrayData::U16(v) => write_ascii_vals(w, v, nc)?,
+                ArrayData::U32(v) => write_ascii_vals(w, v, nc)?,
+                ArrayData::U64(v) => write_ascii_vals(w, v, nc)?,
             }
             writeln!(w)?;
         }
@@ -1335,12 +1339,17 @@ fn write_array_data(w: &mut impl Write, arr: &DataArray, format: VtkLegacyFormat
                         w.write_all(&x.to_be_bytes())?;
                     }
                 }
-                ArrayData::I32(v) => {
+                ArrayData::I8(v) => {
                     for &x in v {
                         w.write_all(&x.to_be_bytes())?;
                     }
                 }
-                ArrayData::U32(v) => {
+                ArrayData::I16(v) => {
+                    for &x in v {
+                        w.write_all(&x.to_be_bytes())?;
+                    }
+                }
+                ArrayData::I32(v) => {
                     for &x in v {
                         w.write_all(&x.to_be_bytes())?;
                     }
@@ -1352,6 +1361,21 @@ fn write_array_data(w: &mut impl Write, arr: &DataArray, format: VtkLegacyFormat
                 }
                 ArrayData::U8(v) => {
                     w.write_all(v)?;
+                }
+                ArrayData::U16(v) => {
+                    for &x in v {
+                        w.write_all(&x.to_be_bytes())?;
+                    }
+                }
+                ArrayData::U32(v) => {
+                    for &x in v {
+                        w.write_all(&x.to_be_bytes())?;
+                    }
+                }
+                ArrayData::U64(v) => {
+                    for &x in v {
+                        w.write_all(&x.to_be_bytes())?;
+                    }
                 }
             }
             writeln!(w)?;

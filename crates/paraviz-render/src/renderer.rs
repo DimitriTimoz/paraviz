@@ -3,7 +3,8 @@
 //! and multi-representation scientific visualization pipelines.
 
 use crate::mesh_prep::{
-    self, GizmoVertex, LineVertex, PointInstance, SurfaceVertex, WidgetVertex,
+    self, GizmoVertex, LineVertex, PointInstance, SurfaceGeomVertex, SurfaceScalarSource,
+    SurfaceVertex, WidgetVertex,
 };
 use crate::scene::{ActorStyle, ColorBy, RenderScene, Representation, SceneActor};
 use crate::shaders;
@@ -90,7 +91,8 @@ struct LineUniforms {
     use_colormap: u32,
     log_scale: u32,
     opacity: f32,
-    _pad: [f32; 3],
+    line_width: f32,
+    viewport_size: [f32; 2],
 }
 
 #[repr(C)]
@@ -129,6 +131,8 @@ struct VolumeUniforms {
     log_scale: u32,
     opacity: f32,
     max_steps: u32,
+    clip_origin: [f32; 4],
+    clip_normal: [f32; 4],
 }
 
 #[repr(C)]
@@ -148,6 +152,9 @@ struct EdlUniforms {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct WidgetUniforms {
     view_proj: [[f32; 4]; 4],
+    viewport_size: [f32; 2],
+    line_width: f32,
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -171,14 +178,77 @@ struct CubeVertex {
 
 struct PipelineBundle {
     bg_pipeline: wgpu::RenderPipeline,
-    surface_opaque_pipeline: wgpu::RenderPipeline,
-    surface_alpha_pipeline: wgpu::RenderPipeline,
+    surface_indexed_opaque_pipeline: wgpu::RenderPipeline,
+    surface_indexed_alpha_pipeline: wgpu::RenderPipeline,
+    surface_edges_opaque_pipeline: wgpu::RenderPipeline,
+    surface_edges_alpha_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     volume_pipeline: wgpu::RenderPipeline,
     widget_tri_pipeline: wgpu::RenderPipeline,
     widget_line_pipeline: wgpu::RenderPipeline,
     gizmo_pipeline: wgpu::RenderPipeline,
+}
+
+struct DynamicVertexBuffer {
+    buffer: wgpu::Buffer,
+    capacity_bytes: u64,
+    used_bytes: u64,
+    label: &'static str,
+}
+
+impl DynamicVertexBuffer {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, label: &'static str, initial_bytes: u64, data: &[u8]) -> Self {
+        let capacity_bytes = initial_bytes.max(data.len() as u64).max(1024).next_power_of_two();
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: capacity_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !data.is_empty() {
+            queue.write_buffer(&buffer, 0, data);
+        }
+        Self {
+            buffer,
+            capacity_bytes,
+            used_bytes: data.len() as u64,
+            label,
+        }
+    }
+
+    fn upload<T: Pod>(
+        slot: &mut Option<Self>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &'static str,
+        items: &[T],
+    ) {
+        let bytes: &[u8] = bytemuck::cast_slice(items);
+        let needed = bytes.len() as u64;
+        if needed == 0 {
+            if let Some(buf) = slot.as_mut() {
+                buf.used_bytes = 0;
+            }
+            return;
+        }
+        match slot.as_mut() {
+            Some(buf) if buf.capacity_bytes >= needed => {
+                queue.write_buffer(&buf.buffer, 0, bytes);
+                buf.used_bytes = needed;
+            }
+            Some(buf) => {
+                *buf = Self::new(device, queue, buf.label, needed, bytes);
+            }
+            None => {
+                *slot = Some(Self::new(device, queue, label, needed, bytes));
+            }
+        }
+    }
+
+    fn slice_used(&self) -> wgpu::BufferSlice<'_> {
+        self.buffer.slice(..self.used_bytes)
+    }
 }
 
 struct RenderTargets {
@@ -201,6 +271,7 @@ struct MsaaTargets {
     #[allow(dead_code)]
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    depth_resolve_bg: wgpu::BindGroup,
 }
 
 struct EdlTargets {
@@ -217,7 +288,16 @@ struct EdlTargets {
 }
 
 enum CachedGeometry {
-    Surface {
+    SurfaceIndexed {
+        geom_buffer: wgpu::Buffer,
+        scalar_buffer: wgpu::Buffer,
+        index_buffer: wgpu::Buffer,
+        vertex_count: u32,
+        index_count: u32,
+        scalar_source: SurfaceScalarSource,
+        auto_range: (f64, f64),
+    },
+    SurfaceEdges {
         buffer: wgpu::Buffer,
         vertex_count: u32,
         auto_range: (f64, f64),
@@ -266,6 +346,8 @@ pub struct WebGpuRenderer {
     target_format: wgpu::TextureFormat,
     pipelines: HashMap<(wgpu::TextureFormat, u32), PipelineBundle>,
     edl_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    depth_resolve_bgl: wgpu::BindGroupLayout,
+    depth_resolve_pipeline: wgpu::RenderPipeline,
     offscreen_targets: Option<RenderTargets>,
     external_depth: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     msaa_targets: Option<MsaaTargets>,
@@ -292,16 +374,16 @@ pub struct WebGpuRenderer {
     gizmo_bind_group: wgpu::BindGroup,
 
     // Bounding-box overlay cache
-    bbox_vb: Option<wgpu::Buffer>,
+    bbox_vb: Option<DynamicVertexBuffer>,
     bbox_vertex_count: u32,
     bbox_uniform_buf: wgpu::Buffer,
     bbox_bind_group: wgpu::BindGroup,
     bbox_lut_bind_group: wgpu::BindGroup,
 
     // 3D Viewport Widget overlay buffers
-    widget_tri_vb: Option<wgpu::Buffer>,
+    widget_tri_vb: Option<DynamicVertexBuffer>,
     widget_tri_count: u32,
-    widget_line_vb: Option<wgpu::Buffer>,
+    widget_line_vb: Option<DynamicVertexBuffer>,
     widget_line_count: u32,
     widget_uniform_buf: wgpu::Buffer,
     widget_bind_group: wgpu::BindGroup,
@@ -438,6 +520,21 @@ impl WebGpuRenderer {
             ],
         });
 
+        let depth_resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paraviz-depth-resolve-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let depth_resolve_pipeline = create_depth_resolve_pipeline(&device, &depth_resolve_bgl);
+
         let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("paraviz-lut-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -573,7 +670,8 @@ impl WebGpuRenderer {
                 use_colormap: 0,
                 log_scale: 0,
                 opacity: 1.0,
-                _pad: [0.0; 3],
+                line_width: 1.5,
+                viewport_size: [1.0, 1.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -612,6 +710,9 @@ impl WebGpuRenderer {
             label: Some("paraviz-widget-uniform"),
             contents: bytemuck::bytes_of(&WidgetUniforms {
                 view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                viewport_size: [1.0, 1.0],
+                line_width: 2.0,
+                _pad: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -630,6 +731,8 @@ impl WebGpuRenderer {
             target_format,
             pipelines,
             edl_pipelines: HashMap::new(),
+            depth_resolve_bgl,
+            depth_resolve_pipeline,
             offscreen_targets: None,
             external_depth: None,
             msaa_targets: None,
@@ -826,6 +929,9 @@ impl WebGpuRenderer {
         }
         drop(mapped);
         staging.unmap();
+        if scene.settings.show_scalar_bar {
+            crate::legend::composite_scalar_bar(scene, &mut rgba, width, height);
+        }
         Ok(rgba)
     }
 
@@ -878,7 +984,13 @@ impl WebGpuRenderer {
             None => true,
         };
         if need {
-            self.msaa_targets = Some(create_msaa_targets(&self.device, width, height, format));
+            self.msaa_targets = Some(create_msaa_targets(
+                &self.device,
+                width,
+                height,
+                format,
+                &self.depth_resolve_bgl,
+            ));
         }
     }
 
@@ -976,19 +1088,38 @@ impl WebGpuRenderer {
             );
         }
 
-        // Optional global bounding box overlay.
-        if scene.settings.show_bounding_box {
+        // Optional global bounding box / Cube Axes Grid overlay (reusing persistent dynamic GPU buffer).
+        if scene.settings.show_bounding_box || scene.settings.show_axes_grid {
             let bb = scene.bounds();
-            let line_verts = mesh_prep::prepare_outline(&bb);
+            let mut line_verts = mesh_prep::prepare_outline(&bb);
+            if scene.settings.show_axes_grid && bb.is_valid() {
+                let tick_len = (bb.diagonal() * 0.025).max(1e-4);
+                let n_ticks = 5usize;
+                for i in 0..=n_ticks {
+                    let frac = i as f32 / n_ticks as f32;
+                    // X-axis ticks along bottom-front edge
+                    let x = bb.min.x + (bb.max.x - bb.min.x) * frac;
+                    line_verts.push(mesh_prep::LineVertex { position: [x, bb.min.y, bb.min.z], scalar: 0.0 });
+                    line_verts.push(mesh_prep::LineVertex { position: [x, bb.min.y - tick_len, bb.min.z], scalar: 0.0 });
+                    // Y-axis ticks along left-front edge
+                    let y = bb.min.y + (bb.max.y - bb.min.y) * frac;
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x, y, bb.min.z], scalar: 0.0 });
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x - tick_len, y, bb.min.z], scalar: 0.0 });
+                    // Z-axis ticks along bottom-left edge
+                    let z = bb.min.z + (bb.max.z - bb.min.z) * frac;
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x, bb.min.y, z], scalar: 0.0 });
+                    line_verts.push(mesh_prep::LineVertex { position: [bb.min.x - tick_len, bb.min.y, z], scalar: 0.0 });
+                }
+            }
             self.bbox_vertex_count = line_verts.len() as u32;
             if !line_verts.is_empty() {
-                self.bbox_vb = Some(self.device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("paraviz-scene-bbox-vb"),
-                        contents: bytemuck::cast_slice(&line_verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    },
-                ));
+                DynamicVertexBuffer::upload(
+                    &mut self.bbox_vb,
+                    &self.device,
+                    &self.queue,
+                    "paraviz-scene-bbox-vb",
+                    &line_verts,
+                );
                 self.queue.write_buffer(
                     &self.bbox_uniform_buf,
                     0,
@@ -1001,40 +1132,51 @@ impl WebGpuRenderer {
                         use_colormap: 0,
                         log_scale: 0,
                         opacity: 0.9,
-                        _pad: [0.0; 3],
+                        line_width: 1.5,
+                        viewport_size: [width as f32, height as f32],
                     }),
                 );
             }
+        } else {
+            self.bbox_vertex_count = 0;
         }
 
-        // Prepare 3D interactive viewport widget overlays.
-        if !scene.widgets.is_empty() {
-            let prep = mesh_prep::prepare_widgets(&scene.widgets);
+        // Prepare 3D interactive viewport widget overlays + optional selection highlight crosshair.
+        let mut all_widgets = scene.widgets.clone();
+        if let Some(pos) = scene.selection_highlight {
+            let r = (scene.bounds().diagonal() * 0.025).max(0.05);
+            all_widgets.push(crate::scene::ViewportWidget::Sphere { center: pos, radius: r });
+        }
+        if !all_widgets.is_empty() {
+            let prep = mesh_prep::prepare_widgets(&all_widgets);
             self.widget_tri_count = prep.triangles.len() as u32;
             self.widget_line_count = prep.lines.len() as u32;
             if !prep.triangles.is_empty() {
-                self.widget_tri_vb = Some(self.device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("paraviz-widget-tri-vb"),
-                        contents: bytemuck::cast_slice(&prep.triangles),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    },
-                ));
+                DynamicVertexBuffer::upload(
+                    &mut self.widget_tri_vb,
+                    &self.device,
+                    &self.queue,
+                    "paraviz-widget-tri-vb",
+                    &prep.triangles,
+                );
             }
             if !prep.lines.is_empty() {
-                self.widget_line_vb = Some(self.device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("paraviz-widget-line-vb"),
-                        contents: bytemuck::cast_slice(&prep.lines),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    },
-                ));
+                DynamicVertexBuffer::upload(
+                    &mut self.widget_line_vb,
+                    &self.device,
+                    &self.queue,
+                    "paraviz-widget-line-vb",
+                    &prep.lines,
+                );
             }
             self.queue.write_buffer(
                 &self.widget_uniform_buf,
                 0,
                 bytemuck::bytes_of(&WidgetUniforms {
                     view_proj: view_proj.to_cols_array_2d(),
+                    viewport_size: [width as f32, height as f32],
+                    line_width: 2.0,
+                    _pad: 0.0,
                 }),
             );
         } else {
@@ -1060,12 +1202,14 @@ impl WebGpuRenderer {
             );
         }
 
-        // Determine sample count & render path (EDL vs 4x MSAA vs 1x direct).
-        let clamped_msaa = clamp_msaa_samples(scene.settings.msaa_samples);
+        // Determine sample count & render path (supports EDL + 4x MSAA simultaneously).
+        let effective_samples = clamp_msaa_samples(scene.settings.msaa_samples);
         let edl_enabled = scene.settings.edl_enabled;
-        let effective_samples = if edl_enabled { 1 } else { clamped_msaa };
 
         self.ensure_pipeline_bundle(format, effective_samples);
+        if edl_enabled && effective_samples == 4 && draw_gizmo {
+            self.ensure_pipeline_bundle(format, 1);
+        }
         if edl_enabled {
             self.ensure_edl_pipeline(format);
             self.ensure_edl_targets(width, height, format);
@@ -1085,7 +1229,8 @@ impl WebGpuRenderer {
                     _pad2: 0,
                 }),
             );
-        } else if effective_samples == 4 {
+        }
+        if effective_samples == 4 {
             self.ensure_msaa_targets(width, height, format);
         }
 
@@ -1099,7 +1244,16 @@ impl WebGpuRenderer {
 
         // Choose main geometry pass targets.
         let (pass_color_view, pass_resolve_target, pass_depth_view, pass_color_store) =
-            if edl_enabled {
+            if edl_enabled && effective_samples == 4 {
+                let msaa = self.msaa_targets.as_ref().unwrap();
+                let edl = self.edl_targets.as_ref().unwrap();
+                (
+                    &msaa.color_view,
+                    Some(&edl.color_view),
+                    &msaa.depth_view,
+                    wgpu::StoreOp::Discard,
+                )
+            } else if edl_enabled {
                 let edl = self.edl_targets.as_ref().unwrap();
                 (&edl.color_view, None, &edl.depth_view, wgpu::StoreOp::Store)
             } else if effective_samples == 4 {
@@ -1118,6 +1272,12 @@ impl WebGpuRenderer {
                 (color_view, None, depth_view, wgpu::StoreOp::Store)
             };
 
+        let clear_color = if scene.settings.transparent_background {
+            wgpu::Color::TRANSPARENT
+        } else {
+            wgpu::Color::BLACK
+        };
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("paraviz-main-pass"),
@@ -1126,7 +1286,7 @@ impl WebGpuRenderer {
                     depth_slice: None,
                     resolve_target: pass_resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: pass_color_store,
                     },
                 })],
@@ -1143,10 +1303,12 @@ impl WebGpuRenderer {
                 multiview_mask: None,
             });
 
-            // 1. Background gradient
-            pass.set_pipeline(&bundle.bg_pipeline);
-            pass.set_bind_group(0, &self.bg_bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            // 1. Background gradient (skipped when exporting transparent background)
+            if !scene.settings.transparent_background {
+                pass.set_pipeline(&bundle.bg_pipeline);
+                pass.set_bind_group(0, &self.bg_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
 
             // 2. Opaque surfaces, wireframes, outlines, and points
             for actor in &scene.actors {
@@ -1157,12 +1319,27 @@ impl WebGpuRenderer {
                     continue;
                 };
                 match &cached.geometry {
-                    CachedGeometry::Surface {
+                    CachedGeometry::SurfaceIndexed {
+                        geom_buffer,
+                        scalar_buffer,
+                        index_buffer,
+                        index_count,
+                        ..
+                    } if *index_count > 0 && actor.style.opacity >= 0.999 => {
+                        pass.set_pipeline(&bundle.surface_indexed_opaque_pipeline);
+                        pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
+                        pass.set_bind_group(1, &cached.lut_bind_group, &[]);
+                        pass.set_vertex_buffer(0, geom_buffer.slice(..));
+                        pass.set_vertex_buffer(1, scalar_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*index_count, 0, 0..1);
+                    }
+                    CachedGeometry::SurfaceEdges {
                         buffer,
                         vertex_count,
                         ..
                     } if *vertex_count > 0 && actor.style.opacity >= 0.999 => {
-                        pass.set_pipeline(&bundle.surface_opaque_pipeline);
+                        pass.set_pipeline(&bundle.surface_edges_opaque_pipeline);
                         pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &cached.lut_bind_group, &[]);
                         pass.set_vertex_buffer(0, buffer.slice(..));
@@ -1172,12 +1349,12 @@ impl WebGpuRenderer {
                         buffer,
                         vertex_count,
                         ..
-                    } if *vertex_count > 0 => {
+                    } if *vertex_count >= 2 => {
                         pass.set_pipeline(&bundle.line_pipeline);
                         pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
                         pass.set_bind_group(1, &cached.lut_bind_group, &[]);
                         pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw(0..*vertex_count, 0..1);
+                        pass.draw(0..6, 0..(*vertex_count / 2));
                     }
                     CachedGeometry::Points {
                         buffer,
@@ -1195,38 +1372,65 @@ impl WebGpuRenderer {
                 }
             }
 
-            // 3. Global bounding-box overlay
-            if scene.settings.show_bounding_box
-                && self.bbox_vertex_count > 0
+            // 3. Global bounding-box / Cube Axes Grid overlay
+            if (scene.settings.show_bounding_box || scene.settings.show_axes_grid)
+                && self.bbox_vertex_count >= 2
                 && let Some(vb) = &self.bbox_vb
             {
                 pass.set_pipeline(&bundle.line_pipeline);
                 pass.set_bind_group(0, &self.bbox_bind_group, &[]);
                 pass.set_bind_group(1, &self.bbox_lut_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.draw(0..self.bbox_vertex_count, 0..1);
+                pass.set_vertex_buffer(0, vb.slice_used());
+                pass.draw(0..6, 0..(self.bbox_vertex_count / 2));
             }
 
-            // 4. Translucent surfaces
-            for actor in &scene.actors {
-                if !actor.style.visible || actor.style.opacity >= 0.999 {
-                    continue;
-                }
+            // 4. Translucent surfaces (sorted back-to-front by distance from camera)
+            let mut translucent_indices: Vec<(usize, f32)> = scene
+                .actors
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.style.visible && a.style.opacity < 0.999)
+                .map(|(idx, a)| {
+                    let c = a.dataset.bounds().center();
+                    let dist2 = (c - scene.camera.position).length_squared();
+                    (idx, dist2)
+                })
+                .collect();
+            translucent_indices.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+            for (actor_idx, _) in translucent_indices {
+                let actor = &scene.actors[actor_idx];
                 let Some(cached) = self.actor_cache.get(&actor.id) else {
                     continue;
                 };
-                if let CachedGeometry::Surface {
-                    buffer,
-                    vertex_count,
-                    ..
-                } = &cached.geometry
-                    && *vertex_count > 0
-                {
-                    pass.set_pipeline(&bundle.surface_alpha_pipeline);
-                    pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
-                    pass.set_bind_group(1, &cached.lut_bind_group, &[]);
-                    pass.set_vertex_buffer(0, buffer.slice(..));
-                    pass.draw(0..*vertex_count, 0..1);
+                match &cached.geometry {
+                    CachedGeometry::SurfaceIndexed {
+                        geom_buffer,
+                        scalar_buffer,
+                        index_buffer,
+                        index_count,
+                        ..
+                    } if *index_count > 0 => {
+                        pass.set_pipeline(&bundle.surface_indexed_alpha_pipeline);
+                        pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
+                        pass.set_bind_group(1, &cached.lut_bind_group, &[]);
+                        pass.set_vertex_buffer(0, geom_buffer.slice(..));
+                        pass.set_vertex_buffer(1, scalar_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*index_count, 0, 0..1);
+                    }
+                    CachedGeometry::SurfaceEdges {
+                        buffer,
+                        vertex_count,
+                        ..
+                    } if *vertex_count > 0 => {
+                        pass.set_pipeline(&bundle.surface_edges_alpha_pipeline);
+                        pass.set_bind_group(0, &cached.uniform_bind_group, &[]);
+                        pass.set_bind_group(1, &cached.lut_bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..*vertex_count, 0..1);
+                    }
+                    _ => {}
                 }
             }
 
@@ -1253,23 +1457,47 @@ impl WebGpuRenderer {
                 }
             }
 
-            // 6. 3D Interactive Viewport Widget overlays (wireframe lines + translucent guides)
-            if self.widget_line_count > 0
+            // 6. 3D Interactive Viewport Widget overlays (wide wireframe lines + translucent guides)
+            if self.widget_line_count >= 2
                 && let Some(vb) = &self.widget_line_vb
             {
                 pass.set_pipeline(&bundle.widget_line_pipeline);
                 pass.set_bind_group(0, &self.widget_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.draw(0..self.widget_line_count, 0..1);
+                pass.set_vertex_buffer(0, vb.slice_used());
+                pass.draw(0..6, 0..(self.widget_line_count / 2));
             }
             if self.widget_tri_count > 0
                 && let Some(vb) = &self.widget_tri_vb
             {
                 pass.set_pipeline(&bundle.widget_tri_pipeline);
                 pass.set_bind_group(0, &self.widget_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_vertex_buffer(0, vb.slice_used());
                 pass.draw(0..self.widget_tri_count, 0..1);
             }
+        }
+
+        // 6b. Resolve 4x MSAA depth into 1x EDL depth texture when both EDL and 4x MSAA are enabled.
+        if edl_enabled && effective_samples == 4 {
+            let msaa = self.msaa_targets.as_ref().unwrap();
+            let edl_targets = self.edl_targets.as_ref().unwrap();
+            let mut resolve_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("paraviz-depth-resolve-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &edl_targets.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            resolve_pass.set_pipeline(&self.depth_resolve_pipeline);
+            resolve_pass.set_bind_group(0, &msaa.depth_resolve_bg, &[]);
+            resolve_pass.draw(0..3, 0..1);
         }
 
         // 7. Fullscreen Eye-Dome Lighting (EDL) post-process pass into final color_view
@@ -1283,7 +1511,7 @@ impl WebGpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1304,17 +1532,25 @@ impl WebGpuRenderer {
             let margin = 10.0_f32.min((width as f32 - gizmo_size).max(0.0));
             let gy = (height as f32 - gizmo_size - margin).max(0.0);
 
-            let (gizmo_color_view, gizmo_resolve, gizmo_depth_view, gizmo_store) =
-                if effective_samples == 4 {
+            let (gizmo_pipeline, gizmo_color_view, gizmo_resolve, gizmo_depth_view, gizmo_store) =
+                if !edl_enabled && effective_samples == 4 {
                     let msaa = self.msaa_targets.as_ref().unwrap();
                     (
+                        &bundle.gizmo_pipeline,
                         &msaa.color_view,
                         Some(color_view),
                         &msaa.depth_view,
                         wgpu::StoreOp::Discard,
                     )
                 } else {
-                    (color_view, None, depth_view, wgpu::StoreOp::Store)
+                    let b1 = self.pipelines.get(&(format, 1)).unwrap();
+                    (
+                        &b1.gizmo_pipeline,
+                        color_view,
+                        None,
+                        depth_view,
+                        wgpu::StoreOp::Store,
+                    )
                 };
 
             let mut gizmo_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1341,7 +1577,7 @@ impl WebGpuRenderer {
                 multiview_mask: None,
             });
             gizmo_pass.set_viewport(margin, gy, gizmo_size, gizmo_size, 0.0, 1.0);
-            gizmo_pass.set_pipeline(&bundle.gizmo_pipeline);
+            gizmo_pass.set_pipeline(gizmo_pipeline);
             gizmo_pass.set_bind_group(0, &self.gizmo_bind_group, &[]);
             gizmo_pass.set_vertex_buffer(0, self.gizmo_vb.slice(..));
             gizmo_pass.draw(0..self.gizmo_vertex_count, 0..1);
@@ -1352,14 +1588,60 @@ impl WebGpuRenderer {
     }
 
     fn sync_actor_cache(&mut self, actor: &SceneActor) {
+        let mut scalar_only_update = false;
         let needs_rebuild = match self.actor_cache.get(&actor.id) {
             Some(c) => {
-                !Arc::ptr_eq(&c.dataset, &actor.dataset)
+                if !Arc::ptr_eq(&c.dataset, &actor.dataset)
                     || c.representation != actor.style.representation
-                    || c.color_by != actor.style.color_by
+                {
+                    true
+                } else if c.color_by != actor.style.color_by {
+                    if matches!(c.geometry, CachedGeometry::SurfaceIndexed { .. }) {
+                        scalar_only_update = true;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
             }
             None => true,
         };
+
+        if scalar_only_update {
+            let cached = self.actor_cache.get_mut(&actor.id).unwrap();
+            if let CachedGeometry::SurfaceIndexed {
+                scalar_buffer,
+                vertex_count,
+                scalar_source,
+                auto_range,
+                ..
+            } = &mut cached.geometry
+                && let Some((new_scalars, new_range)) = mesh_prep::extract_indexed_surface_scalars(
+                    &actor.dataset,
+                    &actor.style.color_by,
+                    scalar_source,
+                    *vertex_count as usize,
+                )
+            {
+                self.queue
+                    .write_buffer(scalar_buffer, 0, bytemuck::cast_slice(&new_scalars));
+                *auto_range = new_range;
+                cached.color_by = actor.style.color_by.clone();
+                if cached.colormap != actor.style.colormap {
+                    let bytes = actor.style.colormap.to_rgba8_lut(LUT_WIDTH);
+                    upload_lut_texture(&self.queue, &cached.lut_texture, &bytes);
+                    cached.colormap = actor.style.colormap.clone();
+                }
+                if cached.volume_tf != actor.style.volume_tf {
+                    let bytes = actor.style.volume_tf.to_rgba8_lut(LUT_WIDTH);
+                    upload_lut_texture(&self.queue, &cached.tf_texture, &bytes);
+                    cached.volume_tf = actor.style.volume_tf.clone();
+                }
+                return;
+            }
+        }
 
         if needs_rebuild {
             let geometry = build_cached_geometry(&self.device, &self.queue, &actor.dataset, &actor.style);
@@ -1481,17 +1763,47 @@ fn build_cached_geometry(
     style: &ActorStyle,
 ) -> CachedGeometry {
     match style.representation {
-        Representation::Surface | Representation::SurfaceWithEdges => {
+        Representation::Surface => {
+            let prep = mesh_prep::prepare_surface_indexed(dataset, &style.color_by);
+            if prep.indices.is_empty() || prep.geom_vertices.is_empty() {
+                return CachedGeometry::Empty;
+            }
+            let geom_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("paraviz-surface-geom-vb"),
+                contents: bytemuck::cast_slice(&prep.geom_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let scalar_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("paraviz-surface-scalar-vb"),
+                contents: bytemuck::cast_slice(&prep.scalars),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("paraviz-surface-ib"),
+                contents: bytemuck::cast_slice(&prep.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            CachedGeometry::SurfaceIndexed {
+                geom_buffer,
+                scalar_buffer,
+                index_buffer,
+                vertex_count: prep.geom_vertices.len() as u32,
+                index_count: prep.indices.len() as u32,
+                scalar_source: prep.scalar_source,
+                auto_range: prep.scalar_range,
+            }
+        }
+        Representation::SurfaceWithEdges => {
             let prep = mesh_prep::prepare_surface(dataset, &style.color_by);
             if prep.vertices.is_empty() {
                 return CachedGeometry::Empty;
             }
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("paraviz-surface-vb"),
+                label: Some("paraviz-surface-edges-vb"),
                 contents: bytemuck::cast_slice(&prep.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            CachedGeometry::Surface {
+            CachedGeometry::SurfaceEdges {
                 buffer,
                 vertex_count: prep.vertices.len() as u32,
                 auto_range: prep.scalar_range,
@@ -1529,7 +1841,7 @@ fn build_cached_geometry(
                 auto_range: (0.0, 1.0),
             }
         }
-        Representation::Points => {
+        Representation::Points | Representation::PointGaussian => {
             let prep = mesh_prep::prepare_points(dataset, &style.color_by);
             if prep.instances.is_empty() {
                 return CachedGeometry::Empty;
@@ -1598,7 +1910,8 @@ fn build_cached_geometry(
 fn resolve_scalar_range(style: &ActorStyle, geom: &CachedGeometry) -> (f64, f64) {
     if style.auto_range {
         match geom {
-            CachedGeometry::Surface { auto_range, .. }
+            CachedGeometry::SurfaceIndexed { auto_range, .. }
+            | CachedGeometry::SurfaceEdges { auto_range, .. }
             | CachedGeometry::Lines { auto_range, .. }
             | CachedGeometry::Points { auto_range, .. }
             | CachedGeometry::Volume { auto_range, .. } => *auto_range,
@@ -1631,7 +1944,7 @@ fn write_actor_uniforms(
     };
 
     match &cached.geometry {
-        CachedGeometry::Surface { .. } => {
+        CachedGeometry::SurfaceIndexed { .. } | CachedGeometry::SurfaceEdges { .. } => {
             let data = SurfaceUniforms {
                 view_proj: view_proj.to_cols_array_2d(),
                 model: Mat4::IDENTITY.to_cols_array_2d(),
@@ -1672,7 +1985,8 @@ fn write_actor_uniforms(
                 use_colormap: if is_outline { 0 } else { use_colormap },
                 log_scale: u32::from(style.colormap.log_scale),
                 opacity: style.opacity,
-                _pad: [0.0; 3],
+                line_width: style.line_width,
+                viewport_size,
             };
             queue.write_buffer(&cached.uniform_buffer, 0, bytemuck::bytes_of(&data));
         }
@@ -1719,6 +2033,13 @@ fn write_actor_uniforms(
                 )
             };
 
+            let (clip_origin, clip_normal) = match style.volume_clip_plane {
+                Some((orig, norm)) => {
+                    let n = glam::Vec3::from_array(norm).normalize_or(glam::Vec3::Z);
+                    ([orig[0], orig[1], orig[2], 1.0], [n.x, n.y, n.z, 0.0])
+                }
+                None => ([0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]),
+            };
             let data = VolumeUniforms {
                 view_proj: view_proj.to_cols_array_2d(),
                 inv_view_proj: inv_view_proj.to_cols_array_2d(),
@@ -1738,6 +2059,8 @@ fn write_actor_uniforms(
                 log_scale: u32::from(style.volume_tf.color_map.log_scale),
                 opacity: style.opacity,
                 max_steps,
+                clip_origin,
+                clip_normal,
             };
             queue.write_buffer(&cached.uniform_buffer, 0, bytemuck::bytes_of(&data));
         }
@@ -1854,6 +2177,7 @@ fn create_msaa_targets(
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    depth_resolve_bgl: &wgpu::BindGroupLayout,
 ) -> MsaaTargets {
     let color_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("paraviz-msaa4x-color"),
@@ -1870,7 +2194,15 @@ fn create_msaa_targets(
         view_formats: &[],
     });
     let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let (depth_texture, depth_view) = create_depth_texture(device, width, height, 4, false);
+    let (depth_texture, depth_view) = create_depth_texture(device, width, height, 4, true);
+    let depth_resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("paraviz-depth-resolve-bg"),
+        layout: depth_resolve_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&depth_view),
+        }],
+    });
     MsaaTargets {
         width,
         height,
@@ -1879,7 +2211,50 @@ fn create_msaa_targets(
         color_view,
         depth_texture,
         depth_view,
+        depth_resolve_bg,
     }
+}
+
+fn create_depth_resolve_pipeline(
+    device: &wgpu::Device,
+    depth_resolve_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("paraviz-depth-resolve-shader"),
+        source: wgpu::ShaderSource::Wgsl(shaders::DEPTH_RESOLVE_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("paraviz-depth-resolve-layout"),
+        bind_group_layouts: &[Some(depth_resolve_bgl)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("paraviz-depth-resolve-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 fn create_edl_targets(
@@ -2064,7 +2439,32 @@ fn create_pipelines(
         cache: None,
     });
 
-    let surface_vbl = wgpu::VertexBufferLayout {
+    let surface_geom_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<SurfaceGeomVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+        ],
+    };
+    let surface_scalar_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<f32>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: 0,
+            shader_location: 2,
+        }],
+    };
+    let surface_edges_vbl = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<SurfaceVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
@@ -2091,14 +2491,17 @@ fn create_pipelines(
         ],
     };
 
-    let make_surface_pipeline = |label: &str, alpha_blend: bool| {
+    let make_surface_pipeline = |label: &str,
+                                 entry_point: &'static str,
+                                 buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+                                 alpha_blend: bool| {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(&actor_lut_layout),
             vertex: wgpu::VertexState {
                 module: &surface_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(surface_vbl.clone())],
+                entry_point: Some(entry_point),
+                buffers,
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -2133,8 +2536,16 @@ fn create_pipelines(
         })
     };
 
-    let surface_opaque_pipeline = make_surface_pipeline("paraviz-surface-opaque", false);
-    let surface_alpha_pipeline = make_surface_pipeline("paraviz-surface-alpha", true);
+    let indexed_buffers = [Some(surface_geom_vbl), Some(surface_scalar_vbl)];
+    let edges_buffers = [Some(surface_edges_vbl)];
+    let surface_indexed_opaque_pipeline =
+        make_surface_pipeline("paraviz-surface-indexed-opaque", "vs_indexed", &indexed_buffers, false);
+    let surface_indexed_alpha_pipeline =
+        make_surface_pipeline("paraviz-surface-indexed-alpha", "vs_indexed", &indexed_buffers, true);
+    let surface_edges_opaque_pipeline =
+        make_surface_pipeline("paraviz-surface-edges-opaque", "vs_main", &edges_buffers, false);
+    let surface_edges_alpha_pipeline =
+        make_surface_pipeline("paraviz-surface-edges-alpha", "vs_main", &edges_buffers, true);
 
     let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("paraviz-line-pipeline"),
@@ -2143,8 +2554,8 @@ fn create_pipelines(
             module: &line_shader,
             entry_point: Some("vs_main"),
             buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<LineVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
+                array_stride: (2 * std::mem::size_of::<LineVertex>()) as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
                     wgpu::VertexAttribute {
                         format: wgpu::VertexFormat::Float32x3,
@@ -2155,6 +2566,16 @@ fn create_pipelines(
                         format: wgpu::VertexFormat::Float32,
                         offset: 12,
                         shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 16,
+                        shader_location: 2,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32,
+                        offset: 28,
+                        shader_location: 3,
                     },
                 ],
             })],
@@ -2171,7 +2592,8 @@ fn create_pipelines(
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::LineList,
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -2291,7 +2713,7 @@ fn create_pipelines(
         cache: None,
     });
 
-    let widget_vbl = wgpu::VertexBufferLayout {
+    let widget_tri_vbl = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<WidgetVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
@@ -2307,49 +2729,76 @@ fn create_pipelines(
             },
         ],
     };
-
-    let make_widget_pipeline = |label: &str, topology: wgpu::PrimitiveTopology, depth_write: bool| {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(label),
-            layout: Some(&uniform_only_layout),
-            vertex: wgpu::VertexState {
-                module: &widget_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(widget_vbl.clone())],
-                compilation_options: Default::default(),
+    let widget_line_vbl = wgpu::VertexBufferLayout {
+        array_stride: (2 * std::mem::size_of::<WidgetVertex>()) as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &widget_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology,
-                cull_mode: None,
-                ..Default::default()
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 12,
+                shader_location: 1,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(depth_write),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample,
-            multiview_mask: None,
-            cache: None,
-        })
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 28,
+                shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 40,
+                shader_location: 3,
+            },
+        ],
     };
 
+    let make_widget_pipeline =
+        |label: &str, entry_point: &'static str, vbl: wgpu::VertexBufferLayout<'_>, depth_write: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&uniform_only_layout),
+                vertex: wgpu::VertexState {
+                    module: &widget_shader,
+                    entry_point: Some(entry_point),
+                    buffers: &[Some(vbl)],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &widget_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample,
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
     let widget_tri_pipeline =
-        make_widget_pipeline("paraviz-widget-tri", wgpu::PrimitiveTopology::TriangleList, false);
+        make_widget_pipeline("paraviz-widget-tri", "vs_main", widget_tri_vbl, false);
     let widget_line_pipeline =
-        make_widget_pipeline("paraviz-widget-line", wgpu::PrimitiveTopology::LineList, true);
+        make_widget_pipeline("paraviz-widget-line", "vs_line", widget_line_vbl, true);
 
     let gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("paraviz-gizmo-pipeline"),
@@ -2408,8 +2857,10 @@ fn create_pipelines(
 
     PipelineBundle {
         bg_pipeline,
-        surface_opaque_pipeline,
-        surface_alpha_pipeline,
+        surface_indexed_opaque_pipeline,
+        surface_indexed_alpha_pipeline,
+        surface_edges_opaque_pipeline,
+        surface_edges_alpha_pipeline,
         line_pipeline,
         point_pipeline,
         volume_pipeline,

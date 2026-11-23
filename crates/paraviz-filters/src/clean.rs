@@ -1,13 +1,12 @@
 //! Coincident point merging and degenerate cell removal filter
 //! (`CleanPolyDataFilter`, equivalent to `vtkCleanPolyData`).
 
-use crate::util::compact_polydata_points;
+use crate::util::{compact_polydata_points, FxHashMap};
 use glam::Vec3;
 use paraviz_core::{
     DataSet, FieldData, Filter, MultiBlockDataSet, PipelineError, PolyData,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Merges coincident points within `tolerance`, remaps cell vertex indices,
 /// removes degenerate cells, and compacts unused points.
@@ -63,7 +62,7 @@ impl CleanPolyDataFilter {
         let cell_size = if tol > 0.0 { tol } else { 1e-6 };
         let inv_cell = 1.0 / cell_size;
 
-        let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+        let mut grid: FxHashMap<(i64, i64, i64), Vec<u32>> = FxHashMap::default();
         let mut new_points: Vec<[f32; 3]> = Vec::with_capacity(pd.points.len());
         let mut kept_old_pts: Vec<usize> = Vec::with_capacity(pd.points.len());
         let mut old_to_new: Vec<u32> = Vec::with_capacity(pd.points.len());

@@ -5,16 +5,19 @@ use paraviz_core::{
     PipelineInfo, Source, TransferFunction,
 };
 use paraviz_filters::{
-    CalculatorFilter, CellCentersFilter, CellDataToPointDataFilter, CleanPolyDataFilter,
-    ClipFilter, ConnectivityFilter, ContourFilter, ElevationFilter, ExtractEdgesFilter,
-    ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter, GradientFilter,
-    PointDataToCellDataFilter, ProbeOverLineFilter, ReflectFilter, ShrinkFilter, SliceFilter,
-    SmoothFilter, StreamTracerFilter, ThresholdFilter, TransformFilter, TriangulateFilter,
-    TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
+    AddTimeStepsFilter, AppendDatasetsFilter, CalculatorFilter, CellCentersFilter,
+    CellDataToPointDataFilter, CleanPolyDataFilter, ClipFilter, ConnectivityFilter, ContourFilter,
+    DecimateFilter, Delaunay2DFilter, Delaunay3DFilter, ElevationFilter, ExtractBlockFilter,
+    ExtractEdgesFilter, ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter,
+    GradientFilter, IntegrateVariablesFilter, IsoVolumeFilter, PointDataToCellDataFilter,
+    ProbeOverLineFilter, ReflectFilter, ResampleToImageFilter, ResampleWithDatasetFilter,
+    ShrinkFilter, SliceFilter, SmoothFilter, StreamTracerFilter, StreamTracerWithCustomSource,
+    TemporalStatisticsFilter, ThresholdFilter, TransformFilter, TriangulateFilter, TubeFilter,
+    WarpByScalarFilter, WarpByVectorFilter,
 };
 use paraviz_io::{
-    read_dataset, read_raw_volume, write_dataset, write_glb, IoError, PvdSeriesSource,
-    RawVolumeDescriptor, VtkFileSource,
+    read_dataset, read_raw_volume, write_animated_gif, write_dataset, write_glb,
+    write_html_viewer, IoError, PvdSeriesSource, RawVolumeDescriptor, VtkFileSource,
 };
 use paraviz_render::{
     pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,
@@ -72,6 +75,10 @@ impl Source for InMemorySource {
 
     fn execute(&self, _time: f64) -> Result<DataSet, PipelineError> {
         Ok((*self.dataset).clone())
+    }
+
+    fn execute_arc(&self, _time: f64) -> Result<Arc<DataSet>, PipelineError> {
+        Ok(Arc::clone(&self.dataset))
     }
 }
 
@@ -144,6 +151,11 @@ impl SourceConfig {
         };
         Ok(src)
     }
+
+    /// Deserializes a [`SourceConfig`] from JSON (used by saved states and Rust traces).
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
 }
 
 /// Serializable filter configuration mirroring ParaView's Filters menu.
@@ -176,6 +188,16 @@ pub enum FilterConfig {
     Triangulate(TriangulateFilter),
     ExtractEdges(ExtractEdgesFilter),
     CleanPolyData(CleanPolyDataFilter),
+    AppendDatasets(AppendDatasetsFilter),
+    IntegrateVariables(IntegrateVariablesFilter),
+    Decimate(DecimateFilter),
+    Delaunay2D(Delaunay2DFilter),
+    Delaunay3D(Delaunay3DFilter),
+    IsoVolume(IsoVolumeFilter),
+    ResampleToImage(ResampleToImageFilter),
+    ExtractBlock(ExtractBlockFilter),
+    TemporalStatistics(TemporalStatisticsFilter),
+    AddTimeSteps(AddTimeStepsFilter),
 }
 
 impl FilterConfig {
@@ -209,6 +231,16 @@ impl FilterConfig {
             Self::Triangulate(_) => "Triangulate",
             Self::ExtractEdges(_) => "ExtractEdges",
             Self::CleanPolyData(_) => "CleanPolyData",
+            Self::AppendDatasets(_) => "AppendDatasets",
+            Self::IntegrateVariables(_) => "IntegrateVariables",
+            Self::Decimate(_) => "Decimate",
+            Self::Delaunay2D(_) => "Delaunay2D",
+            Self::Delaunay3D(_) => "Delaunay3D",
+            Self::IsoVolume(_) => "IsoVolume",
+            Self::ResampleToImage(_) => "ResampleToImage",
+            Self::ExtractBlock(_) => "ExtractBlock",
+            Self::TemporalStatistics(_) => "TemporalStatistics",
+            Self::AddTimeSteps(_) => "AddTimeSteps",
         }
     }
 
@@ -242,7 +274,22 @@ impl FilterConfig {
             Self::Triangulate(f) => Box::new(f.clone()),
             Self::ExtractEdges(f) => Box::new(f.clone()),
             Self::CleanPolyData(f) => Box::new(f.clone()),
+            Self::AppendDatasets(f) => Box::new(f.clone()),
+            Self::IntegrateVariables(f) => Box::new(f.clone()),
+            Self::Decimate(f) => Box::new(f.clone()),
+            Self::Delaunay2D(f) => Box::new(f.clone()),
+            Self::Delaunay3D(f) => Box::new(f.clone()),
+            Self::IsoVolume(f) => Box::new(f.clone()),
+            Self::ResampleToImage(f) => Box::new(f.clone()),
+            Self::ExtractBlock(f) => Box::new(f.clone()),
+            Self::TemporalStatistics(f) => Box::new(f.clone()),
+            Self::AddTimeSteps(f) => Box::new(f.clone()),
         }
+    }
+
+    /// Deserializes a [`FilterConfig`] from JSON (used by saved states and Rust traces).
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
     }
 }
 
@@ -406,6 +453,8 @@ pub struct SerializedNode {
     pub parent: Option<u64>,
     pub source: Option<SourceConfig>,
     pub filter: Option<FilterConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_dataset: Option<DataSet>,
     pub style: ActorStyle,
 }
 
@@ -417,6 +466,7 @@ pub struct ParaViz {
     pub camera: Camera,
     pub settings: SceneSettings,
     pub widgets: Vec<ViewportWidget>,
+    pub selection_highlight: Option<[f32; 3]>,
     pub time: f64,
     renderer: Option<WebGpuRenderer>,
 }
@@ -436,6 +486,7 @@ impl ParaViz {
             camera: Camera::default(),
             settings: SceneSettings::default(),
             widgets: Vec::new(),
+            selection_highlight: None,
             time: 0.0,
             renderer: None,
         }
@@ -561,6 +612,10 @@ impl ParaViz {
         if matches!(config, FilterConfig::StreamTracer(_)) {
             style.representation = Representation::Wireframe;
         }
+        let time_steps = match &config {
+            FilterConfig::AddTimeSteps(f) => f.time_values(),
+            _ => Vec::new(),
+        };
         self.nodes.push(SessionNode {
             id,
             name,
@@ -569,7 +624,7 @@ impl ParaViz {
             filter_config: Some(config),
             style,
             cached_dataset: None,
-            time_steps: Vec::new(),
+            time_steps,
             auto_styled: false,
         });
         Ok(id)
@@ -600,6 +655,10 @@ impl ParaViz {
         let flt = config.build_filter();
         self.graph.update_filter(id, flt)?;
         let node = self.node_mut(id)?;
+        node.time_steps = match &config {
+            FilterConfig::AddTimeSteps(f) => f.time_values(),
+            _ => Vec::new(),
+        };
         node.filter_config = Some(config);
         self.invalidate_subtree(id);
         Ok(())
@@ -710,6 +769,7 @@ impl ParaViz {
             actors: Vec::new(),
             settings: self.settings.clone(),
             widgets: self.widgets.clone(),
+            selection_highlight: self.selection_highlight,
         };
         for node in &self.nodes {
             if !node.style.visible {
@@ -770,6 +830,58 @@ impl ParaViz {
         Ok(())
     }
 
+    /// Renders a 360-degree turntable animation and writes an animated GIF89a file to `path`.
+    pub fn render_turntable_gif(
+        &mut self,
+        path: impl AsRef<Path>,
+        width: u32,
+        height: u32,
+        frames: u32,
+        delay_ms: u16,
+    ) -> Result<(), SessionError> {
+        let count = frames.max(1);
+        let saved_cam = self.camera.clone();
+        let step_rad = std::f32::consts::TAU / (count as f32);
+        let mut rgba_frames = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            rgba_frames.push(self.render_rgba(width, height)?);
+            self.camera.orbit(step_rad, 0.0);
+        }
+        self.camera = saved_cam;
+        let delay_cs = (delay_ms / 10).max(1);
+        write_animated_gif(path, &rgba_frames, width, height, delay_cs)?;
+        Ok(())
+    }
+
+    /// Renders all advertised pipeline time steps and writes an animated GIF89a file to `path`.
+    pub fn render_timeseries_gif(
+        &mut self,
+        path: impl AsRef<Path>,
+        width: u32,
+        height: u32,
+        delay_ms: u16,
+    ) -> Result<(), SessionError> {
+        let steps = self.all_time_steps();
+        let saved_time = self.time;
+        let mut rgba_frames = if steps.is_empty() {
+            vec![self.render_rgba(width, height)?]
+        } else {
+            let mut out = Vec::with_capacity(steps.len());
+            for t in steps {
+                self.set_time(t);
+                out.push(self.render_rgba(width, height)?);
+            }
+            out
+        };
+        if rgba_frames.is_empty() {
+            rgba_frames.push(self.render_rgba(width, height)?);
+        }
+        self.set_time(saved_time);
+        let delay_cs = (delay_ms / 10).max(1);
+        write_animated_gif(path, &rgba_frames, width, height, delay_cs)?;
+        Ok(())
+    }
+
     /// Exports the evaluated dataset of `id` to disk using `paraviz-io`.
     pub fn export_dataset(
         &mut self,
@@ -781,15 +893,16 @@ impl ParaViz {
         Ok(())
     }
 
-    /// Exports a `PolyData` node to a binary glTF 2.0 (`.glb`) file with optional scalar vertex colors.
-    pub fn export_glb(
+    fn prepare_surface_export(
         &mut self,
         id: NodeId,
-        path: impl AsRef<Path>,
         use_node_colormap: bool,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(String, paraviz_core::PolyData, Option<ColorMap>, Option<String>), SessionError>
+    {
         let ds = self.evaluate(id)?;
-        let style = self.node(id)?.style.clone();
+        let node = self.node(id)?;
+        let name = node.name.clone();
+        let style = node.style.clone();
         let poly = match ds.as_ref() {
             DataSet::PolyData(p) => p.clone(),
             other => paraviz_filters::extract_surface(other)?,
@@ -799,11 +912,36 @@ impl ParaViz {
             _ => None,
         };
         let cmap = if use_node_colormap {
-            Some(&style.colormap)
+            Some(style.colormap)
         } else {
             None
         };
-        write_glb(path, &poly, cmap, scalar_name.as_deref())?;
+        Ok((name, poly, cmap, scalar_name))
+    }
+
+    /// Exports a `PolyData` node (or extracted surface) to a binary glTF 2.0 (`.glb`) file
+    /// with optional scalar vertex colors.
+    pub fn export_glb(
+        &mut self,
+        id: NodeId,
+        path: impl AsRef<Path>,
+        use_node_colormap: bool,
+    ) -> Result<(), SessionError> {
+        let (_, poly, cmap, scalar_name) = self.prepare_surface_export(id, use_node_colormap)?;
+        write_glb(path, &poly, cmap.as_ref(), scalar_name.as_deref())?;
+        Ok(())
+    }
+
+    /// Exports a `PolyData` node (or extracted surface) to a self-contained interactive
+    /// WebGL2 HTML5 3D viewer (`.html`).
+    pub fn export_html(
+        &mut self,
+        id: NodeId,
+        path: impl AsRef<Path>,
+        use_node_colormap: bool,
+    ) -> Result<(), SessionError> {
+        let (title, poly, cmap, scalar_name) = self.prepare_surface_export(id, use_node_colormap)?;
+        write_html_viewer(path, &poly, &title, cmap.as_ref(), scalar_name.as_deref())?;
         Ok(())
     }
 
@@ -852,6 +990,70 @@ impl ParaViz {
         Ok(self.add_dataset(label, DataSet::PolyData(poly)))
     }
 
+    /// Registers a multi-input filter node (e.g. `ResampleWithDataset`, live `AppendDatasets`).
+    pub fn add_multi_filter(
+        &mut self,
+        label: impl Into<String>,
+        inputs: Vec<NodeId>,
+        filter: Box<dyn paraviz_core::MultiInputFilter>,
+    ) -> Result<NodeId, SessionError> {
+        let name = label.into();
+        let primary_parent = inputs.first().copied();
+        let id = self.graph.add_multi_filter(name.clone(), inputs, filter)?;
+        self.nodes.push(SessionNode {
+            id,
+            name,
+            parent: primary_parent,
+            source_config: None,
+            filter_config: None,
+            style: ActorStyle::default(),
+            cached_dataset: None,
+            auto_styled: false,
+            time_steps: Vec::new(),
+        });
+        Ok(id)
+    }
+
+    /// Samples `source_node`'s volumetric fields onto `destination_node`'s geometry points.
+    pub fn resample_with_dataset(
+        &mut self,
+        source_node: NodeId,
+        destination_node: NodeId,
+    ) -> Result<NodeId, SessionError> {
+        self.add_multi_filter(
+            "ResampleWithDataset",
+            vec![source_node, destination_node],
+            Box::new(ResampleWithDatasetFilter),
+        )
+    }
+
+    /// Traces streamlines through `field_node`'s vector field using `seed_node`'s points as seeds.
+    pub fn stream_tracer_with_custom_source(
+        &mut self,
+        field_node: NodeId,
+        seed_node: NodeId,
+        config: StreamTracerFilter,
+    ) -> Result<NodeId, SessionError> {
+        let id = self.add_multi_filter(
+            "StreamTracerWithCustomSource",
+            vec![field_node, seed_node],
+            Box::new(StreamTracerWithCustomSource::new(config)),
+        )?;
+        if let Ok(n) = self.node_mut(id) {
+            n.style.representation = Representation::Wireframe;
+        }
+        Ok(id)
+    }
+
+    /// Appends multiple live pipeline nodes together into a single combined mesh/grid.
+    pub fn append_nodes(&mut self, inputs: Vec<NodeId>) -> Result<NodeId, SessionError> {
+        self.add_multi_filter(
+            "AppendDatasets",
+            inputs,
+            Box::new(AppendDatasetsFilter::new()),
+        )
+    }
+
     /// Returns an immutable slice of all pipeline nodes.
     pub fn nodes(&self) -> &[SessionNode] {
         &self.nodes
@@ -873,19 +1075,30 @@ impl ParaViz {
             .ok_or(SessionError::MissingNode(id))
     }
 
-    /// Serializes the configurable pipeline nodes, styles, camera, and settings to JSON.
+    /// Serializes the configurable pipeline nodes, custom in-memory datasets, styles, camera, and settings to JSON.
     pub fn save_state_json(&self) -> Result<String, SessionError> {
         let state = PipelineState {
             nodes: self
                 .nodes
                 .iter()
-                .map(|n| SerializedNode {
-                    id: n.id.0,
-                    name: n.name.clone(),
-                    parent: n.parent.map(|p| p.0),
-                    source: n.source_config.clone(),
-                    filter: n.filter_config.clone(),
-                    style: n.style.clone(),
+                .map(|n| {
+                    let custom_dataset = if n.source_config.is_none() && n.filter_config.is_none() {
+                        n.cached_dataset
+                            .as_deref()
+                            .cloned()
+                            .or_else(|| self.graph.cached_output(n.id).map(|arc| (*arc).clone()))
+                    } else {
+                        None
+                    };
+                    SerializedNode {
+                        id: n.id.0,
+                        name: n.name.clone(),
+                        parent: n.parent.map(|p| p.0),
+                        source: n.source_config.clone(),
+                        filter: n.filter_config.clone(),
+                        custom_dataset,
+                        style: n.style.clone(),
+                    }
                 })
                 .collect(),
             camera: self.camera.clone(),
@@ -910,6 +1123,8 @@ impl ParaViz {
             } else if let (Some(old_parent), Some(flt)) = (sn.parent, sn.filter) {
                 let mapped_parent = *id_map.get(&old_parent).ok_or(SessionError::MissingNode(NodeId(old_parent)))?;
                 pv.add_filter_cfg(sn.name, mapped_parent, flt)?
+            } else if let Some(ds) = sn.custom_dataset {
+                pv.add_dataset(sn.name, ds)
             } else {
                 continue;
             };
@@ -925,6 +1140,14 @@ impl ParaViz {
     /// Generates an executable Rust code snippet reproducing the current pipeline via the `paraviz` API
     /// (equivalent to ParaView's Python Trace).
     pub fn to_rust_trace(&self) -> String {
+        fn raw_str(s: &str) -> String {
+            let mut hashes = "#".to_string();
+            while s.contains(&format!("\"{hashes}")) {
+                hashes.push('#');
+            }
+            format!("r{hashes}\"{s}\"{hashes}")
+        }
+
         let mut out = String::from(
             "use paraviz::prelude::*;\n\nfn main() -> Result<(), Box<dyn std::error::Error>> {\n    let mut pv = ParaViz::new();\n",
         );
@@ -932,31 +1155,93 @@ impl ParaViz {
         for (idx, node) in self.nodes.iter().enumerate() {
             let var = format!("node_{}", idx);
             if let Some(src) = &node.source_config {
+                let json = serde_json::to_string(src).unwrap_or_default();
                 out.push_str(&format!(
-                    "    let {var} = pv.add_source_cfg({:?}, {:?})?;\n",
-                    node.name, src
+                    "    let {var} = pv.add_source_cfg({:?}, SourceConfig::from_json({})?)?;\n",
+                    node.name,
+                    raw_str(&json)
                 ));
             } else if let (Some(parent), Some(flt)) = (node.parent, &node.filter_config) {
                 let pvar = var_names.get(&parent).cloned().unwrap_or_else(|| "node_0".into());
+                let json = serde_json::to_string(flt).unwrap_or_default();
                 out.push_str(&format!(
-                    "    let {var} = pv.add_filter_cfg({:?}, {pvar}, {:?})?;\n",
-                    node.name, flt
+                    "    let {var} = pv.add_filter_cfg({:?}, {pvar}, FilterConfig::from_json({})?)?;\n",
+                    node.name,
+                    raw_str(&json)
                 ));
             } else {
-                out.push_str(&format!("    // Custom node {:?}\n", node.name));
+                out.push_str(&format!("    // In-memory custom node {:?} (recreate via add_dataset/gpu_contour)\n", node.name));
                 continue;
             }
             if node.style.visible {
                 out.push_str(&format!(
-                    "    pv.show({var}).representation(Representation::{:?}).opacity({:.2});\n",
-                    node.style.representation, node.style.opacity
+                    "    pv.show({var})\n        .representation(Representation::{:?})\n",
+                    node.style.representation
+                ));
+                if let Some(preset) = ColorMapPreset::ALL
+                    .iter()
+                    .find(|p| p.name() == node.style.colormap.name)
+                {
+                    out.push_str(&format!("        .colormap(ColorMapPreset::{preset:?})\n"));
+                }
+                match &node.style.color_by {
+                    ColorBy::PointScalar { array, component: None } => {
+                        out.push_str(&format!("        .color_by_point({array:?})\n"));
+                    }
+                    ColorBy::PointScalar {
+                        array,
+                        component: Some(c),
+                    } => {
+                        out.push_str(&format!(
+                            "        .color_by_point_component({array:?}, {c})\n"
+                        ));
+                    }
+                    ColorBy::CellScalar { array, .. } => {
+                        out.push_str(&format!("        .color_by_cell({array:?})\n"));
+                    }
+                    ColorBy::Solid(rgba) => {
+                        out.push_str(&format!(
+                            "        .solid_color([{:.4}, {:.4}, {:.4}, {:.4}])\n",
+                            rgba[0], rgba[1], rgba[2], rgba[3]
+                        ));
+                    }
+                }
+                if !node.style.auto_range {
+                    out.push_str(&format!(
+                        "        .scalar_range({:.6}, {:.6})\n",
+                        node.style.scalar_range.0, node.style.scalar_range.1
+                    ));
+                }
+                out.push_str(&format!(
+                    "        .opacity({:.3})\n        .line_width({:.2})\n        .point_size({:.2});\n",
+                    node.style.opacity, node.style.line_width, node.style.point_size
                 ));
             } else {
                 out.push_str(&format!("    pv.hide({var});\n"));
             }
             var_names.insert(node.id, var);
         }
-        out.push_str("    pv.reset_camera()?;\n    pv.render_png(\"output.png\", 1280, 720)?;\n    Ok(())\n}\n");
+        out.push_str(&format!(
+            "    pv.camera.position = [{:.4}, {:.4}, {:.4}].into();\n",
+            self.camera.position.x, self.camera.position.y, self.camera.position.z
+        ));
+        out.push_str(&format!(
+            "    pv.camera.target = [{:.4}, {:.4}, {:.4}].into();\n",
+            self.camera.target.x, self.camera.target.y, self.camera.target.z
+        ));
+        out.push_str(&format!(
+            "    pv.camera.up = [{:.4}, {:.4}, {:.4}].into();\n",
+            self.camera.up.x, self.camera.up.y, self.camera.up.z
+        ));
+        out.push_str(&format!(
+            "    pv.camera.fov_y_deg = {:.2};\n",
+            self.camera.fov_y_deg
+        ));
+        out.push_str(&format!(
+            "    pv.settings.edl_enabled = {};\n    pv.settings.msaa_samples = {};\n",
+            self.settings.edl_enabled, self.settings.msaa_samples
+        ));
+        out.push_str("    pv.render_png(\"output.png\", 1280, 720)?;\n    Ok(())\n}\n");
         out
     }
 

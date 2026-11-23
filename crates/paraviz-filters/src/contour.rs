@@ -3,7 +3,7 @@
 
 use crate::util::{
     canonical_edge_key, deduplicate_edge_triangles, interpolate_field_data_edges, merge_polydata,
-    EdgeTri, EdgeVertex,
+    EdgeTri, EdgeVertex, GridPoints,
 };
 use glam::Vec3;
 use paraviz_core::{
@@ -55,7 +55,7 @@ impl Filter for ContourFilter {
         let pd = match input {
             DataSet::ImageData(img) => contour_structured(
                 img.dimensions,
-                &img.all_points(),
+                GridPoints::Image(img),
                 &img.point_data,
                 &self.field_name,
                 &self.iso_values,
@@ -64,7 +64,7 @@ impl Filter for ContourFilter {
             )?,
             DataSet::RectilinearGrid(rg) => contour_structured(
                 rg.dimensions(),
-                &rg.all_points(),
+                GridPoints::Rectilinear(rg),
                 &rg.point_data,
                 &self.field_name,
                 &self.iso_values,
@@ -73,7 +73,7 @@ impl Filter for ContourFilter {
             )?,
             DataSet::StructuredGrid(sg) => contour_structured(
                 sg.dimensions,
-                &sg.points,
+                GridPoints::from_structured(&sg.points, sg.dimensions),
                 &sg.point_data,
                 &self.field_name,
                 &self.iso_values,
@@ -125,12 +125,11 @@ fn resolve_scalar_array<'a>(
     }
 }
 
-/// Computes `(t, p_interp)` along edge `(ia, ib)` where `va` and `vb` straddle `iso`.
+/// Computes `(t, p_interp)` along edge `(pa, pb)` where `va` and `vb` straddle `iso`.
 #[inline]
-pub(crate) fn interp_edge(
-    pts: &[[f32; 3]],
-    ia: usize,
-    ib: usize,
+pub(crate) fn interp_edge_pos(
+    pa: [f32; 3],
+    pb: [f32; 3],
     va: f64,
     vb: f64,
     iso: f64,
@@ -141,8 +140,6 @@ pub(crate) fn interp_edge(
     } else {
         0.5
     };
-    let pa = pts[ia];
-    let pb = pts[ib];
     let tf = t as f32;
     let p = [
         pa[0] + (pb[0] - pa[0]) * tf,
@@ -151,6 +148,31 @@ pub(crate) fn interp_edge(
     ];
     (t, p)
 }
+
+/// Computes `(t, p_interp)` along edge `(ia, ib)` where `va` and `vb` straddle `iso`.
+#[inline]
+pub(crate) fn interp_edge(
+    pts: &[[f32; 3]],
+    ia: usize,
+    ib: usize,
+    va: f64,
+    vb: f64,
+    iso: f64,
+) -> (f64, [f32; 3]) {
+    interp_edge_pos(pts[ia], pts[ib], va, vb, iso)
+}
+
+/// `(dx, dy, dz)` offsets of the 8 cube corners in Marching Cubes order.
+const CUBE_CORNER_OFFSETS: [(usize, usize, usize); 8] = [
+    (0, 0, 0),
+    (1, 0, 0),
+    (1, 1, 0),
+    (0, 1, 0),
+    (0, 0, 1),
+    (1, 0, 1),
+    (1, 1, 1),
+    (0, 1, 1),
+];
 
 /// Edge-to-corner-vertex pairs for standard Marching Cubes.
 const CUBE_EDGE_CORNERS: [(usize, usize); 12] = [
@@ -170,7 +192,7 @@ const CUBE_EDGE_CORNERS: [(usize, usize); 12] = [
 
 fn contour_structured(
     dims: [usize; 3],
-    points: &[[f32; 3]],
+    points: GridPoints<'_>,
     point_data: &FieldData,
     field_name: &str,
     iso_values: &[f64],
@@ -183,7 +205,11 @@ fn contour_structured(
         return Ok(PolyData::new());
     }
 
-    let scalars: Vec<f64> = (0..points.len()).map(|i| arr.get_magnitude(i)).collect();
+    let n_pts = nx * ny * nz;
+    let scalars: Vec<f64> = (0..n_pts)
+        .into_par_iter()
+        .map(|i| arr.get_magnitude(i))
+        .collect();
     let cx = nx - 1;
     let cy = ny - 1;
     let cz = nz - 1;
@@ -242,7 +268,11 @@ fn contour_structured(
                     if (edge_mask & (1 << e)) != 0 {
                         let ia = corners[c0];
                         let ib = corners[c1];
-                        let (t, pos) = interp_edge(points, ia, ib, vals[c0], vals[c1], iso);
+                        let o0 = CUBE_CORNER_OFFSETS[c0];
+                        let o1 = CUBE_CORNER_OFFSETS[c1];
+                        let pa = points.at_ijk(i + o0.0, j + o0.1, k + o0.2);
+                        let pb = points.at_ijk(i + o1.0, j + o1.1, k + o1.2);
+                        let (t, pos) = interp_edge_pos(pa, pb, vals[c0], vals[c1], iso);
                         let key = canonical_edge_key(ia as u32, ib as u32);
                         vert_list[e] = (key, pos, (ia, ib, t));
                     }
@@ -336,6 +366,23 @@ pub(crate) fn contour_tetrahedron(
     iso: f64,
     out: &mut Vec<EdgeTri>,
 ) {
+    let tet_pts = [
+        points[verts[0]],
+        points[verts[1]],
+        points[verts[2]],
+        points[verts[3]],
+    ];
+    contour_tetrahedron_pts(tet_pts, verts, vals, iso, out);
+}
+
+/// Evaluates Marching Tetrahedra using pre-fetched corner coordinates `tet_pts` and global indices `verts`.
+pub(crate) fn contour_tetrahedron_pts(
+    tet_pts: [[f32; 3]; 4],
+    verts: [usize; 4],
+    vals: [f64; 4],
+    iso: f64,
+    out: &mut Vec<EdgeTri>,
+) {
     let mut case = 0usize;
     for (b, &v) in vals.iter().enumerate() {
         if v < iso {
@@ -347,16 +394,16 @@ pub(crate) fn contour_tetrahedron(
     }
 
     // Check tet geometric orientation so normals are consistent across arbitrary tet decompositions.
-    let p0 = Vec3::from_array(points[verts[0]]);
-    let p1 = Vec3::from_array(points[verts[1]]);
-    let p2 = Vec3::from_array(points[verts[2]]);
-    let p3 = Vec3::from_array(points[verts[3]]);
+    let p0 = Vec3::from_array(tet_pts[0]);
+    let p1 = Vec3::from_array(tet_pts[1]);
+    let p2 = Vec3::from_array(tet_pts[2]);
+    let p3 = Vec3::from_array(tet_pts[3]);
     let flip_winding = (p1 - p0).cross(p2 - p0).dot(p3 - p0) < 0.0;
 
     let edge_sample = |a: usize, b: usize| -> (u64, [f32; 3], (usize, usize, f64)) {
         let ia = verts[a];
         let ib = verts[b];
-        let (t, pos) = interp_edge(points, ia, ib, vals[a], vals[b], iso);
+        let (t, pos) = interp_edge_pos(tet_pts[a], tet_pts[b], vals[a], vals[b], iso);
         let key = canonical_edge_key(ia as u32, ib as u32);
         (key, pos, (ia, ib, t))
     };

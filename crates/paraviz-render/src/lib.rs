@@ -7,6 +7,8 @@
 
 pub mod camera;
 pub mod compute;
+mod fxhash;
+pub mod legend;
 pub mod mesh_prep;
 pub mod pick;
 pub mod renderer;
