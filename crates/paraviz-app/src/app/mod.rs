@@ -1,0 +1,1523 @@
+pub(crate) use crate::charts::{draw_chart_tab, draw_opacity_tf_editor, ChartMode, ChartState};
+pub(crate) use crate::cli::format_memory_bytes;
+pub(crate) use crate::modals::{
+    draw_modal, is_raw_volume_ext, AppModal, ExportSpreadsheetModalState, FileBrowserState,
+    GifModalState, GpuContourModalState, ModalAction, RawVolumeModalState, ScreenshotModalState,
+};
+pub(crate) use crate::theme::{
+    apply_theme, node_badge_style, paint_logo_badge, palette, pill_badge, section_card,
+    visibility_eye_button, UiTheme, ViewportBgPreset,
+};
+use paraviz::prelude::*;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+mod drawer;
+mod editors;
+mod inspector;
+mod menu_pipeline;
+mod viewport;
+
+use drawer::{dataset_cell_center, dataset_element_scalar, dataset_point_at, export_spreadsheet_csv};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Properties,
+    Display,
+    Information,
+    Scene,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawerTab {
+    Spreadsheet,
+    Chart,
+    RustTrace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportMode {
+    Orbit,
+    Pick,
+    Ruler,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpreadsheetTarget {
+    Points,
+    Cells,
+    Field,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickDomain {
+    Point,
+    Cell,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PickedHighlight {
+    node_id: NodeId,
+    domain: PickDomain,
+    element_index: usize,
+    world_pos: Option<[f32; 3]>,
+    scalar_value: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ViewportCacheKey {
+    scene_revision: u64,
+    width: u32,
+    height: u32,
+    camera: Camera,
+    settings: SceneSettings,
+    widgets: Vec<ViewportWidget>,
+    picked_highlight: Option<PickedHighlight>,
+}
+
+struct PipelineTreeRow {
+    id: NodeId,
+    depth: usize,
+    name: String,
+    visible: bool,
+    badge: (&'static str, egui::Color32, egui::Color32),
+}
+
+#[derive(Debug, Clone)]
+struct CameraBookmark {
+    name: String,
+    camera: Camera,
+}
+
+pub struct ParaVizApp {
+    session: ParaViz,
+    renderer: WebGpuRenderer,
+    device: wgpu::Device,
+    egui_renderer: Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>,
+    viewport_tex_id: Option<egui::TextureId>,
+    viewport_tex_size: (u32, u32),
+    scene_revision: u64,
+    viewport_cache_key: Option<ViewportCacheKey>,
+    cached_scene: Option<RenderScene>,
+    cached_total_points: usize,
+    cached_total_cells: usize,
+
+    theme: UiTheme,
+    theme_applied: bool,
+    selected_node: Option<NodeId>,
+    renaming_node: Option<(NodeId, String)>,
+    copied_filter: Option<(String, FilterConfig)>,
+    copied_filter_chain: Vec<(String, FilterConfig)>,
+    auto_apply: bool,
+    pending_source: Option<(NodeId, SourceConfig)>,
+    pending_filter: Option<(NodeId, FilterConfig)>,
+
+    inspector_tab: InspectorTab,
+    show_left_dock: bool,
+    zen_mode: bool,
+    show_drawer: bool,
+    drawer_tab: DrawerTab,
+    chart_state: ChartState,
+    spreadsheet_target: SpreadsheetTarget,
+    spreadsheet_offset: usize,
+    spreadsheet_page_size: usize,
+    spreadsheet_filter: String,
+    spreadsheet_scroll_to_top: bool,
+    show_scalar_bar: bool,
+    show_widgets: bool,
+
+    viewport_mode: ViewportMode,
+    last_pick: Option<PickResult>,
+    picked_highlight: Option<PickedHighlight>,
+    highlight_flash_until: Option<Instant>,
+    ruler_points: Vec<[f32; 3]>,
+    export_glb_colors: bool,
+
+    turntable_enabled: bool,
+    turntable_speed: f32,
+
+    playing: bool,
+    time_accumulator: f64,
+    play_fps: f64,
+
+    last_frame_time: Instant,
+    fps_smoothed: f32,
+    last_render_ms: f32,
+
+    recent_files: Vec<PathBuf>,
+    camera_bookmarks: Vec<CameraBookmark>,
+    info_stats_cache: HashMap<(NodeId, String, AttributeAssociation), HistogramResult>,
+    volume_tf_hist_cache: HashMap<(NodeId, String, AttributeAssociation, Option<usize>), HistogramResult>,
+
+    modal: Option<AppModal>,
+    status_message: String,
+    error_message: Option<String>,
+}
+
+impl ParaVizApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+        let rs = cc
+            .wgpu_render_state
+            .as_ref()
+            .expect("eframe must be configured with the WGPU backend");
+        let device = rs.device.clone();
+        let queue = rs.queue.clone();
+        let egui_renderer = rs.renderer.clone();
+
+        let renderer = WebGpuRenderer::from_device(
+            Arc::new(device.clone()),
+            Arc::new(queue),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
+        let theme = UiTheme::DarkStudio;
+        apply_theme(&cc.egui_ctx, theme);
+
+        let mut app = Self {
+            session: ParaViz::new(),
+            renderer,
+            device,
+            egui_renderer,
+            viewport_tex_id: None,
+            viewport_tex_size: (0, 0),
+            scene_revision: 1,
+            viewport_cache_key: None,
+            cached_scene: None,
+            cached_total_points: 0,
+            cached_total_cells: 0,
+            theme,
+            theme_applied: true,
+            selected_node: None,
+            renaming_node: None,
+            copied_filter: None,
+            copied_filter_chain: Vec::new(),
+            auto_apply: true,
+            pending_source: None,
+            pending_filter: None,
+            inspector_tab: InspectorTab::Properties,
+            show_left_dock: true,
+            zen_mode: false,
+            show_drawer: false,
+            drawer_tab: DrawerTab::Spreadsheet,
+            chart_state: ChartState::default(),
+            spreadsheet_target: SpreadsheetTarget::Points,
+            spreadsheet_offset: 0,
+            spreadsheet_page_size: 200,
+            spreadsheet_filter: String::new(),
+            spreadsheet_scroll_to_top: false,
+            show_scalar_bar: true,
+            show_widgets: true,
+            viewport_mode: ViewportMode::Orbit,
+            last_pick: None,
+            picked_highlight: None,
+            highlight_flash_until: None,
+            ruler_points: Vec::new(),
+            export_glb_colors: true,
+            turntable_enabled: false,
+            turntable_speed: 0.45,
+            playing: false,
+            time_accumulator: 0.0,
+            play_fps: 4.0,
+            last_frame_time: Instant::now(),
+            fps_smoothed: 60.0,
+            last_render_ms: 0.0,
+            recent_files: Vec::new(),
+            camera_bookmarks: Vec::new(),
+            info_stats_cache: HashMap::new(),
+            volume_tf_hist_cache: HashMap::new(),
+            modal: None,
+            status_message: "Ready".into(),
+            error_message: None,
+        };
+
+        if let Some(path) = initial_path {
+            app.load_path(&path);
+        } else {
+            app.load_demo(DemoPreset::WaveletContour);
+        }
+
+        app
+    }
+
+    fn invalidate_viewport(&mut self) {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    fn clear_stats_caches(&mut self) {
+        self.info_stats_cache.clear();
+        self.volume_tf_hist_cache.clear();
+    }
+
+    fn clear_stats_caches_for_node(&mut self, node_id: NodeId) {
+        self.info_stats_cache.retain(|(nid, _, _), _| *nid != node_id);
+        self.volume_tf_hist_cache
+            .retain(|(nid, _, _, _), _| *nid != node_id);
+    }
+
+    fn focus_on_world_pos(&mut self, pos: [f32; 3]) {
+        let p = glam::Vec3::from_array(pos);
+        let offset = self.session.camera.position - self.session.camera.target;
+        let dist = offset.length().max(1e-4);
+        let dir = offset.normalize_or(glam::Vec3::Z);
+        let target_dist = self
+            .selected_node
+            .and_then(|id| self.session.node(id).ok())
+            .and_then(|n| n.dataset())
+            .map(|ds| ds.bounds().diagonal() * 0.35)
+            .filter(|d| *d > 1e-4)
+            .map(|d| dist.min(d))
+            .unwrap_or(dist);
+        self.session.camera.target = p;
+        self.session.camera.position = p + dir * target_dist;
+        if self.session.camera.orthographic {
+            self.session.camera.ortho_scale =
+                (self.session.camera.ortho_scale * (target_dist / dist)).max(1e-5);
+        }
+        self.invalidate_viewport();
+    }
+
+    fn reveal_in_spreadsheet(&mut self, node_id: NodeId, domain: PickDomain, element_index: usize) {
+        self.select_node(node_id);
+        self.show_drawer = true;
+        self.drawer_tab = DrawerTab::Spreadsheet;
+        self.spreadsheet_target = match domain {
+            PickDomain::Point => SpreadsheetTarget::Points,
+            PickDomain::Cell => SpreadsheetTarget::Cells,
+        };
+        self.spreadsheet_offset = element_index;
+        self.spreadsheet_scroll_to_top = true;
+        self.highlight_flash_until = Some(Instant::now() + Duration::from_secs(2));
+        self.status_message = match domain {
+            PickDomain::Point => format!("Revealed Point #{element_index} in Spreadsheet"),
+            PickDomain::Cell => format!("Revealed Cell #{element_index} in Spreadsheet"),
+        };
+    }
+
+    fn highlight_from_spreadsheet_row(
+        &mut self,
+        node_id: NodeId,
+        ds: &DataSet,
+        domain: PickDomain,
+        row: usize,
+    ) {
+        let world_pos = match domain {
+            PickDomain::Point => dataset_point_at(ds, row),
+            PickDomain::Cell => dataset_cell_center(ds, row),
+        };
+        let scalar_value = self
+            .session
+            .node(node_id)
+            .ok()
+            .and_then(|n| dataset_element_scalar(ds, &n.style.color_by, domain, row));
+        self.picked_highlight = Some(PickedHighlight {
+            node_id,
+            domain,
+            element_index: row,
+            world_pos,
+            scalar_value,
+        });
+        self.highlight_flash_until = Some(Instant::now() + Duration::from_secs(2));
+        self.status_message = match domain {
+            PickDomain::Point => format!("Highlighted Point #{row}"),
+            PickDomain::Cell => format!("Highlighted Cell #{row}"),
+        };
+        self.invalidate_viewport();
+    }
+
+    fn push_recent_file(&mut self, path: &Path) {
+        let p = path.to_path_buf();
+        self.recent_files.retain(|existing| existing != &p);
+        self.recent_files.insert(0, p);
+        self.recent_files.truncate(8);
+    }
+
+    fn load_demo(&mut self, preset: DemoPreset) {
+        match preset.build() {
+            Ok(mut pv) => {
+                let _ = pv.update_visible();
+                self.selected_node = pv.nodes().last().map(|n| n.id);
+                self.session = pv;
+                self.pending_source = None;
+                self.pending_filter = None;
+                self.renaming_node = None;
+                self.last_pick = None;
+                self.picked_highlight = None;
+                self.highlight_flash_until = None;
+                self.ruler_points.clear();
+                self.clear_stats_caches();
+                self.playing = false;
+                self.error_message = None;
+                self.invalidate_viewport();
+                self.status_message = format!("Loaded demo: {}", preset.name());
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to load demo: {e}"));
+            }
+        }
+    }
+
+    fn load_path(&mut self, path: &Path) {
+        if is_raw_volume_ext(path) {
+            self.modal = Some(AppModal::RawVolume(RawVolumeModalState::with_path(
+                path.display().to_string(),
+            )));
+            return;
+        }
+
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if ext == "json" {
+            match std::fs::read_to_string(path).and_then(|s| {
+                ParaViz::load_state_json(&s).map_err(|e| std::io::Error::other(e.to_string()))
+            }) {
+                Ok(mut pv) => {
+                    let _ = pv.update_visible();
+                    self.selected_node = pv.nodes().last().map(|n| n.id);
+                    self.session = pv;
+                    self.pending_source = None;
+                    self.pending_filter = None;
+                    self.renaming_node = None;
+                    self.last_pick = None;
+                    self.picked_highlight = None;
+                    self.highlight_flash_until = None;
+                    self.ruler_points.clear();
+                    self.clear_stats_caches();
+                    self.playing = false;
+                    self.error_message = None;
+                    self.invalidate_viewport();
+                    self.push_recent_file(path);
+                    self.status_message = format!("Loaded state: {}", path.display());
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Failed to load state: {e}"));
+                }
+            }
+            return;
+        }
+
+        let is_first = self.session.nodes().is_empty();
+        match self.session.open(path) {
+            Ok(id) => {
+                let _ = self.session.evaluate(id);
+                self.session.show(id);
+                if is_first {
+                    let _ = self.session.camera_preset(CameraPreset::Isometric);
+                } else {
+                    let _ = self.session.reset_camera();
+                }
+                self.select_node(id);
+                self.clear_stats_caches();
+                self.error_message = None;
+                self.invalidate_viewport();
+                self.push_recent_file(path);
+                self.status_message = format!("Opened '{}'", path.display());
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to open '{}': {e}", path.display()));
+            }
+        }
+    }
+
+    fn import_raw_volume(&mut self, rv: RawVolumeModalState) {
+        let desc = RawVolumeDescriptor {
+            dimensions: rv.dimensions,
+            scalar_type: paraviz_core::ScalarType::F32, // overridden by read_raw_volume_with_type
+            origin: rv.origin,
+            spacing: rv.spacing,
+            endian: rv.endian,
+            header_bytes: rv.header_bytes,
+            array_name: if rv.array_name.trim().is_empty() {
+                "Scalars".into()
+            } else {
+                rv.array_name.trim().to_string()
+            },
+        };
+        let path = PathBuf::from(rv.path.trim());
+        match paraviz::io::read_raw_volume_with_type(&path, &desc, rv.scalar_type) {
+            Ok(img) => {
+                let is_first = self.session.nodes().is_empty();
+                let base_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("RawVolume");
+                let label = self.unique_label(base_name);
+                let id = self.session.add_dataset(label.clone(), DataSet::ImageData(img));
+                let _ = self.session.evaluate(id);
+                self.session.show(id).representation(Representation::Volume);
+                if is_first {
+                    let _ = self.session.camera_preset(CameraPreset::Isometric);
+                } else {
+                    let _ = self.session.reset_camera();
+                }
+                self.select_node(id);
+                self.error_message = None;
+                self.invalidate_viewport();
+                self.push_recent_file(&path);
+                self.status_message = format!(
+                    "Imported raw volume '{label}' ({}×{}×{})",
+                    rv.dimensions[0], rv.dimensions[1], rv.dimensions[2]
+                );
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Raw volume import failed: {e}"));
+            }
+        }
+    }
+
+    fn add_source(&mut self, cfg: SourceConfig) {
+        let is_first = self.session.nodes().is_empty();
+        let label = self.unique_label(&cfg.default_label());
+        match self.session.add_source_cfg(label.clone(), cfg) {
+            Ok(id) => {
+                let _ = self.session.evaluate(id);
+                self.session.show(id);
+                if is_first {
+                    let _ = self.session.camera_preset(CameraPreset::Isometric);
+                } else {
+                    let _ = self.session.reset_camera();
+                }
+                self.select_node(id);
+                self.error_message = None;
+                self.invalidate_viewport();
+                self.status_message = format!("Added source '{label}'");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to add source: {e}"));
+            }
+        }
+    }
+
+    fn add_filter_to_selected(&mut self, mut cfg: FilterConfig) {
+        let Some(parent_id) = self.selected_node else {
+            self.error_message = Some("Select a pipeline node first to apply a filter.".into());
+            return;
+        };
+
+        if let Ok(ds) = self.session.evaluate(parent_id) {
+            let bb = ds.bounds();
+            let center = bb.center().to_array();
+            let active_scalar = ds
+                .point_data()
+                .and_then(|p| p.active_scalars_array())
+                .map(|a| (a.name.clone(), a.range(None)));
+            let active_vector = ds
+                .point_data()
+                .and_then(|p| p.active_vectors_array())
+                .map(|a| a.name.clone());
+
+            match &mut cfg {
+                FilterConfig::Contour(f) => {
+                    if let Some((name, (mn, mx))) = active_scalar {
+                        f.field_name = name;
+                        f.iso_values = vec![(mn + mx) * 0.5];
+                    }
+                }
+                FilterConfig::Slice(f) => {
+                    f.origin = center;
+                }
+                FilterConfig::Clip(f) => {
+                    f.function = ImplicitFunction::Plane {
+                        origin: center,
+                        normal: [1.0, 0.0, 0.0],
+                    };
+                }
+                FilterConfig::Threshold(f) => {
+                    if let Some((name, (mn, mx))) = active_scalar {
+                        f.field_name = name;
+                        f.min = mn + (mx - mn) * 0.25;
+                        f.max = mx;
+                    }
+                }
+                FilterConfig::StreamTracer(f) => {
+                    if let Some(vname) = active_vector {
+                        f.vector_field = vname;
+                    }
+                    let r = (bb.diagonal() * 0.25).max(0.2);
+                    f.seeds = SeedSource::Sphere {
+                        center,
+                        radius: r,
+                        count: 16,
+                    };
+                }
+                FilterConfig::Glyph(f) => {
+                    f.vector_field = active_vector;
+                    f.scalar_field = active_scalar.map(|(n, _)| n);
+                }
+                FilterConfig::WarpByVector(f) => {
+                    if let Some(vname) = active_vector {
+                        f.vector_field = vname;
+                    }
+                }
+                FilterConfig::WarpByScalar(f) => {
+                    if let Some((name, _)) = active_scalar {
+                        f.scalar_field = name;
+                    }
+                }
+                FilterConfig::Gradient(f) => {
+                    if let Some(vname) = active_vector {
+                        f.field_name = vname;
+                    } else if let Some((name, _)) = active_scalar {
+                        f.field_name = name;
+                    }
+                }
+                FilterConfig::Calculator(f) => {
+                    if let Some((name, _)) = active_scalar {
+                        f.expression = format!("{name} * 2.0");
+                    }
+                }
+                FilterConfig::ProbeOverLine(f) if bb.is_valid() => {
+                    f.point1 = [bb.min.x, center[1], center[2]];
+                    f.point2 = [bb.max.x, center[1], center[2]];
+                }
+                FilterConfig::Elevation(f) if bb.is_valid() => {
+                    let dz = (bb.max.z - bb.min.z).abs();
+                    let dy = (bb.max.y - bb.min.y).abs();
+                    if dz > 1e-4 {
+                        f.low_point = [center[0], center[1], bb.min.z];
+                        f.high_point = [center[0], center[1], bb.max.z];
+                    } else if dy > 1e-4 {
+                        f.low_point = [center[0], bb.min.y, center[2]];
+                        f.high_point = [center[0], bb.max.y, center[2]];
+                    } else {
+                        f.low_point = [bb.min.x, center[1], center[2]];
+                        f.high_point = [bb.max.x, center[1], center[2]];
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let is_cell_centers = matches!(cfg, FilterConfig::CellCenters(_));
+        let is_wire_edges = matches!(
+            cfg,
+            FilterConfig::FeatureEdges(_) | FilterConfig::ExtractEdges(_)
+        );
+        let is_probe = matches!(cfg, FilterConfig::ProbeOverLine(_));
+        let label = self.unique_label(cfg.default_label());
+        match self.session.add_filter_cfg(label.clone(), parent_id, cfg) {
+            Ok(id) => {
+                let eval_res = self.session.evaluate(id);
+                let handle = self.session.show(id);
+                if is_cell_centers {
+                    handle.representation(Representation::Points);
+                } else if is_wire_edges {
+                    handle.representation(Representation::Wireframe);
+                }
+                if let Err(e) = eval_res {
+                    self.error_message = Some(format!("Filter '{label}' failed: {e}"));
+                } else {
+                    self.error_message = None;
+                    self.status_message = format!("Applied filter '{label}'");
+                }
+                self.select_node(id);
+                self.invalidate_viewport();
+                if is_probe {
+                    self.chart_state.mode = ChartMode::XYPlot;
+                    self.drawer_tab = DrawerTab::Chart;
+                    self.show_drawer = true;
+                }
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to add filter: {e}"));
+            }
+        }
+    }
+
+    fn open_gpu_contour_modal(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            self.error_message = Some("Select an ImageData node first.".into());
+            return;
+        };
+        let Ok(ds) = self.session.evaluate(sel_id) else {
+            self.error_message = Some("Failed to evaluate selected node.".into());
+            return;
+        };
+        let Some(img) = ds.as_image_data() else {
+            self.error_message =
+                Some("GPU Compute Contour requires an ImageData dataset.".into());
+            return;
+        };
+        let arrays: Vec<(String, (f64, f64))> = img
+            .point_data
+            .arrays()
+            .iter()
+            .map(|a| (a.name.clone(), a.range(None)))
+            .collect();
+        let (field_name, range) = img
+            .point_data
+            .active_scalars_array()
+            .map(|a| (a.name.clone(), a.range(None)))
+            .or_else(|| arrays.first().cloned())
+            .unwrap_or_else(|| (String::new(), (0.0, 1.0)));
+        let iso_value = 0.5 * (range.0 + range.1);
+        self.modal = Some(AppModal::GpuContour(GpuContourModalState {
+            node_id: sel_id,
+            available_arrays: arrays,
+            field_name,
+            iso_value,
+            range,
+        }));
+    }
+
+    fn run_gpu_contour(&mut self, node_id: NodeId, field_name: &str, iso_value: f64) {
+        let label = self.unique_label("GpuContour");
+        let field_opt = if field_name.is_empty() {
+            None
+        } else {
+            Some(field_name)
+        };
+        match self
+            .session
+            .gpu_contour(label.clone(), node_id, field_opt, iso_value)
+        {
+            Ok(new_id) => {
+                let _ = self.session.evaluate(new_id);
+                self.session.show(new_id);
+                self.select_node(new_id);
+                self.error_message = None;
+                self.invalidate_viewport();
+                self.status_message =
+                    format!("Applied GPU Compute Contour '{label}' (iso={iso_value:.3})");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("GPU Compute Contour failed: {e}"));
+            }
+        }
+    }
+
+    fn append_visible_datasets(&mut self) {
+        if let Err(e) = self.session.update_visible() {
+            self.error_message = Some(format!("Append failed: {e}"));
+            return;
+        }
+        let merged_res = {
+            let refs: Vec<&DataSet> = self
+                .session
+                .nodes()
+                .iter()
+                .filter(|n| n.style.visible)
+                .filter_map(|n| n.dataset().map(|arc| arc.as_ref()))
+                .collect();
+            if refs.is_empty() {
+                self.error_message = Some("No visible datasets to append.".into());
+                return;
+            }
+            append_datasets(&refs)
+        };
+        match merged_res {
+            Ok(ds) => {
+                let label = self.unique_label("AppendDatasets");
+                let id = self.session.add_dataset(label.clone(), ds);
+                let _ = self.session.evaluate(id);
+                self.session.show(id);
+                self.select_node(id);
+                self.error_message = None;
+                self.invalidate_viewport();
+                self.status_message = format!("Appended visible datasets -> '{label}'");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Append Datasets failed: {e}"));
+            }
+        }
+    }
+
+    fn focus_selected_node(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            let _ = self.session.reset_camera();
+            self.invalidate_viewport();
+            return;
+        };
+        let _ = self.session.evaluate(sel_id);
+        if let Ok(node) = self.session.node(sel_id)
+            && let Some(ds) = node.dataset()
+        {
+            let bb = ds.bounds();
+            if bb.is_valid() {
+                self.session.camera.fit_bounds(&bb);
+                self.invalidate_viewport();
+                return;
+            }
+        }
+        let _ = self.session.reset_camera();
+        self.invalidate_viewport();
+    }
+
+    fn duplicate_selected_node(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            return;
+        };
+        let Ok(node) = self.session.node(sel_id).cloned() else {
+            return;
+        };
+        let label = self.unique_label(&format!("{}_copy", node.name));
+        let new_id_res = if let Some(src) = node.source_config {
+            self.session.add_source_cfg(label.clone(), src)
+        } else if let (Some(parent), Some(flt)) = (node.parent, node.filter_config) {
+            self.session.add_filter_cfg(label.clone(), parent, flt)
+        } else if let Some(ds) = node.cached_dataset {
+            Ok(self.session.add_dataset(label.clone(), (*ds).clone()))
+        } else {
+            return;
+        };
+        match new_id_res {
+            Ok(new_id) => {
+                if let Ok(n) = self.session.node_mut(new_id) {
+                    n.style = node.style;
+                }
+                let _ = self.session.evaluate(new_id);
+                self.select_node(new_id);
+                self.invalidate_viewport();
+                self.status_message = format!("Duplicated node -> '{label}'");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Duplicate failed: {e}"));
+            }
+        }
+    }
+
+    fn copy_filter_from_node(&mut self, id: NodeId) {
+        let Ok(node) = self.session.node(id) else {
+            return;
+        };
+        if let Some(cfg) = &node.filter_config {
+            self.copied_filter = Some((node.name.clone(), cfg.clone()));
+            self.status_message = format!("Copied filter '{}'", node.name);
+        }
+    }
+
+    fn copy_filter_chain_from_node(&mut self, id: NodeId) {
+        let mut chain = Vec::new();
+        let mut cur = Some(id);
+        while let Some(nid) = cur {
+            let Ok(node) = self.session.node(nid) else {
+                break;
+            };
+            if let Some(cfg) = &node.filter_config {
+                chain.push((node.name.clone(), cfg.clone()));
+                cur = node.parent;
+            } else {
+                break;
+            }
+        }
+        chain.reverse();
+        if !chain.is_empty() {
+            self.copied_filter = chain.last().cloned();
+            let count = chain.len();
+            self.copied_filter_chain = chain;
+            self.status_message = format!("Copied {count}-filter chain");
+        }
+    }
+
+    fn paste_filter_to_node(&mut self, target_id: NodeId) {
+        let Some((src_name, cfg)) = self.copied_filter.clone() else {
+            return;
+        };
+        let label = self.unique_label(&src_name);
+        match self.session.add_filter_cfg(label.clone(), target_id, cfg) {
+            Ok(new_id) => {
+                let eval_res = self.session.evaluate(new_id);
+                self.session.show(new_id);
+                if let Err(e) = eval_res {
+                    self.error_message = Some(format!("Paste filter failed: {e}"));
+                } else {
+                    self.error_message = None;
+                    self.status_message = format!("Pasted filter '{label}'");
+                }
+                self.select_node(new_id);
+                self.invalidate_viewport();
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Paste filter failed: {e}"));
+            }
+        }
+    }
+
+    fn paste_filter_chain_to_node(&mut self, mut target_id: NodeId) {
+        if self.copied_filter_chain.is_empty() {
+            self.paste_filter_to_node(target_id);
+            return;
+        }
+        let chain = self.copied_filter_chain.clone();
+        let count = chain.len();
+        for (idx, (src_name, cfg)) in chain.into_iter().enumerate() {
+            let label = self.unique_label(&src_name);
+            match self.session.add_filter_cfg(label, target_id, cfg) {
+                Ok(new_id) => {
+                    if idx + 1 < count {
+                        self.session.hide(new_id);
+                    } else {
+                        self.session.show(new_id);
+                    }
+                    let _ = self.session.evaluate(new_id);
+                    target_id = new_id;
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Paste filter chain failed: {e}"));
+                    return;
+                }
+            }
+        }
+        self.select_node(target_id);
+        self.invalidate_viewport();
+        self.status_message = format!("Pasted {count}-filter chain");
+    }
+
+    fn solo_selected_node(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            return;
+        };
+        let ids: Vec<NodeId> = self.session.nodes().iter().map(|n| n.id).collect();
+        for id in ids {
+            if id == sel_id {
+                self.session.show(id);
+            } else {
+                self.session.hide(id);
+            }
+        }
+        self.invalidate_viewport();
+    }
+
+    fn set_all_visibility(&mut self, visible: bool) {
+        let ids: Vec<NodeId> = self.session.nodes().iter().map(|n| n.id).collect();
+        for id in ids {
+            if visible {
+                self.session.show(id);
+            } else {
+                self.session.hide(id);
+            }
+        }
+        self.invalidate_viewport();
+    }
+
+    fn sync_viewport_widgets(&mut self) {
+        self.session.widgets.clear();
+        if self.show_widgets
+            && let Some(sel_id) = self.selected_node
+            && let Ok(node) = self.session.node(sel_id)
+        {
+            let active_cfg = self
+                .pending_filter
+                .as_ref()
+                .filter(|(id, _)| *id == sel_id)
+                .map(|(_, cfg)| cfg)
+                .or(node.filter_config.as_ref());
+
+            if let Some(flt) = active_cfg {
+                let ref_bounds = node
+                    .parent
+                    .and_then(|pid| self.session.node(pid).ok())
+                    .and_then(|pn| pn.dataset())
+                    .map(|ds| ds.bounds())
+                    .filter(|b| b.is_valid())
+                    .or_else(|| node.dataset().map(|ds| ds.bounds()).filter(|b| b.is_valid()));
+                let plane_size = ref_bounds
+                    .map(|b| (b.diagonal() * 0.85).max(0.5))
+                    .unwrap_or(4.0);
+
+                match flt {
+                    FilterConfig::Slice(f) => {
+                        self.session.widgets.push(ViewportWidget::Plane {
+                            origin: f.origin,
+                            normal: f.normal,
+                            size: plane_size,
+                        });
+                    }
+                    FilterConfig::Clip(f) => match &f.function {
+                        ImplicitFunction::Plane { origin, normal } => {
+                            self.session.widgets.push(ViewportWidget::Plane {
+                                origin: *origin,
+                                normal: *normal,
+                                size: plane_size,
+                            });
+                        }
+                        ImplicitFunction::Sphere { center, radius } => {
+                            self.session.widgets.push(ViewportWidget::Sphere {
+                                center: *center,
+                                radius: *radius,
+                            });
+                        }
+                        ImplicitFunction::Box { min, max } => {
+                            self.session.widgets.push(ViewportWidget::Box {
+                                min: *min,
+                                max: *max,
+                            });
+                        }
+                    },
+                    FilterConfig::ProbeOverLine(f) => {
+                        self.session.widgets.push(ViewportWidget::Line {
+                            p1: f.point1,
+                            p2: f.point2,
+                        });
+                    }
+                    FilterConfig::StreamTracer(f) => match &f.seeds {
+                        SeedSource::Line { p1, p2, .. } => {
+                            self.session
+                                .widgets
+                                .push(ViewportWidget::Line { p1: *p1, p2: *p2 });
+                        }
+                        SeedSource::Sphere { center, radius, .. } => {
+                            self.session.widgets.push(ViewportWidget::Sphere {
+                                center: *center,
+                                radius: *radius,
+                            });
+                        }
+                        SeedSource::Points(_) => {}
+                    },
+                    FilterConfig::Elevation(f) => {
+                        self.session.widgets.push(ViewportWidget::Line {
+                            p1: f.low_point,
+                            p2: f.high_point,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if self.ruler_points.len() == 2
+            && (self.show_widgets || self.viewport_mode == ViewportMode::Ruler)
+        {
+            self.session.widgets.push(ViewportWidget::Line {
+                p1: self.ruler_points[0],
+                p2: self.ruler_points[1],
+            });
+        }
+    }
+
+    fn unique_label(&self, base: &str) -> String {
+        if !self.session.nodes().iter().any(|n| n.name == base) {
+            return base.to_string();
+        }
+        let mut idx = 2;
+        loop {
+            let candidate = format!("{base}_{idx}");
+            if !self.session.nodes().iter().any(|n| n.name == candidate) {
+                return candidate;
+            }
+            idx += 1;
+        }
+    }
+
+    fn select_node(&mut self, id: NodeId) {
+        if self.selected_node != Some(id) {
+            self.selected_node = Some(id);
+            self.pending_source = None;
+            self.pending_filter = None;
+            self.renaming_node = None;
+            self.spreadsheet_offset = 0;
+            let has_arc = self
+                .session
+                .node(id)
+                .ok()
+                .and_then(|n| n.dataset())
+                .and_then(|ds| ds.as_poly_data())
+                .is_some_and(|pd| pd.point_data.get("ArcLength").is_some());
+            self.chart_state.mode = if has_arc {
+                ChartMode::XYPlot
+            } else {
+                ChartMode::Histogram
+            };
+            self.invalidate_viewport();
+        }
+    }
+
+    fn delete_selected_node(&mut self) {
+        if let Some(id) = self.selected_node {
+            let removed = self.session.remove_node(id);
+            self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
+            self.volume_tf_hist_cache
+                .retain(|(nid, _, _, _), _| !removed.contains(nid));
+            if self
+                .picked_highlight
+                .as_ref()
+                .is_some_and(|h| removed.contains(&h.node_id))
+            {
+                self.picked_highlight = None;
+            }
+            if self.selected_node.is_some_and(|s| removed.contains(&s)) {
+                self.selected_node = self.session.nodes().last().map(|n| n.id);
+                self.pending_source = None;
+                self.pending_filter = None;
+            }
+            self.invalidate_viewport();
+        }
+    }
+
+    fn step_time(&mut self, delta_steps: isize) {
+        let steps = self.session.all_time_steps();
+        if steps.is_empty() {
+            return;
+        }
+        let cur_idx = steps
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (*a - self.session.time)
+                    .abs()
+                    .total_cmp(&(*b - self.session.time).abs())
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let next_idx =
+            (cur_idx as isize + delta_steps).rem_euclid(steps.len() as isize) as usize;
+        self.session.set_time(steps[next_idx]);
+        self.clear_stats_caches();
+        self.invalidate_viewport();
+    }
+
+    fn handle_shortcuts_and_drops(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        for path in dropped {
+            self.load_path(&path);
+        }
+
+        if !ctx.egui_wants_keyboard_input() && self.modal.is_none() && self.renaming_node.is_none() {
+            if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+                let _ = self.session.reset_camera();
+                self.invalidate_viewport();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                self.focus_selected_node();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+                self.viewport_mode = ViewportMode::Orbit;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num2)) {
+                self.viewport_mode = ViewportMode::Pick;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num3)) {
+                self.viewport_mode = ViewportMode::Ruler;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+                self.show_widgets = !self.show_widgets;
+                self.invalidate_viewport();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+                self.session.settings.edl_enabled = !self.session.settings.edl_enabled;
+                self.invalidate_viewport();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+                self.session.settings.msaa_samples = if self.session.settings.msaa_samples >= 4 {
+                    1
+                } else {
+                    4
+                };
+                self.invalidate_viewport();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+                self.session.settings.show_axes_gizmo = !self.session.settings.show_axes_gizmo;
+                self.invalidate_viewport();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+                self.session.settings.show_bounding_box =
+                    !self.session.settings.show_bounding_box;
+                self.invalidate_viewport();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+                self.turntable_enabled = !self.turntable_enabled;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+                self.show_left_dock = !self.show_left_dock;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F1))
+                || ctx.input(|i| i.key_pressed(egui::Key::Questionmark))
+            {
+                self.modal = Some(AppModal::Shortcuts);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+            {
+                self.delete_selected_node();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Space))
+                && !self.session.all_time_steps().is_empty()
+            {
+                self.playing = !self.playing;
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
+                && let Some(sel) = self.selected_node
+            {
+                self.copy_filter_from_node(sel);
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
+                && let Some(sel) = self.selected_node
+            {
+                self.paste_filter_to_node(sel);
+            }
+        }
+    }
+
+
+    fn handle_modals(&mut self, ctx: &egui::Context) {
+        let action = draw_modal(
+            ctx,
+            &mut self.modal,
+            &mut self.export_glb_colors,
+            self.viewport_tex_size,
+            self.theme,
+        );
+        match action {
+            ModalAction::None => {}
+            ModalAction::OpenFile(p) | ModalAction::LoadState(p) => self.load_path(&p),
+            ModalAction::ImportRawVolume(rv) => self.import_raw_volume(rv),
+            ModalAction::RunGpuContour {
+                node_id,
+                field_name,
+                iso_value,
+            } => self.run_gpu_contour(node_id, &field_name, iso_value),
+            ModalAction::LoadDemo(preset) => self.load_demo(preset),
+            ModalAction::SaveState(p) => match self.session.save_state_json() {
+                Ok(json) => match std::fs::write(&p, json) {
+                    Ok(()) => {
+                        self.error_message = None;
+                        self.status_message = format!("Saved state -> {}", p.display());
+                    }
+                    Err(e) => self.error_message = Some(format!("Write failed: {e}")),
+                },
+                Err(e) => self.error_message = Some(format!("Serialize failed: {e}")),
+            },
+            ModalAction::ExportDataset(p) => {
+                if let Some(id) = self.selected_node {
+                    let ext = p
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let res = if ext == "glb" {
+                        self.session.export_glb(id, &p, self.export_glb_colors)
+                    } else if ext == "html" || ext == "htm" {
+                        self.session.export_html(id, &p, self.export_glb_colors)
+                    } else {
+                        self.session.export_dataset(id, &p)
+                    };
+                    match res {
+                        Ok(()) => {
+                            self.error_message = None;
+                            self.status_message = format!("Exported dataset -> {}", p.display());
+                        }
+                        Err(e) => self.error_message = Some(format!("Export failed: {e}")),
+                    }
+                }
+            }
+            ModalAction::ExportSpreadsheetCsv(p) => {
+                if let Some(sel_id) = self.selected_node
+                    && let Ok(node) = self.session.node(sel_id)
+                    && let Some(ds) = node.dataset().cloned()
+                {
+                    match export_spreadsheet_csv(
+                        &ds,
+                        self.spreadsheet_target,
+                        &self.spreadsheet_filter,
+                        &p,
+                    ) {
+                        Ok(msg) => {
+                            self.error_message = None;
+                            self.status_message = msg;
+                        }
+                        Err(err) => self.error_message = Some(err),
+                    }
+                } else {
+                    self.error_message =
+                        Some("No evaluated dataset selected for CSV export.".into());
+                }
+            }
+            ModalAction::SaveScreenshot {
+                path,
+                width,
+                height,
+                transparent,
+                include_scalar_bar,
+            } => {
+                let res = self.session.build_scene().and_then(|mut scene| {
+                    scene.settings.transparent_background = transparent;
+                    scene.settings.show_scalar_bar = include_scalar_bar;
+                    self.renderer
+                        .render_to_png(&scene, width, height, &path)
+                        .map_err(SessionError::from)
+                });
+                match res {
+                    Ok(()) => {
+                        self.error_message = None;
+                        self.status_message = format!(
+                            "Saved screenshot ({width}x{height}) -> {}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => self.error_message = Some(format!("Screenshot failed: {e}")),
+                }
+            }
+            ModalAction::ExportGif {
+                path,
+                width,
+                height,
+                frames,
+                delay_ms,
+                is_turntable,
+                transparent,
+                include_scalar_bar,
+            } => {
+                let prev_trans = self.session.settings.transparent_background;
+                let prev_bar = self.session.settings.show_scalar_bar;
+                self.session.settings.transparent_background = transparent;
+                self.session.settings.show_scalar_bar = include_scalar_bar;
+                let res = if is_turntable {
+                    self.session
+                        .render_turntable_gif(&path, width, height, frames, delay_ms)
+                } else {
+                    self.session
+                        .render_timeseries_gif(&path, width, height, delay_ms)
+                };
+                self.session.settings.transparent_background = prev_trans;
+                self.session.settings.show_scalar_bar = prev_bar;
+                match res {
+                    Ok(()) => {
+                        self.error_message = None;
+                        self.status_message = format!(
+                            "Exported animated GIF ({width}x{height}) -> {}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => self.error_message = Some(format!("GIF export failed: {e}")),
+                }
+            }
+        }
+    }
+}
+
+
+impl eframe::App for ParaVizApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.theme_applied {
+            apply_theme(ui.ctx(), self.theme);
+            self.theme_applied = true;
+        }
+
+        let now = Instant::now();
+        let dt = (now - self.last_frame_time).as_secs_f64();
+        self.last_frame_time = now;
+        if dt > 1e-5 {
+            let inst_fps = (1.0 / dt) as f32;
+            self.fps_smoothed = self.fps_smoothed * 0.9 + inst_fps * 0.1;
+        }
+
+        if self.turntable_enabled {
+            self.session
+                .camera
+                .orbit((dt as f32) * self.turntable_speed, 0.0);
+            self.invalidate_viewport();
+            ui.ctx().request_repaint();
+        }
+
+        if self.playing {
+            let steps = self.session.all_time_steps();
+            if steps.is_empty() {
+                self.playing = false;
+            } else {
+                self.time_accumulator += dt * self.play_fps;
+                if self.time_accumulator >= 1.0 {
+                    let advance = self.time_accumulator.floor() as isize;
+                    self.time_accumulator -= advance as f64;
+                    self.step_time(advance);
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+
+        self.handle_shortcuts_and_drops(ui.ctx());
+
+        egui::Panel::top("paraviz_top_bar").show(ui, |ui| {
+            self.draw_menu_bar(ui);
+            if !self.zen_mode {
+                ui.add_space(2.0);
+                self.draw_toolbar(ui);
+            }
+        });
+
+        if !self.zen_mode && self.show_left_dock {
+            egui::Panel::left("paraviz_left_dock")
+                .default_size(325.0)
+                .min_size(250.0)
+                .show(ui, |ui| {
+                    self.draw_left_dock(ui);
+                });
+        }
+
+        let pal = palette(self.theme);
+        egui::Panel::bottom("paraviz_status_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(err) = &self.error_message {
+                    pill_badge(
+                        ui,
+                        "ERR",
+                        pal.danger.gamma_multiply(0.25),
+                        pal.danger,
+                    );
+                    ui.colored_label(pal.danger, err);
+                    if ui
+                        .small_button("Report Issue")
+                        .on_hover_text(
+                            "Encountered a bug? Open an issue at github.com/DimitriTimoz/paraviz/issues",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/DimitriTimoz/paraviz/issues/new/choose",
+                        ));
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        self.error_message = None;
+                    }
+                } else {
+                    pill_badge(
+                        ui,
+                        "OK",
+                        pal.success.gamma_multiply(0.22),
+                        pal.success,
+                    );
+                    ui.label(&self.status_message);
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let total_mem: usize = self
+                        .session
+                        .nodes()
+                        .iter()
+                        .filter_map(|n| n.dataset().map(|d| d.memory_bytes()))
+                        .sum();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Nodes: {}  |  Mem: {}  |  Dist: {:.2}  |  F1: Help",
+                            self.session.nodes().len(),
+                            format_memory_bytes(total_mem),
+                            self.session.camera.distance()
+                        ))
+                        .size(11.0)
+                        .monospace()
+                        .color(pal.muted),
+                    );
+                });
+            });
+        });
+
+        if !self.zen_mode && self.show_drawer {
+            egui::Panel::bottom("paraviz_inspector_drawer")
+                .resizable(true)
+                .default_size(240.0)
+                .min_size(130.0)
+                .show(ui, |ui| {
+                    self.draw_drawer(ui);
+                });
+        }
+
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            self.draw_viewport(ui);
+        });
+
+        self.handle_modals(ui.ctx());
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_dataset() -> DataSet {
+        let mut pd = PolyData::from_triangles(
+            vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            vec![[0, 1, 2]],
+        );
+        pd.point_data.add_array(DataArray::scalars_f64("Temp", vec![10.0, 20.0, 30.0]));
+        pd.point_data.add_array(DataArray::scalars_f64("Pressure", vec![1.0, 2.0, 3.0]));
+        pd.cell_data.add_array(DataArray::scalars_f64("CellArea", vec![2.0]));
+        pd.cell_data.add_array(DataArray::scalars_f64("ZoneID", vec![7.0]));
+        pd.field_data.add_array(DataArray::scalars_f64("TimeValue", vec![42.5]));
+        DataSet::PolyData(pd)
+    }
+
+    #[test]
+    fn export_spreadsheet_csv_respects_active_domain_and_filter() {
+        let ds = sample_dataset();
+        let dir = std::env::temp_dir();
+
+        // 1. Points domain with column filter
+        let pts_path = dir.join(format!("paraviz_test_pts_{}.csv", std::process::id()));
+        let msg = export_spreadsheet_csv(&ds, SpreadsheetTarget::Points, "press", &pts_path)
+            .expect("points export");
+        assert!(msg.contains("3 Point rows"));
+        let pts_csv = std::fs::read_to_string(&pts_path).unwrap();
+        assert!(pts_csv.starts_with("PointID,X,Y,Z,Pressure\n"));
+        assert!(!pts_csv.contains("Temp"));
+        let _ = std::fs::remove_file(&pts_path);
+
+        // 2. Cells domain
+        let cells_path = dir.join(format!("paraviz_test_cells_{}.csv", std::process::id()));
+        let msg = export_spreadsheet_csv(&ds, SpreadsheetTarget::Cells, "Zone", &cells_path)
+            .expect("cells export");
+        assert!(msg.contains("1 Cell rows"));
+        let cells_csv = std::fs::read_to_string(&cells_path).unwrap();
+        assert_eq!(cells_csv, "CellID,ZoneID\n0,7\n");
+        let _ = std::fs::remove_file(&cells_path);
+
+        // 3. Field domain
+        let field_path = dir.join(format!("paraviz_test_field_{}.csv", std::process::id()));
+        let msg = export_spreadsheet_csv(&ds, SpreadsheetTarget::Field, "", &field_path)
+            .expect("field export");
+        assert!(msg.contains("1 Field rows"));
+        let field_csv = std::fs::read_to_string(&field_path).unwrap();
+        assert_eq!(field_csv, "Tuple,TimeValue\n0,42.5\n");
+        let _ = std::fs::remove_file(&field_path);
+    }
+
+    #[test]
+    fn viewport_cache_key_detects_mutations_and_stays_equal_when_idle() {
+        let base = ViewportCacheKey {
+            scene_revision: 1,
+            width: 1280,
+            height: 720,
+            camera: Camera::default(),
+            settings: SceneSettings::default(),
+            widgets: Vec::new(),
+            picked_highlight: None,
+        };
+        assert_eq!(base, base.clone());
+
+        let mut resized = base.clone();
+        resized.width = 1281;
+        assert_ne!(base, resized);
+
+        let mut cam_moved = base.clone();
+        cam_moved.camera.fov_y_deg = 55.0;
+        assert_ne!(base, cam_moved);
+
+        let mut hl_changed = base.clone();
+        hl_changed.picked_highlight = Some(PickedHighlight {
+            node_id: NodeId(1),
+            domain: PickDomain::Point,
+            element_index: 4,
+            world_pos: Some([1.0, 2.0, 3.0]),
+            scalar_value: Some(0.5),
+        });
+        assert_ne!(base, hl_changed);
+    }
+
+    #[test]
+    fn dataset_cell_center_computes_triangle_centroid() {
+        let ds = sample_dataset();
+        let c = dataset_cell_center(&ds, 0).expect("triangle centroid");
+        assert!((c[0] - 2.0 / 3.0).abs() < 1e-5);
+        assert!((c[1] - 2.0 / 3.0).abs() < 1e-5);
+        assert!(c[2].abs() < 1e-5);
+    }
+}
