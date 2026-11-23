@@ -65,16 +65,17 @@ cargo run --release -p paraviz-app -- path/to/mesh.vtu
   <img src="assets/pipeline-architecture.svg" width="840" alt="ParaViz Demand-Driven Pipeline and WebGPU Architecture">
 </p>
 
-- **Interactive WebGPU Studio**: Real-time `Surface`, `SurfaceWithEdges`, `Wireframe`, `Points` (analytical sphere impostors), `PointGaussian`, `Volume`, and `Outline` representations with **4x MSAA**, **Eye-Dome Lighting (EDL)**, `DarkStudio` / `LightStudio` themes, 11 colormaps, and Camera Bookmarks.
+- **Interactive WebGPU Studio**: Real-time `Surface`, `SurfaceWithEdges`, `Wireframe`, `Points` (analytical sphere impostors), `PointGaussian`, `Volume`, and `Outline` representations with **Split Views** (`1x1` / `1x2` / `2x1` / `2x2` across `3D View`, `XY Chart`, `Spreadsheet`), **Link Cameras**, per-pane node visibility, **MultiBlock Patches** visibility/color inspector, **4x MSAA**, **Eye-Dome Lighting (EDL)**, `DarkStudio` / `LightStudio` themes, 11 colormaps, Camera Bookmarks, and movable/resizable **Scalar Color Bar**, **`Time:`** badge, and custom **Viewport Annotations**.
+- **Async Background Loading & Filtering**: Non-blocking worker threads (desktop native) keep UI navigation smooth during large file loads and heavy filters with live elapsed status and cooperative **Cancel**.
 - **Demand-Driven Pipeline & 37+ Parallel Filters**: Pull-evaluated `PipelineGraph` DAG with caching and `rayon` parallelism across isosurfaces (CPU Marching Cubes/Tetrahedra + **GPU Compute Contour**), slices, clips, thresholds, `StreamTracer` & twist-free `TubeFilter`, vector glyphs, Garland-Heckbert QEM decimation, Delaunay 2D/3D, `CalculatorFilter`, line probing, domain integration, and time steps — plus **Auto-Apply** and **Copy/Paste Filter Chains** (`Ctrl/Cmd+C`, `Ctrl/Cmd+V`).
 - **3D Volume Raymarching**: Full-precision `R32Float` 3D textures (no optional `float32-filterable` GPU feature required), Interleaved Gradient Noise (IGN) ray jittering, central-difference gradient Phong shading, interactive histogram-backed opacity curves, transfer-function presets, and a live **3D Volume Clip Plane**.
-- **Inspection & Quantitative Plots**: 3D raycast picking (`Reveal in Spreadsheet`), 2-point 3D distance ruler, searchable & CSV-exportable attribute spreadsheets, automatic `Plot Over Line` XY charts, and scalar histograms.
+- **Inspection & Quantitative Plots**: 3D raycast picking (`Block:` patch path + `Reveal in Spreadsheet`), 2-point 3D distance ruler, searchable & CSV-exportable attribute spreadsheets, automatic `Plot Over Line` XY charts, and scalar histograms.
 - **Broad Scientific Format Support**:
-  - **VTK & 3D Meshes**: Legacy `.vtk`, VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`), partitioned `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.pvd` time series, `.stl`, `.obj`, `.ply`, `.csv`/`.tsv`
+  - **VTK & 3D Meshes**: Legacy `.vtk`, VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`), partitioned `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.pvd` time series, **VTKHDF (`.vtkhdf`)**, `.stl`, `.obj`, `.ply`, `.csv`/`.tsv`
   - **Medical & Volumetric**: NIfTI-1 (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), Raw binary volumes (`.raw`, `.bin`, `.vol`)
-  - **CFD / CAE**: EnSight Gold (`.case`), OpenFOAM (`constant/polyMesh` + fields), XDMF (`.xdmf`, `.xmf` with XML, Binary, and pure-Rust HDF5 `Format="HDF"` + temporal collections)
+  - **CFD / CAE / FEA**: **CGNS (`.cgns`)**, **Exodus II (`.exo`, `.e`, `.ex2`)**, EnSight Gold (`.case`), OpenFOAM (`constant/polyMesh` + fields), XDMF (`.xdmf`, `.xmf` with XML, Binary, and pure-Rust HDF5 `Format="HDF"` + temporal collections)
 - **Publication & Portable Web Exports**:
-  - High-resolution **PNG** screenshots (with optional **transparent background** & **Scalar Color Bar**)
+  - High-resolution **PNG** screenshots (with optional **transparent background**, **Scalar Color Bar**, **`Time:`** badge & **Viewport Annotations**)
   - Pure-Rust animated **GIF89a** exports (360° turntables & time series)
   - Binary **glTF 2.0 (`.glb`)** with optional baked colormap vertex colors
   - Self-contained interactive **WebGL2 `.html`** 3D viewers you can share and open in any browser
@@ -89,7 +90,7 @@ ParaViz is a clean-slate Rust + WebGPU (`wgpu`) + `egui` implementation rather t
 | --- | --- | --- |
 | **`SurfaceWithEdges`** | Polygon-offset / two-pass overlay that can Z-fight at grazing angles | **Single-pass barycentric WGSL shader** with screen-space `fwidth()` anti-aliasing and zero Z-fighting |
 | **3D Volume Raymarching** | Hardware 3D texture filtering; slicing banding at coarse steps | **`R32Float` 3D textures** with manual WGSL trilinear filtering, **IGN ray jittering**, and live **3D Volume Clip Plane** |
-| **Properties Editing** | Manual **Apply** step before seeing changes | **Auto-Apply** on by default (with explicit **Apply / Discard** toggle for heavy pipelines) |
+| **Properties Editing** | Manual **Apply** step before seeing changes | **Auto-Apply** on by default (with explicit **Apply / Discard** toggle & **async Cancel** for heavy pipelines) |
 | **Filter Reuse** | Long-standing feature request (`#21123`) | Built-in **Copy / Paste Filter & Filter Chain** (`Ctrl/Cmd+C` / `Ctrl/Cmd+V`) |
 | **Isosurfaces** | CPU Marching Cubes / Contour filters | Parallel `rayon` Marching Cubes with spatial edge-key vertex welding + **WebGPU Compute `GpuContourEngine`** |
 | **Streamlines & Tubes** | Frenet-frame tubes (can twist at inflections); `CellData` vector friction | Twist-free **parallel-transport (Bishop) tubes**; automatic `CellData` vector conversion in `StreamTracer` |
@@ -97,7 +98,7 @@ ParaViz is a clean-slate Rust + WebGPU (`wgpu`) + `egui` implementation rather t
 | **Portable Sharing** | Requires external `vtk.js` / Glance tooling for web views | Built-in **GIF89a** turntables, **`.glb`** with baked colors, and standalone **WebGL2 `.html`** viewers |
 | **Footprint** | Multi-hundred-MB C++/Qt/Python distribution | Single self-contained native binary or browser WebGPU/Wasm app |
 
-> **Current Scope (`v0.2.x`)**: Focused on single-workstation visualization, batch CLI rendering, and pure-Rust/WebGPU workflows with zero VTK C++ dependency. Distributed MPI / `pvserver`, OSPRay/OptiX path tracing, standalone VTKHDF / raw `.h5` (outside XDMF), CGNS, Exodus II, Silo, CAD B-Rep readers, in-GUI Python scripting, and Catalyst/Ascent co-processing are not in current scope.
+> **Current Scope (`v0.2.x`)**: Focused on single-workstation visualization, batch CLI rendering, and pure-Rust/WebGPU workflows with zero VTK C++ dependency. Distributed MPI / `pvserver`, OSPRay/OptiX path tracing, Silo/Plot3D/CAD B-Rep readers, in-GUI Python scripting, and Catalyst/Ascent co-processing are out of current scope.
 
 See the full comparison and shortcut mapping in [**Differences from Classic ParaView**](docs/differences-from-paraview.md).
 
@@ -114,13 +115,13 @@ cargo run -p paraviz-app -- demo wavelet -o wavelet.png --width 1280 --height 72
 # Render a dataset with chained filters, EDL, 4x MSAA, transparent background & color bar
 cargo run -p paraviz-app -- render volume.vti -o iso.png \
   --filter contour:140 --repr edges --cmap viridis --color-by RTData \
-  --edl --msaa 4 --transparent --scalar-bar
+  --edl --msaa 4 --transparent --scalar-bar --time-annotation
 
 # Export a 360-degree animated GIF turntable
 cargo run -p paraviz-app -- render mesh.vtu -o spin.gif --turntable 36 --edl
 
 # Inspect dataset metadata, bounds, and scalar ranges
-cargo run -p paraviz-app -- info mesh.vtu
+cargo run -p paraviz-app -- info mesh.vtkhdf
 
 # Convert to binary glTF (.glb) or an interactive WebGL2 (.html) viewer
 cargo run -p paraviz-app -- convert mesh.vtu viewer.html
@@ -176,7 +177,8 @@ Full end-user and developer guides live in the [**Documentation Hub**](docs/READ
 - [**Differences from Classic ParaView**](docs/differences-from-paraview.md) — UX improvements, shortcut mapping, and feature scope
 - [**Desktop Studio GUI & Headless CLI**](docs/gui-and-cli.md) — Complete controls, keyboard/mouse shortcuts (`F1`), and CLI reference
 - [**File Formats & I/O**](docs/file-formats.md) — Supported VTK, 3D, medical, and CFD formats & exports
-- [**Sources & Filters Reference**](docs/filters-and-sources.md) — All 14 procedural sources, 37+ filters, and `CalculatorFilter` syntax
+- [**Sources & Filters Reference**](docs/filters-and-sources.md) — Complete per-parameter reference for all 14 procedural sources, 37 filters, and `CalculatorFilter` syntax
+- [**Rendering, Appearance & Scene Parameters**](docs/rendering-and-scene.md) — Every parameter for `ActorStyle`, colormaps, `TransferFunction`, `Camera`, `SceneSettings`, `ScalarBarConfig`, and annotations
 - [**Rust API Guide (& Python Bindings)**](docs/rust-api.md) — High-level `ParaViz` API, `DataSet` construction, and `paraviz-py`
 - [**Architecture & WebGPU Rendering Pipeline**](docs/architecture.md) — Workspace crate breakdown, pipeline DAG, and WGSL shaders
 

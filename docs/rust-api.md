@@ -54,21 +54,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### DisplayHandle Reference (`pv.show(node_id)`)
 
-- `.visible(bool)`
+- `.visible(bool)` — Toggle visibility (`pv.hide(node_id)` sets `visible = false`)
 - `.representation(Representation)` — `Surface`, `SurfaceWithEdges`, `Wireframe`, `Points`, `PointGaussian`, `Volume`, `Outline`
-- `.colormap(ColorMapPreset)` / `.custom_colormap(ColorMap)`
+- `.colormap(ColorMapPreset)` / `.custom_colormap(ColorMap)` — Updates both `style.colormap` and `style.volume_tf.color_map`
 - `.color_by_point(array)` / `.color_by_point_component(array, component)` / `.color_by_cell(array)` / `.solid_color([r, g, b, a])`
-- `.scalar_range(min, max)` / `.auto_range(bool)`
-- `.opacity(f32)` / `.point_size(f32)` / `.line_width(f32)`
-- `.edge_color([r, g, b, a])` / `.edge_width(f32)`
-- `.volume_tf(TransferFunction)` / `.volume_step_size(f32)`
+- `.scalar_range(min, max)` / `.auto_range(bool)` — Manual or auto-fitted scalar bounds (updates `volume_tf.scalar_range` too)
+- `.opacity(f32)` *(clamped `0.0..=1.0`)* / `.point_size(f32)` *(min `1.0`)* / `.line_width(f32)` *(min `0.5`)*
+- `.edge_color([r, g, b, a])` / `.edge_width(f32)` *(min `0.25`)*
+- `.volume_tf(TransferFunction)` / `.volume_step_size(f32)` *(min `0.05`)*
+- `.hide_block(path_or_name)` / `.show_block(path_or_name)` — Per-block visibility inside `MultiBlockDataSet`
+- `.block_color(path_or_name, [r, g, b, a])` / `.clear_block_color(path_or_name)` — Per-block RGBA color override
+
+For every underlying `ActorStyle`, `SceneSettings`, `Camera`, `ScalarBarConfig`, and `ViewportAnnotation` field, see [Rendering, Style & Scene Parameters](rendering-and-scene.md).
 
 ### Session Operations
 
 | Method | Purpose |
 | --- | --- |
 | `ParaViz::new()` / `ParaViz::headless()` | Create session (lazy vs. eager headless WebGPU initialization) |
-| `open(path)` | Open any supported file (`.pvd` creates `PvdSeriesSource`, others create `VtkFileSource`) |
+| `open(path)` / `open_with_reader(path, reader)` | Open any supported file using auto-detection or an explicit `DatasetReader` (`.pvd` creates `PvdSeriesSource`) |
+| `open_preloaded(path, reader, ds, time_steps)` | Register a pre-decoded dataset (e.g., from a background worker) without re-reading disk on first evaluation |
 | `open_raw_volume(label, path, &desc)` | Load a raw binary 3D volume using `RawVolumeDescriptor` |
 | `add_source(label, src)` / `add_source_cfg(label, cfg)` | Add custom `Source` or serializable `SourceConfig` |
 | `add_dataset(label, ds)` | Wrap an in-memory `DataSet` via `InMemorySource` |
@@ -77,11 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `resample_with_dataset(src, dst)` / `append_nodes(inputs)` | Convenience multi-input pipeline helpers |
 | `stream_tracer_with_custom_source(field, seeds, cfg)` | Trace streamlines from a custom seed geometry node (`StreamTracerWithCustomSource`) |
 | `update_source_cfg(id, cfg)` / `update_filter_cfg(id, cfg)` | Mutate a configurable node and invalidate downstream caches |
+| `seed_evaluated(id, arc_ds, time)` | Populate an already-evaluated dataset into the pipeline cache (for background worker integration) |
 | `gpu_contour(label, input, field_opt, iso)` | Run WebGPU Compute Marching Cubes (`GpuContourEngine`) on an `ImageData` node |
 | `set_time(t)` / `all_time_steps()` | Switch active time step and query source time steps |
 | `evaluate(id)` / `update_visible()` / `update_all()` | Execute demand-driven pipeline nodes |
-| `pick(px, py, width, height)` | Cast a 3D raycast pick query against visible actors (`PickResult`) |
-| `render_rgba(w, h)` / `render_png(path, w, h)` | Render headless `Rgba8Unorm` pixels or PNG (supports `settings.transparent_background` and `settings.show_scalar_bar`) |
+| `pick(px, py, width, height)` | Cast a 3D raycast pick query against visible actors (`PickResult`, including `block_path`) |
+| `render_rgba(w, h)` / `render_png(path, w, h)` | Render headless `Rgba8Unorm` pixels or PNG (supports `transparent_background`, `show_scalar_bar`, `ScalarBarConfig`, `show_time_annotation`, and `annotations`) |
 | `render_turntable_gif(...)` / `render_timeseries_gif(...)` | Render 360-degree turntable or time-series animated GIF89a files |
 | `export_dataset(id, path)` / `export_glb(id, path, use_cmap)` / `export_html(id, path, use_cmap)` | Export evaluated node to VTK/mesh/CSV/NIfTI/MHA, binary glTF 2.0, or interactive WebGL2 `.html` |
 | `save_state_json()` / `load_state_json(json)` | Save & restore full pipeline, styles, camera, and `SceneSettings` |
