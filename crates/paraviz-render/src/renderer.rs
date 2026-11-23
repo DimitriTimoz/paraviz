@@ -1,8 +1,9 @@
 //! WebGPU rendering engine with actor-level GPU caching, headless RGBA/PNG export,
+//! Eye-Dome Lighting (EDL), 4x MSAA, 3-point ParaView Light Kit, 3D viewport widgets,
 //! and multi-representation scientific visualization pipelines.
 
 use crate::mesh_prep::{
-    self, GizmoVertex, LineVertex, PointInstance, SurfaceVertex,
+    self, GizmoVertex, LineVertex, PointInstance, SurfaceVertex, WidgetVertex,
 };
 use crate::scene::{ActorStyle, ColorBy, RenderScene, Representation, SceneActor};
 use crate::shaders;
@@ -60,6 +61,7 @@ struct SurfaceUniforms {
     camera_pos: [f32; 4],
     light_dir: [f32; 4],
     fill_light_dir: [f32; 4],
+    back_light_dir: [f32; 4],
     solid_color: [f32; 4],
     edge_color: [f32; 4],
     nan_color: [f32; 4],
@@ -131,6 +133,25 @@ struct VolumeUniforms {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct EdlUniforms {
+    near: f32,
+    far: f32,
+    edl_strength: f32,
+    edl_radius: f32,
+    orthographic: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct WidgetUniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct GizmoUniforms {
     mvp: [[f32; 4]; 4],
     light_dir: [f32; 4],
@@ -149,13 +170,14 @@ struct CubeVertex {
 }
 
 struct PipelineBundle {
-    format: wgpu::TextureFormat,
     bg_pipeline: wgpu::RenderPipeline,
     surface_opaque_pipeline: wgpu::RenderPipeline,
     surface_alpha_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     volume_pipeline: wgpu::RenderPipeline,
+    widget_tri_pipeline: wgpu::RenderPipeline,
+    widget_line_pipeline: wgpu::RenderPipeline,
     gizmo_pipeline: wgpu::RenderPipeline,
 }
 
@@ -167,6 +189,31 @@ struct RenderTargets {
     #[allow(dead_code)]
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+}
+
+struct MsaaTargets {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    #[allow(dead_code)]
+    color_texture: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+}
+
+struct EdlTargets {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    #[allow(dead_code)]
+    color_texture: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    tex_bind_group: wgpu::BindGroup,
 }
 
 enum CachedGeometry {
@@ -216,20 +263,26 @@ struct CachedActor {
 pub struct WebGpuRenderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    pipelines: PipelineBundle,
-    offscreen_pipelines: Option<PipelineBundle>,
+    target_format: wgpu::TextureFormat,
+    pipelines: HashMap<(wgpu::TextureFormat, u32), PipelineBundle>,
+    edl_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     offscreen_targets: Option<RenderTargets>,
     external_depth: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    msaa_targets: Option<MsaaTargets>,
+    edl_targets: Option<EdlTargets>,
 
     // Shared bind group layouts
     uniform_bgl: wgpu::BindGroupLayout,
     lut_bgl: wgpu::BindGroupLayout,
     volume_bgl: wgpu::BindGroupLayout,
+    edl_tex_bgl: wgpu::BindGroupLayout,
     lut_sampler: wgpu::Sampler,
 
     // Shared static buffers & pass resources
     bg_uniform_buf: wgpu::Buffer,
     bg_bind_group: wgpu::BindGroup,
+    edl_uniform_buf: wgpu::Buffer,
+    edl_uniform_bind_group: wgpu::BindGroup,
     point_quad_buf: wgpu::Buffer,
     volume_cube_vb: wgpu::Buffer,
     volume_cube_ib: wgpu::Buffer,
@@ -244,6 +297,14 @@ pub struct WebGpuRenderer {
     bbox_uniform_buf: wgpu::Buffer,
     bbox_bind_group: wgpu::BindGroup,
     bbox_lut_bind_group: wgpu::BindGroup,
+
+    // 3D Viewport Widget overlay buffers
+    widget_tri_vb: Option<wgpu::Buffer>,
+    widget_tri_count: u32,
+    widget_line_vb: Option<wgpu::Buffer>,
+    widget_line_count: u32,
+    widget_uniform_buf: wgpu::Buffer,
+    widget_bind_group: wgpu::BindGroup,
 
     // Per-actor GPU resource cache
     actor_cache: HashMap<u64, CachedActor>,
@@ -351,6 +412,32 @@ impl WebGpuRenderer {
             ],
         });
 
+        let edl_tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paraviz-edl-tex-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("paraviz-lut-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -362,7 +449,11 @@ impl WebGpuRenderer {
             ..Default::default()
         });
 
-        let pipelines = create_pipelines(&device, target_format, &uniform_bgl, &lut_bgl, &volume_bgl);
+        let mut pipelines = HashMap::new();
+        pipelines.insert(
+            (target_format, 1),
+            create_pipelines(&device, target_format, 1, &uniform_bgl, &lut_bgl, &volume_bgl),
+        );
 
         let bg_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("paraviz-bg-uniform"),
@@ -378,6 +469,29 @@ impl WebGpuRenderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: bg_uniform_buf.as_entire_binding(),
+            }],
+        });
+
+        let edl_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("paraviz-edl-uniform"),
+            contents: bytemuck::bytes_of(&EdlUniforms {
+                near: 0.01,
+                far: 1000.0,
+                edl_strength: 1.0,
+                edl_radius: 2.0,
+                orthographic: 0,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let edl_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paraviz-edl-uniform-bg"),
+            layout: &uniform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: edl_uniform_buf.as_entire_binding(),
             }],
         });
 
@@ -472,7 +586,12 @@ impl WebGpuRenderer {
             }],
         });
         let default_lut = ColorMap::default();
-        let bbox_lut_tex = create_lut_texture(&device, &queue, &default_lut.to_rgba8_lut(LUT_WIDTH), "paraviz-bbox-lut");
+        let bbox_lut_tex = create_lut_texture(
+            &device,
+            &queue,
+            &default_lut.to_rgba8_lut(LUT_WIDTH),
+            "paraviz-bbox-lut",
+        );
         let bbox_lut_view = bbox_lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bbox_lut_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("paraviz-bbox-lut-bg"),
@@ -489,19 +608,41 @@ impl WebGpuRenderer {
             ],
         });
 
+        let widget_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("paraviz-widget-uniform"),
+            contents: bytemuck::bytes_of(&WidgetUniforms {
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let widget_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paraviz-widget-bg"),
+            layout: &uniform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: widget_uniform_buf.as_entire_binding(),
+            }],
+        });
+
         Self {
             device,
             queue,
+            target_format,
             pipelines,
-            offscreen_pipelines: None,
+            edl_pipelines: HashMap::new(),
             offscreen_targets: None,
             external_depth: None,
+            msaa_targets: None,
+            edl_targets: None,
             uniform_bgl,
             lut_bgl,
             volume_bgl,
+            edl_tex_bgl,
             lut_sampler,
             bg_uniform_buf,
             bg_bind_group,
+            edl_uniform_buf,
+            edl_uniform_bind_group,
             point_quad_buf,
             volume_cube_vb,
             volume_cube_ib,
@@ -514,6 +655,12 @@ impl WebGpuRenderer {
             bbox_uniform_buf,
             bbox_bind_group,
             bbox_lut_bind_group,
+            widget_tri_vb: None,
+            widget_tri_count: 0,
+            widget_line_vb: None,
+            widget_line_count: 0,
+            widget_uniform_buf,
+            widget_bind_group,
             actor_cache: HashMap::new(),
         }
     }
@@ -523,9 +670,19 @@ impl WebGpuRenderer {
         &self.device
     }
 
+    /// Returns a cloned `Arc<wgpu::Device>` for sharing with compute engines.
+    pub fn device_arc(&self) -> Arc<wgpu::Device> {
+        Arc::clone(&self.device)
+    }
+
     /// Returns the underlying WebGPU queue.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Returns a cloned `Arc<wgpu::Queue>` for sharing with compute engines.
+    pub fn queue_arc(&self) -> Arc<wgpu::Queue> {
+        Arc::clone(&self.queue)
     }
 
     /// Renders `scene` into an internal `Rgba8Unorm` texture (`RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC`)
@@ -548,27 +705,14 @@ impl WebGpuRenderer {
             self.offscreen_targets = Some(create_render_targets(&self.device, width, height));
         }
 
-        if self.pipelines.format != wgpu::TextureFormat::Rgba8Unorm
-            && self.offscreen_pipelines.is_none()
-        {
-            self.offscreen_pipelines = Some(create_pipelines(
-                &self.device,
-                wgpu::TextureFormat::Rgba8Unorm,
-                &self.uniform_bgl,
-                &self.lut_bgl,
-                &self.volume_bgl,
-            ));
-        }
-
         let targets = self.offscreen_targets.take().unwrap();
-        let use_offscreen_bundle = self.pipelines.format != wgpu::TextureFormat::Rgba8Unorm;
         let res = self.render_into_views(
             scene,
+            wgpu::TextureFormat::Rgba8Unorm,
             &targets.color_view,
             &targets.depth_view,
             width,
             height,
-            use_offscreen_bundle,
         );
         self.offscreen_targets = Some(targets);
         res?;
@@ -592,11 +736,18 @@ impl WebGpuRenderer {
             None => true,
         };
         if need_depth {
-            let (tex, view) = create_depth_texture(&self.device, width, height);
+            let (tex, view) = create_depth_texture(&self.device, width, height, 1, false);
             self.external_depth = Some((width, height, tex, view));
         }
         let (_, _, depth_tex, depth_view) = self.external_depth.take().unwrap();
-        let res = self.render_into_views(scene, color_view, &depth_view, width, height, false);
+        let res = self.render_into_views(
+            scene,
+            self.target_format,
+            color_view,
+            &depth_view,
+            width,
+            height,
+        );
         self.external_depth = Some((width, height, depth_tex, depth_view));
         res
     }
@@ -697,14 +848,69 @@ impl WebGpuRenderer {
         Ok(())
     }
 
+    fn ensure_pipeline_bundle(&mut self, format: wgpu::TextureFormat, sample_count: u32) {
+        self.pipelines.entry((format, sample_count)).or_insert_with(|| {
+            create_pipelines(
+                &self.device,
+                format,
+                sample_count,
+                &self.uniform_bgl,
+                &self.lut_bgl,
+                &self.volume_bgl,
+            )
+        });
+    }
+
+    fn ensure_edl_pipeline(&mut self, format: wgpu::TextureFormat) {
+        self.edl_pipelines.entry(format).or_insert_with(|| {
+            create_edl_pipeline(&self.device, format, &self.uniform_bgl, &self.edl_tex_bgl)
+        });
+    }
+
+    fn ensure_msaa_targets(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let need = match &self.msaa_targets {
+            Some(t) => t.width != width || t.height != height || t.format != format,
+            None => true,
+        };
+        if need {
+            self.msaa_targets = Some(create_msaa_targets(&self.device, width, height, format));
+        }
+    }
+
+    fn ensure_edl_targets(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let need = match &self.edl_targets {
+            Some(t) => t.width != width || t.height != height || t.format != format,
+            None => true,
+        };
+        if need {
+            self.edl_targets = Some(create_edl_targets(
+                &self.device,
+                width,
+                height,
+                format,
+                &self.edl_tex_bgl,
+            ));
+        }
+    }
+
     fn render_into_views(
         &mut self,
         scene: &RenderScene,
+        format: wgpu::TextureFormat,
         color_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-        use_offscreen_bundle: bool,
     ) -> Result<(), RenderError> {
         let aspect = width as f32 / height as f32;
         let view_mat = scene.camera.view_matrix();
@@ -712,14 +918,17 @@ impl WebGpuRenderer {
         let view_proj = proj_mat * view_mat;
         let inv_view_proj = view_proj.inverse();
 
-        // Camera-relative key and fill lights (ParaView light-kit style).
+        // Camera-relative 3-point ParaView Light Kit (Key, Fill, Rim/Back).
         let inv_view = view_mat.inverse();
         let key_world = inv_view
-            .transform_vector3(Vec3::new(0.32, 0.48, 0.82))
-            .normalize_or(Vec3::new(0.3, 0.5, 0.8));
+            .transform_vector3(Vec3::new(0.35, 0.55, 0.75))
+            .normalize_or(Vec3::new(0.35, 0.55, 0.75));
         let fill_world = inv_view
-            .transform_vector3(Vec3::new(-0.55, -0.30, 0.45))
-            .normalize_or(Vec3::new(-0.5, -0.3, 0.5));
+            .transform_vector3(Vec3::new(-0.60, -0.35, 0.40))
+            .normalize_or(Vec3::new(-0.60, -0.35, 0.40));
+        let back_world = inv_view
+            .transform_vector3(Vec3::new(-0.35, 0.65, -0.65))
+            .normalize_or(Vec3::new(-0.35, 0.65, -0.65));
 
         // Update background uniforms.
         self.queue.write_buffer(
@@ -761,6 +970,7 @@ impl WebGpuRenderer {
                 scene.camera.position,
                 key_world,
                 fill_world,
+                back_world,
                 [width as f32, height as f32],
                 (smin as f32, smax as f32),
             );
@@ -797,8 +1007,44 @@ impl WebGpuRenderer {
             }
         }
 
+        // Prepare 3D interactive viewport widget overlays.
+        if !scene.widgets.is_empty() {
+            let prep = mesh_prep::prepare_widgets(&scene.widgets);
+            self.widget_tri_count = prep.triangles.len() as u32;
+            self.widget_line_count = prep.lines.len() as u32;
+            if !prep.triangles.is_empty() {
+                self.widget_tri_vb = Some(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("paraviz-widget-tri-vb"),
+                        contents: bytemuck::cast_slice(&prep.triangles),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                ));
+            }
+            if !prep.lines.is_empty() {
+                self.widget_line_vb = Some(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("paraviz-widget-line-vb"),
+                        contents: bytemuck::cast_slice(&prep.lines),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                ));
+            }
+            self.queue.write_buffer(
+                &self.widget_uniform_buf,
+                0,
+                bytemuck::bytes_of(&WidgetUniforms {
+                    view_proj: view_proj.to_cols_array_2d(),
+                }),
+            );
+        } else {
+            self.widget_tri_count = 0;
+            self.widget_line_count = 0;
+        }
+
         // Update orientation axes gizmo uniform (rotation-only view matrix).
-        if scene.settings.show_axes_gizmo {
+        let draw_gizmo = scene.settings.show_axes_gizmo && self.gizmo_vertex_count > 0;
+        if draw_gizmo {
             let mut rot = view_mat;
             rot.w_axis = Vec4::new(0.0, 0.0, -3.2, 1.0);
             let gizmo_proj =
@@ -814,11 +1060,36 @@ impl WebGpuRenderer {
             );
         }
 
-        let bundle = if use_offscreen_bundle {
-            self.offscreen_pipelines.as_ref().unwrap()
-        } else {
-            &self.pipelines
-        };
+        // Determine sample count & render path (EDL vs 4x MSAA vs 1x direct).
+        let clamped_msaa = clamp_msaa_samples(scene.settings.msaa_samples);
+        let edl_enabled = scene.settings.edl_enabled;
+        let effective_samples = if edl_enabled { 1 } else { clamped_msaa };
+
+        self.ensure_pipeline_bundle(format, effective_samples);
+        if edl_enabled {
+            self.ensure_edl_pipeline(format);
+            self.ensure_edl_targets(width, height, format);
+            let near = scene.camera.near.max(1e-5);
+            let far = scene.camera.far.max(near + 1e-3);
+            self.queue.write_buffer(
+                &self.edl_uniform_buf,
+                0,
+                bytemuck::bytes_of(&EdlUniforms {
+                    near,
+                    far,
+                    edl_strength: scene.settings.edl_strength.max(0.0),
+                    edl_radius: 2.0,
+                    orthographic: u32::from(scene.camera.orthographic),
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
+            );
+        } else if effective_samples == 4 {
+            self.ensure_msaa_targets(width, height, format);
+        }
+
+        let bundle = self.pipelines.get(&(format, effective_samples)).unwrap();
 
         let mut encoder = self
             .device
@@ -826,20 +1097,41 @@ impl WebGpuRenderer {
                 label: Some("paraviz-render-encoder"),
             });
 
+        // Choose main geometry pass targets.
+        let (pass_color_view, pass_resolve_target, pass_depth_view, pass_color_store) =
+            if edl_enabled {
+                let edl = self.edl_targets.as_ref().unwrap();
+                (&edl.color_view, None, &edl.depth_view, wgpu::StoreOp::Store)
+            } else if effective_samples == 4 {
+                let msaa = self.msaa_targets.as_ref().unwrap();
+                if draw_gizmo {
+                    (&msaa.color_view, None, &msaa.depth_view, wgpu::StoreOp::Store)
+                } else {
+                    (
+                        &msaa.color_view,
+                        Some(color_view),
+                        &msaa.depth_view,
+                        wgpu::StoreOp::Discard,
+                    )
+                }
+            } else {
+                (color_view, None, depth_view, wgpu::StoreOp::Store)
+            };
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("paraviz-main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
+                    view: pass_color_view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: pass_resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
+                        store: pass_color_store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
+                    view: pass_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -960,27 +1252,84 @@ impl WebGpuRenderer {
                     pass.draw_indexed(0..36, 0, 0..1);
                 }
             }
+
+            // 6. 3D Interactive Viewport Widget overlays (wireframe lines + translucent guides)
+            if self.widget_line_count > 0
+                && let Some(vb) = &self.widget_line_vb
+            {
+                pass.set_pipeline(&bundle.widget_line_pipeline);
+                pass.set_bind_group(0, &self.widget_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.draw(0..self.widget_line_count, 0..1);
+            }
+            if self.widget_tri_count > 0
+                && let Some(vb) = &self.widget_tri_vb
+            {
+                pass.set_pipeline(&bundle.widget_tri_pipeline);
+                pass.set_bind_group(0, &self.widget_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.draw(0..self.widget_tri_count, 0..1);
+            }
         }
 
-        // 6. 3D Orientation Axes Gizmo in bottom-left corner
-        if scene.settings.show_axes_gizmo && self.gizmo_vertex_count > 0 {
-            let gizmo_size = (width.min(height) as f32 * 0.16).clamp(48.0, 140.0);
-            let margin = 10.0_f32.min((width as f32 - gizmo_size).max(0.0));
-            let gy = (height as f32 - gizmo_size - margin).max(0.0);
-
-            let mut gizmo_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("paraviz-gizmo-pass"),
+        // 7. Fullscreen Eye-Dome Lighting (EDL) post-process pass into final color_view
+        if edl_enabled {
+            let edl_pipeline = self.edl_pipelines.get(&format).unwrap();
+            let edl_targets = self.edl_targets.as_ref().unwrap();
+            let mut edl_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("paraviz-edl-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            edl_pass.set_pipeline(edl_pipeline);
+            edl_pass.set_bind_group(0, &self.edl_uniform_bind_group, &[]);
+            edl_pass.set_bind_group(1, &edl_targets.tex_bind_group, &[]);
+            edl_pass.draw(0..3, 0..1);
+        }
+
+        // 8. 3D Orientation Axes Gizmo in bottom-left corner
+        if draw_gizmo {
+            let gizmo_size = (width.min(height) as f32 * 0.16).clamp(48.0, 140.0);
+            let margin = 10.0_f32.min((width as f32 - gizmo_size).max(0.0));
+            let gy = (height as f32 - gizmo_size - margin).max(0.0);
+
+            let (gizmo_color_view, gizmo_resolve, gizmo_depth_view, gizmo_store) =
+                if effective_samples == 4 {
+                    let msaa = self.msaa_targets.as_ref().unwrap();
+                    (
+                        &msaa.color_view,
+                        Some(color_view),
+                        &msaa.depth_view,
+                        wgpu::StoreOp::Discard,
+                    )
+                } else {
+                    (color_view, None, depth_view, wgpu::StoreOp::Store)
+                };
+
+            let mut gizmo_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("paraviz-gizmo-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: gizmo_color_view,
+                    depth_slice: None,
+                    resolve_target: gizmo_resolve,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: gizmo_store,
+                    },
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
+                    view: gizmo_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -1066,7 +1415,6 @@ impl WebGpuRenderer {
                 None
             };
 
-            // Allocate uniform buffer sized for the largest uniform struct (SurfaceUniforms = 272 bytes).
             let uniform_size = std::mem::size_of::<SurfaceUniforms>() as u64;
             let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("paraviz-actor-uniform"),
@@ -1115,6 +1463,14 @@ impl WebGpuRenderer {
             upload_lut_texture(&self.queue, &cached.tf_texture, &bytes);
             cached.volume_tf = actor.style.volume_tf.clone();
         }
+    }
+}
+
+fn clamp_msaa_samples(samples: u32) -> u32 {
+    if samples <= 1 {
+        1
+    } else {
+        4
     }
 }
 
@@ -1265,6 +1621,7 @@ fn write_actor_uniforms(
     camera_pos: Vec3,
     light_dir: Vec3,
     fill_light_dir: Vec3,
+    back_light_dir: Vec3,
     viewport_size: [f32; 2],
     scalar_range: (f32, f32),
 ) {
@@ -1281,6 +1638,7 @@ fn write_actor_uniforms(
                 camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
                 light_dir: [light_dir.x, light_dir.y, light_dir.z, 0.0],
                 fill_light_dir: [fill_light_dir.x, fill_light_dir.y, fill_light_dir.z, 0.0],
+                back_light_dir: [back_light_dir.x, back_light_dir.y, back_light_dir.z, 0.0],
                 solid_color,
                 edge_color: style.edge_color,
                 nan_color: style.colormap.nan_color,
@@ -1437,7 +1795,13 @@ fn create_depth_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    sample_count: u32,
+    texture_binding: bool,
 ) -> (wgpu::Texture, wgpu::TextureView) {
+    let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    if texture_binding {
+        usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+    }
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("paraviz-depth-texture"),
         size: wgpu::Extent3d {
@@ -1446,10 +1810,10 @@ fn create_depth_texture(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1474,7 +1838,7 @@ fn create_render_targets(device: &wgpu::Device, width: u32, height: u32) -> Rend
         view_formats: &[],
     });
     let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let (depth_texture, depth_view) = create_depth_texture(device, width, height);
+    let (depth_texture, depth_view) = create_depth_texture(device, width, height, 1, false);
     RenderTargets {
         width,
         height,
@@ -1485,13 +1849,144 @@ fn create_render_targets(device: &wgpu::Device, width: u32, height: u32) -> Rend
     }
 }
 
+fn create_msaa_targets(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> MsaaTargets {
+    let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("paraviz-msaa4x-color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 4,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let (depth_texture, depth_view) = create_depth_texture(device, width, height, 4, false);
+    MsaaTargets {
+        width,
+        height,
+        format,
+        color_texture,
+        color_view,
+        depth_texture,
+        depth_view,
+    }
+}
+
+fn create_edl_targets(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    edl_tex_bgl: &wgpu::BindGroupLayout,
+) -> EdlTargets {
+    let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("paraviz-edl-scene-color"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let (depth_texture, depth_view) = create_depth_texture(device, width, height, 1, true);
+    let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("paraviz-edl-tex-bg"),
+        layout: edl_tex_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&depth_view),
+            },
+        ],
+    });
+    EdlTargets {
+        width,
+        height,
+        format,
+        color_texture,
+        color_view,
+        depth_texture,
+        depth_view,
+        tex_bind_group,
+    }
+}
+
+fn create_edl_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    uniform_bgl: &wgpu::BindGroupLayout,
+    edl_tex_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let edl_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("paraviz-edl-shader"),
+        source: wgpu::ShaderSource::Wgsl(shaders::EDL_WGSL.into()),
+    });
+    let edl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("paraviz-edl-layout"),
+        bind_group_layouts: &[Some(uniform_bgl), Some(edl_tex_bgl)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("paraviz-edl-pipeline"),
+        layout: Some(&edl_layout),
+        vertex: wgpu::VertexState {
+            module: &edl_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &edl_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_pipelines(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
+    sample_count: u32,
     uniform_bgl: &wgpu::BindGroupLayout,
     lut_bgl: &wgpu::BindGroupLayout,
     volume_bgl: &wgpu::BindGroupLayout,
 ) -> PipelineBundle {
+    let multisample = wgpu::MultisampleState {
+        count: sample_count,
+        mask: !0,
+        alpha_to_coverage_enabled: false,
+    };
+
     let bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("paraviz-bg-shader"),
         source: wgpu::ShaderSource::Wgsl(shaders::BACKGROUND_WGSL.into()),
@@ -1511,6 +2006,10 @@ fn create_pipelines(
     let volume_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("paraviz-volume-shader"),
         source: wgpu::ShaderSource::Wgsl(shaders::VOLUME_WGSL.into()),
+    });
+    let widget_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("paraviz-widget-shader"),
+        source: wgpu::ShaderSource::Wgsl(shaders::WIDGET_WGSL.into()),
     });
     let gizmo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("paraviz-gizmo-shader"),
@@ -1560,7 +2059,7 @@ fn create_pipelines(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample,
         multiview_mask: None,
         cache: None,
     });
@@ -1628,7 +2127,7 @@ fn create_pipelines(
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample,
             multiview_mask: None,
             cache: None,
         })
@@ -1682,7 +2181,7 @@ fn create_pipelines(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample,
         multiview_mask: None,
         cache: None,
     });
@@ -1743,7 +2242,7 @@ fn create_pipelines(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample,
         multiview_mask: None,
         cache: None,
     });
@@ -1787,10 +2286,70 @@ fn create_pipelines(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample,
         multiview_mask: None,
         cache: None,
     });
+
+    let widget_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<WidgetVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 12,
+                shader_location: 1,
+            },
+        ],
+    };
+
+    let make_widget_pipeline = |label: &str, topology: wgpu::PrimitiveTopology, depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&uniform_only_layout),
+            vertex: wgpu::VertexState {
+                module: &widget_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(widget_vbl.clone())],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &widget_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample,
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+
+    let widget_tri_pipeline =
+        make_widget_pipeline("paraviz-widget-tri", wgpu::PrimitiveTopology::TriangleList, false);
+    let widget_line_pipeline =
+        make_widget_pipeline("paraviz-widget-line", wgpu::PrimitiveTopology::LineList, true);
 
     let gizmo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("paraviz-gizmo-pipeline"),
@@ -1842,19 +2401,20 @@ fn create_pipelines(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample,
         multiview_mask: None,
         cache: None,
     });
 
     PipelineBundle {
-        format,
         bg_pipeline,
         surface_opaque_pipeline,
         surface_alpha_pipeline,
         line_pipeline,
         point_pipeline,
         volume_pipeline,
+        widget_tri_pipeline,
+        widget_line_pipeline,
         gizmo_pipeline,
     }
 }

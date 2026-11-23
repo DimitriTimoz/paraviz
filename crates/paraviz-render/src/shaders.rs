@@ -1,5 +1,6 @@
-//! WGSL shaders for background gradient, surface/edges, wireframe/outline,
-//! sphere-impostor point sprites, 3D volume raymarching, and orientation axes gizmo.
+//! WGSL shaders for background gradient, surface/edges (3-point ParaView Light Kit),
+//! wireframe/outline, sphere-impostor point sprites, 3D volume raymarching,
+//! Eye-Dome Lighting (EDL), 3D viewport widgets, and orientation axes gizmo.
 
 /// Fullscreen vertical gradient background shader.
 pub const BACKGROUND_WGSL: &str = r#"
@@ -39,7 +40,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// Surface and SurfaceWithEdges shader with single-pass fwidth() barycentric wireframe,
-/// two-sided Blinn-Phong scientific lighting, 1D LUT colormapping, and NaN handling.
+/// two-sided 3-point ParaView Light Kit + headlight Blinn-Phong lighting,
+/// 1D LUT colormapping, and NaN handling.
 pub const SURFACE_WGSL: &str = r#"
 struct SurfaceUniforms {
     view_proj: mat4x4<f32>,
@@ -47,6 +49,7 @@ struct SurfaceUniforms {
     camera_pos: vec4<f32>,
     light_dir: vec4<f32>,
     fill_light_dir: vec4<f32>,
+    back_light_dir: vec4<f32>,
     solid_color: vec4<f32>,
     edge_color: vec4<f32>,
     nan_color: vec4<f32>,
@@ -136,15 +139,38 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
         n = -n;
     }
 
-    let l1 = normalize(u.light_dir.xyz);
-    let l2 = normalize(u.fill_light_dir.xyz);
-    let diff1 = max(dot(n, l1), 0.0);
-    let diff2 = max(dot(n, l2), 0.0) * 0.28;
-    let h1 = normalize(l1 + v);
-    let spec1 = pow(max(dot(n, h1), 0.0), max(u.shininess, 1.0));
+    // ParaView 3-point Light Kit + Camera Headlight:
+    // 1) Warm Key Light
+    let l_key = normalize(u.light_dir.xyz);
+    let diff_key = max(dot(n, l_key), 0.0) * 0.72;
+    let key_tint = vec3<f32>(1.0, 0.98, 0.95);
 
-    var lit_rgb = base_rgba.rgb * (u.ambient + u.diffuse * (diff1 + diff2))
-        + vec3<f32>(1.0) * (u.specular * spec1);
+    // 2) Cool Fill Light (opposite side)
+    let l_fill = normalize(u.fill_light_dir.xyz);
+    let diff_fill = max(dot(n, l_fill), 0.0) * 0.32;
+    let fill_tint = vec3<f32>(0.84, 0.91, 1.0);
+
+    // 3) Rim / Back Light (defines silhouette and separates backside from dark bg)
+    let l_back = normalize(u.back_light_dir.xyz);
+    let diff_back = max(dot(n, l_back), 0.0) * 0.30;
+    let rim = pow(clamp(1.0 - abs(dot(n, v)), 0.0, 1.0), 2.5) * 0.16;
+    let back_tint = vec3<f32>(0.88, 0.93, 1.0);
+
+    // 4) Camera Headlight (guarantees facing surfaces never go dark)
+    let diff_head = max(dot(n, v), 0.0) * 0.24;
+
+    let light_contrib = key_tint * diff_key
+        + fill_tint * diff_fill
+        + back_tint * (diff_back + rim)
+        + vec3<f32>(diff_head);
+
+    let h_key = normalize(l_key + v);
+    let spec_key = pow(max(dot(n, h_key), 0.0), max(u.shininess, 1.0));
+    let spec_head = pow(max(dot(n, v), 0.0), max(u.shininess * 0.75, 1.0)) * 0.22;
+
+    var lit_rgb = base_rgba.rgb * (vec3<f32>(u.ambient) + u.diffuse * light_contrib)
+        + key_tint * (u.specular * spec_key)
+        + vec3<f32>(u.specular * spec_head);
 
     if (u.show_edges != 0u) {
         let d = max(fwidth(in.barycentric), vec3<f32>(1e-6));
@@ -223,7 +249,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Instanced quad sphere-impostor point shader with anti-aliased silhouette and pseudo-sphere shading.
+/// Instanced quad sphere-impostor point shader with anti-aliased silhouette and
+/// 3-point ParaView Light Kit + headlight pseudo-sphere shading.
 pub const POINT_WGSL: &str = r#"
 struct PointUniforms {
     view_proj: mat4x4<f32>,
@@ -309,12 +336,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let nz = sqrt(max(1.0 - r2, 0.0));
     let n = vec3<f32>(in.quad_uv.x, in.quad_uv.y, nz);
-    let l = normalize(vec3<f32>(0.35, 0.55, 0.75));
     let v = vec3<f32>(0.0, 0.0, 1.0);
-    let diff = max(dot(n, l), 0.0);
-    let h = normalize(l + v);
-    let spec = pow(max(dot(n, h), 0.0), 32.0);
-    let shaded = base_rgba.rgb * (0.28 + 0.72 * diff) + vec3<f32>(0.25 * spec);
+
+    // 3-point ParaView Light Kit + Headlight in view space
+    let l_key = normalize(vec3<f32>(0.35, 0.55, 0.75));
+    let l_fill = normalize(vec3<f32>(-0.60, -0.35, 0.40));
+    let l_back = normalize(vec3<f32>(-0.35, 0.65, -0.65));
+
+    let diff_key = max(dot(n, l_key), 0.0) * 0.72;
+    let diff_fill = max(dot(n, l_fill), 0.0) * 0.30;
+    let diff_back = max(dot(n, l_back), 0.0) * 0.25;
+    let diff_head = nz * 0.24;
+    let rim = pow(1.0 - nz, 2.5) * 0.16;
+
+    let light_rgb = vec3<f32>(1.0, 0.98, 0.95) * diff_key
+        + vec3<f32>(0.84, 0.91, 1.0) * diff_fill
+        + vec3<f32>(0.88, 0.93, 1.0) * (diff_back + rim)
+        + vec3<f32>(diff_head);
+
+    let h_key = normalize(l_key + v);
+    let spec = pow(max(dot(n, h_key), 0.0), 32.0);
+    let shaded = base_rgba.rgb * (vec3<f32>(0.18) + 0.82 * light_rgb) + vec3<f32>(0.25 * spec);
 
     return vec4<f32>(shaded, base_rgba.a * u.opacity * edge_alpha);
 }
@@ -516,6 +558,124 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4<f32>(accum_rgb, accum_a);
+}
+"#;
+
+/// Fullscreen Eye-Dome Lighting (EDL) post-processing shader sampling 8 neighbor depths.
+pub const EDL_WGSL: &str = r#"
+struct EdlUniforms {
+    near: f32,
+    far: f32,
+    edl_strength: f32,
+    edl_radius: f32,
+    orthographic: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0)
+var<uniform> u: EdlUniforms;
+
+@group(1) @binding(0)
+var color_tex: texture_2d<f32>;
+@group(1) @binding(1)
+var depth_tex: texture_depth_2d;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    var out: VsOut;
+    out.pos = vec4<f32>(positions[vid], 0.0, 1.0);
+    return out;
+}
+
+fn linearize_depth(d: f32) -> f32 {
+    if (u.orthographic != 0u) {
+        return u.near + d * (u.far - u.near);
+    }
+    return (u.near * u.far) / max(u.far - d * (u.far - u.near), 1e-6);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(depth_tex));
+    let px = clamp(vec2<i32>(in.pos.xy), vec2<i32>(0), dims - vec2<i32>(1));
+    let base_col = textureLoad(color_tex, px, 0);
+    let d_center = textureLoad(depth_tex, px, 0);
+
+    // Background pixels (depth cleared to 1.0) remain unshaded.
+    if (d_center >= 0.99999) {
+        return base_col;
+    }
+
+    let z_center = max(linearize_depth(d_center), 1e-5);
+    let log2_depth = log2(z_center);
+
+    var offsets = array<vec2<i32>, 8>(
+        vec2<i32>(-1,  0),
+        vec2<i32>( 1,  0),
+        vec2<i32>( 0, -1),
+        vec2<i32>( 0,  1),
+        vec2<i32>(-1, -1),
+        vec2<i32>( 1, -1),
+        vec2<i32>(-1,  1),
+        vec2<i32>( 1,  1),
+    );
+
+    let radius = i32(clamp(round(u.edl_radius), 1.0, 4.0));
+    var response: f32 = 0.0;
+    for (var i: i32 = 0; i < 8; i = i + 1) {
+        let n_px = clamp(px + offsets[i] * radius, vec2<i32>(0), dims - vec2<i32>(1));
+        let d_n = textureLoad(depth_tex, n_px, 0);
+        let z_n = max(linearize_depth(d_n), 1e-5);
+        let log2_neighbor = log2(z_n);
+        response = response + max(0.0, log2_depth - log2_neighbor);
+    }
+
+    let shade = exp(-max(u.edl_strength, 0.0) * response);
+    return vec4<f32>(base_col.rgb * shade, base_col.a);
+}
+"#;
+
+/// 3D Viewport Widget overlay shader (per-vertex RGBA for crisp wireframes and translucent guides).
+pub const WIDGET_WGSL: &str = r#"
+struct WidgetUniforms {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> u: WidgetUniforms;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
 }
 "#;
 

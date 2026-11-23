@@ -1,6 +1,6 @@
 //! Self-contained mesh, line, point, outline, and 3D volume extraction from `paraviz-core` datasets.
 
-use crate::scene::ColorBy;
+use crate::scene::{ColorBy, ViewportWidget};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use paraviz_core::{
@@ -914,4 +914,209 @@ pub fn build_axes_gizmo_mesh() -> Vec<GizmoVertex> {
     }
 
     verts
+}
+
+/// Per-vertex payload for 3D interactive viewport widget overlays.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct WidgetVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
+}
+
+/// Prepared line and translucent triangle geometry for [`ViewportWidget`] overlays.
+#[derive(Debug, Clone, Default)]
+pub struct PreparedWidgets {
+    pub lines: Vec<WidgetVertex>,
+    pub triangles: Vec<WidgetVertex>,
+}
+
+/// Builds wireframe and translucent triangle geometry for all [`ViewportWidget`]s.
+pub fn prepare_widgets(widgets: &[ViewportWidget]) -> PreparedWidgets {
+    let mut out = PreparedWidgets::default();
+    for widget in widgets {
+        match widget {
+            ViewportWidget::Plane {
+                origin,
+                normal,
+                size,
+            } => {
+                let o = Vec3::from_array(*origin);
+                let n = Vec3::from_array(*normal).normalize_or(Vec3::Y);
+                let helper = if n.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+                let u = helper.cross(n).normalize_or(Vec3::X);
+                let v = n.cross(u).normalize_or(Vec3::Z);
+                let h = size.max(1e-4) * 0.5;
+
+                let c0 = (o - u * h - v * h).to_array();
+                let c1 = (o + u * h - v * h).to_array();
+                let c2 = (o + u * h + v * h).to_array();
+                let c3 = (o - u * h + v * h).to_array();
+
+                let fill_col = [0.22, 0.78, 0.96, 0.18];
+                for p in [c0, c1, c2, c0, c2, c3] {
+                    out.triangles.push(WidgetVertex {
+                        position: p,
+                        color: fill_col,
+                    });
+                }
+
+                let edge_col = [0.28, 0.88, 1.0, 0.95];
+                for (a, b) in [(c0, c1), (c1, c2), (c2, c3), (c3, c0)] {
+                    out.lines.push(WidgetVertex {
+                        position: a,
+                        color: edge_col,
+                    });
+                    out.lines.push(WidgetVertex {
+                        position: b,
+                        color: edge_col,
+                    });
+                }
+
+                // Normal vector arrow from plane origin
+                let arrow_col = [1.0, 0.84, 0.24, 1.0];
+                let tip = o + n * (h * 0.85);
+                let head_base = o + n * (h * 0.65);
+                let head_r = h * 0.10;
+                out.lines.push(WidgetVertex {
+                    position: o.to_array(),
+                    color: arrow_col,
+                });
+                out.lines.push(WidgetVertex {
+                    position: tip.to_array(),
+                    color: arrow_col,
+                });
+                for dir in [u, -u, v, -v] {
+                    out.lines.push(WidgetVertex {
+                        position: tip.to_array(),
+                        color: arrow_col,
+                    });
+                    out.lines.push(WidgetVertex {
+                        position: (head_base + dir * head_r).to_array(),
+                        color: arrow_col,
+                    });
+                }
+            }
+            ViewportWidget::Line { p1, p2 } => {
+                let a = Vec3::from_array(*p1);
+                let b = Vec3::from_array(*p2);
+                let line_col = [1.0, 0.82, 0.20, 1.0];
+                out.lines.push(WidgetVertex {
+                    position: *p1,
+                    color: line_col,
+                });
+                out.lines.push(WidgetVertex {
+                    position: *p2,
+                    color: line_col,
+                });
+
+                let handle = ((b - a).length() * 0.04).clamp(0.02, 0.25);
+                let handle_col = [1.0, 0.45, 0.20, 1.0];
+                for center in [a, b] {
+                    for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                        out.lines.push(WidgetVertex {
+                            position: (center - axis * handle).to_array(),
+                            color: handle_col,
+                        });
+                        out.lines.push(WidgetVertex {
+                            position: (center + axis * handle).to_array(),
+                            color: handle_col,
+                        });
+                    }
+                }
+            }
+            ViewportWidget::Box { min, max } => {
+                let mn = Vec3::from_array(*min).min(Vec3::from_array(*max));
+                let mx = Vec3::from_array(*min).max(Vec3::from_array(*max));
+                let c = [
+                    [mn.x, mn.y, mn.z],
+                    [mx.x, mn.y, mn.z],
+                    [mx.x, mx.y, mn.z],
+                    [mn.x, mx.y, mn.z],
+                    [mn.x, mn.y, mx.z],
+                    [mx.x, mn.y, mx.z],
+                    [mx.x, mx.y, mx.z],
+                    [mn.x, mx.y, mx.z],
+                ];
+                let edge_col = [0.28, 0.94, 0.72, 0.95];
+                let edges = [
+                    (0, 1),
+                    (1, 2),
+                    (2, 3),
+                    (3, 0),
+                    (4, 5),
+                    (5, 6),
+                    (6, 7),
+                    (7, 4),
+                    (0, 4),
+                    (1, 5),
+                    (2, 6),
+                    (3, 7),
+                ];
+                for (a, b) in edges {
+                    out.lines.push(WidgetVertex {
+                        position: c[a],
+                        color: edge_col,
+                    });
+                    out.lines.push(WidgetVertex {
+                        position: c[b],
+                        color: edge_col,
+                    });
+                }
+
+                let fill_col = [0.28, 0.94, 0.72, 0.08];
+                let quads = [
+                    [0, 3, 2, 1],
+                    [4, 5, 6, 7],
+                    [0, 1, 5, 4],
+                    [1, 2, 6, 5],
+                    [2, 3, 7, 6],
+                    [3, 0, 4, 7],
+                ];
+                for q in quads {
+                    for idx in [q[0], q[1], q[2], q[0], q[2], q[3]] {
+                        out.triangles.push(WidgetVertex {
+                            position: c[idx],
+                            color: fill_col,
+                        });
+                    }
+                }
+            }
+            ViewportWidget::Sphere { center, radius } => {
+                let c = Vec3::from_array(*center);
+                let r = radius.max(1e-4);
+                let ring_col = [1.0, 0.56, 0.22, 0.95];
+                let segs = 48usize;
+                let planes = [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)];
+                for (u, v) in planes {
+                    for s in 0..segs {
+                        let a0 = (s as f32 / segs as f32) * std::f32::consts::TAU;
+                        let a1 = ((s + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+                        let p0 = c + (u * a0.cos() + v * a0.sin()) * r;
+                        let p1 = c + (u * a1.cos() + v * a1.sin()) * r;
+                        out.lines.push(WidgetVertex {
+                            position: p0.to_array(),
+                            color: ring_col,
+                        });
+                        out.lines.push(WidgetVertex {
+                            position: p1.to_array(),
+                            color: ring_col,
+                        });
+                    }
+                }
+                let cross_r = r * 0.15;
+                for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                    out.lines.push(WidgetVertex {
+                        position: (c - axis * cross_r).to_array(),
+                        color: ring_col,
+                    });
+                    out.lines.push(WidgetVertex {
+                        position: (c + axis * cross_r).to_array(),
+                        color: ring_col,
+                    });
+                }
+            }
+        }
+    }
+    out
 }

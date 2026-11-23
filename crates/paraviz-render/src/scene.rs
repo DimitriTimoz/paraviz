@@ -132,12 +132,35 @@ impl Default for SceneSettings {
     }
 }
 
+/// Interactive 3D viewport widget overlays rendered as crisp wireframe/translucent guides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ViewportWidget {
+    Plane {
+        origin: [f32; 3],
+        normal: [f32; 3],
+        size: f32,
+    },
+    Line {
+        p1: [f32; 3],
+        p2: [f32; 3],
+    },
+    Box {
+        min: [f32; 3],
+        max: [f32; 3],
+    },
+    Sphere {
+        center: [f32; 3],
+        radius: f32,
+    },
+}
+
 /// Complete scene state passed to [`crate::WebGpuRenderer`].
 #[derive(Debug, Clone, Default)]
 pub struct RenderScene {
     pub camera: Camera,
     pub actors: Vec<SceneActor>,
     pub settings: SceneSettings,
+    pub widgets: Vec<ViewportWidget>,
 }
 
 impl RenderScene {

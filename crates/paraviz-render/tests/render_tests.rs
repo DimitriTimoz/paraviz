@@ -4,9 +4,10 @@ use paraviz_core::{
     TransferFunction,
 };
 use paraviz_render::{
-    ActorStyle, Camera, CameraPreset, ColorBy, RenderScene, Representation, SceneActor,
-    WebGpuRenderer,
+    pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, RenderScene,
+    Representation, SceneActor, ViewportWidget, WebGpuRenderer,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_box_polydata() -> DataSet {
@@ -256,4 +257,239 @@ fn render_volume_raymarching_sphere() {
     assert_ne!(center, bg, "volume sphere center should differ from background");
     // Center of density=1.0 mapped with Plasma should be bright warm yellow-orange
     assert!(center[0] > 120, "expected warm bright center pixel, got {center:?}");
+}
+
+fn make_uv_sphere_polydata(radius: f32, stacks: usize, slices: usize) -> PolyData {
+    let mut points = Vec::new();
+    let mut scalars = Vec::new();
+    for i in 0..=stacks {
+        let phi = std::f32::consts::PI * (i as f32 / stacks as f32);
+        let y = radius * phi.cos();
+        let r_ring = radius * phi.sin();
+        for j in 0..slices {
+            let theta = std::f32::consts::TAU * (j as f32 / slices as f32);
+            let x = r_ring * theta.cos();
+            let z = r_ring * theta.sin();
+            points.push([x, y, z]);
+            scalars.push(y);
+        }
+    }
+    let mut tris = Vec::new();
+    for i in 0..stacks {
+        for j in 0..slices {
+            let j_next = (j + 1) % slices;
+            let a = (i * slices + j) as u32;
+            let b = (i * slices + j_next) as u32;
+            let c = ((i + 1) * slices + j) as u32;
+            let d = ((i + 1) * slices + j_next) as u32;
+            if i != 0 {
+                tris.push([a, b, d]);
+            }
+            if i != stacks - 1 {
+                tris.push([a, d, c]);
+            }
+        }
+    }
+    let mut poly = PolyData::from_triangles(points, tris);
+    poly.point_data
+        .set_scalars(DataArray::scalars_f32("height", scalars));
+    poly.compute_normals();
+    poly
+}
+
+#[test]
+fn edl_changes_shading_on_sphere() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let sphere = Arc::new(DataSet::PolyData(make_uv_sphere_polydata(1.0, 20, 32)));
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = false;
+    let mut actor = SceneActor::new(10, "sphere", sphere);
+    actor.style.color_by = ColorBy::Solid([0.75, 0.78, 0.85, 1.0]);
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::Isometric, &scene.bounds());
+
+    scene.settings.edl_enabled = false;
+    let rgba_off = renderer.render_to_rgba(&scene, 160, 160).expect("render no-edl");
+
+    scene.settings.edl_enabled = true;
+    scene.settings.edl_strength = 2.0;
+    let rgba_on = renderer.render_to_rgba(&scene, 160, 160).expect("render edl");
+
+    assert_ne!(rgba_off, rgba_on, "EDL should alter pixel shading on sphere");
+    // Background corner should remain unaffected by EDL
+    assert_eq!(top_right_pixel(&rgba_off, 160), top_right_pixel(&rgba_on, 160));
+}
+
+#[test]
+fn msaa_4x_renders_cleanly() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let dataset = Arc::new(make_box_polydata());
+
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = true;
+    let mut actor = SceneActor::new(20, "box", dataset);
+    actor.style.color_by = ColorBy::PointScalar {
+        array: "elevation".into(),
+        component: None,
+    };
+    actor.style.colormap = ColorMap::from_preset(ColorMapPreset::Viridis);
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::Isometric, &scene.bounds());
+
+    scene.settings.msaa_samples = 1;
+    let rgba_1x = renderer.render_to_rgba(&scene, 128, 128).expect("1x render");
+
+    scene.settings.msaa_samples = 4;
+    let rgba_4x = renderer.render_to_rgba(&scene, 128, 128).expect("4x MSAA render");
+    assert_eq!(rgba_4x.len(), 128 * 128 * 4);
+    assert_ne!(center_pixel(&rgba_4x, 128, 128), top_right_pixel(&rgba_4x, 128));
+    assert_ne!(rgba_1x, rgba_4x, "4x MSAA should anti-alias silhouette edges differently from 1x");
+
+    // Non-standard sample counts should clamp cleanly without panicking
+    scene.settings.msaa_samples = 8;
+    let rgba_clamped = renderer.render_to_rgba(&scene, 128, 128).expect("clamped MSAA render");
+    assert_eq!(rgba_clamped, rgba_4x);
+}
+
+#[test]
+fn pick_scene_hits_sphere_and_misses_background() {
+    let sphere = Arc::new(DataSet::PolyData(make_uv_sphere_polydata(1.0, 24, 36)));
+    let mut scene = RenderScene::new();
+    let actor = SceneActor::new(42, "pick_sphere", sphere);
+    scene.add_actor(actor);
+    scene.camera.apply_preset(CameraPreset::PosZ, &scene.bounds());
+
+    let (w, h) = (200u32, 200u32);
+    let (ro, rd) = scene.camera.screen_ray(w as f32 * 0.5, h as f32 * 0.5, w, h);
+    assert!((rd.length() - 1.0).abs() < 1e-4);
+    assert!((ro.cross(rd)).length() < 1e-4 || rd.dot(-ro.normalize()) > 0.99);
+
+    let hit = pick_scene(&scene, w as f32 * 0.5, h as f32 * 0.5, w, h)
+        .expect("center ray should hit sphere");
+    assert_eq!(hit.actor_id, 42);
+    assert_eq!(hit.actor_name, "pick_sphere");
+    assert!(hit.point_index.is_some());
+    assert!(hit.cell_index.is_some());
+    assert!(hit.scalar_value.is_some());
+
+    let wp = Vec3::from_array(hit.world_pos);
+    assert!((wp.length() - 1.0).abs() < 0.05, "hit {wp:?} not on unit sphere");
+    assert!(wp.z > 0.9, "expected front-facing +Z hemisphere hit, got {wp:?}");
+
+    // Background corner should miss
+    assert!(pick_scene(&scene, 2.0, 2.0, w, h).is_none());
+}
+
+#[test]
+fn viewport_widgets_render_cleanly() {
+    let mut renderer = WebGpuRenderer::new_headless().expect("headless WebGPU init");
+    let mut scene = RenderScene::new();
+    scene.settings.show_axes_gizmo = false;
+    scene.camera.position = Vec3::new(3.0, 2.5, 4.0);
+    scene.camera.target = Vec3::ZERO;
+
+    let base_rgba = renderer.render_to_rgba(&scene, 160, 160).expect("render base");
+
+    scene.widgets = vec![
+        ViewportWidget::Plane {
+            origin: [0.0, 0.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            size: 2.0,
+        },
+        ViewportWidget::Line {
+            p1: [-1.2, -0.5, 0.0],
+            p2: [1.2, 0.8, 0.2],
+        },
+        ViewportWidget::Box {
+            min: [-0.8, -0.8, -0.8],
+            max: [0.8, 0.8, 0.8],
+        },
+        ViewportWidget::Sphere {
+            center: [0.0, 0.0, 0.0],
+            radius: 1.0,
+        },
+    ];
+
+    let widget_rgba = renderer.render_to_rgba(&scene, 160, 160).expect("render widgets");
+    assert_ne!(base_rgba, widget_rgba, "widgets should render visibly over background");
+
+    // Also verify widgets work cleanly under 4x MSAA
+    scene.settings.msaa_samples = 4;
+    let widget_msaa = renderer
+        .render_to_rgba(&scene, 160, 160)
+        .expect("render widgets 4x MSAA");
+    assert_eq!(widget_msaa.len(), 160 * 160 * 4);
+}
+
+#[test]
+fn gpu_compute_marching_cubes_watertight_sphere() {
+    let engine = GpuContourEngine::new_headless().expect("headless compute init");
+    let dim = 24usize;
+    let spacing = 3.0 / (dim - 1) as f64;
+    let mut img = ImageData::new([dim, dim, dim], [-1.5, -1.5, -1.5], [spacing; 3]);
+    let mut sdf = Vec::with_capacity(dim * dim * dim);
+    for k in 0..dim {
+        for j in 0..dim {
+            for i in 0..dim {
+                let p = Vec3::from_array(img.point_coords(i, j, k));
+                sdf.push(p.length() - 1.0);
+            }
+        }
+    }
+    img.point_data.set_scalars(DataArray::scalars_f32("sdf", sdf));
+
+    let poly = engine
+        .contour_imagedata(&img, "sdf", 0.0)
+        .expect("GPU marching cubes");
+    assert!(!poly.points.is_empty(), "expected non-empty points");
+    assert!(!poly.polys.is_empty(), "expected non-empty triangles");
+
+    let normals = poly
+        .point_data
+        .active_normals_array()
+        .expect("expected GPU-computed smooth normals");
+    assert_eq!(normals.num_tuples(), poly.points.len());
+
+    let scalars = poly
+        .point_data
+        .get("sdf")
+        .expect("expected interpolated sdf scalars");
+    assert_eq!(scalars.num_tuples(), poly.points.len());
+
+    for (i, &pt) in poly.points.iter().enumerate() {
+        let p = Vec3::from_array(pt);
+        assert!(
+            (p.length() - 1.0).abs() < 0.08,
+            "point {p:?} radius {} too far from 1.0",
+            p.length()
+        );
+        assert!(
+            scalars.get_scalar(i).abs() < 0.05,
+            "interpolated scalar {} not near iso=0",
+            scalars.get_scalar(i)
+        );
+        let n = Vec3::from_array(normals.get_vec3(i));
+        assert!((n.length() - 1.0).abs() < 1e-3, "non-unit normal {n:?}");
+        assert!(
+            n.dot(p.normalize()) > 0.9,
+            "normal {n:?} should point radially outward at {p:?}"
+        );
+    }
+
+    // Verify watertight closed 2-manifold (every undirected edge shared by exactly 2 triangles)
+    let mut edge_counts: HashMap<(u32, u32), usize> = HashMap::new();
+    for tri in &poly.polys {
+        assert_eq!(tri.len(), 3);
+        for k in 0..3 {
+            let a = tri[k];
+            let b = tri[(k + 1) % 3];
+            let key = if a < b { (a, b) } else { (b, a) };
+            *edge_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    assert!(
+        edge_counts.values().all(|&c| c == 2),
+        "expected watertight closed 2-manifold with every edge having degree 2"
+    );
 }

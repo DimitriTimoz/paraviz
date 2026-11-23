@@ -1,6 +1,6 @@
 //! 3D perspective and orthographic camera with ParaView-compatible presets and interaction.
 
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use paraviz_core::BoundingBox;
 use serde::{Deserialize, Serialize};
 
@@ -199,5 +199,32 @@ impl Camera {
     /// Combined `projection * view` matrix.
     pub fn view_proj_matrix(&self, aspect: f32) -> Mat4 {
         self.projection_matrix(aspect) * self.view_matrix()
+    }
+
+    /// Computes a world-space picking ray `(origin, direction)` for pixel `(px, py)`
+    /// in a viewport of `width x height` pixels (`(0, 0)` at top-left).
+    pub fn screen_ray(&self, px: f32, py: f32, width: u32, height: u32) -> (Vec3, Vec3) {
+        let w = width.max(1) as f32;
+        let h = height.max(1) as f32;
+        let aspect = w / h;
+        let ndc_x = (px / w) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (py / h) * 2.0;
+
+        let inv_vp = self.view_proj_matrix(aspect).inverse();
+        let near_h = inv_vp * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far_h = inv_vp * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+
+        let origin = if near_h.w.abs() > 1e-8 {
+            near_h.truncate() / near_h.w
+        } else {
+            self.position
+        };
+        let far_pt = if far_h.w.abs() > 1e-8 {
+            far_h.truncate() / far_h.w
+        } else {
+            origin + self.view_direction()
+        };
+        let dir = (far_pt - origin).normalize_or(self.view_direction());
+        (origin, dir)
     }
 }
