@@ -71,9 +71,9 @@ cargo run --release -p paraviz-app -- path/to/mesh.vtu
 - **3D Volume Raymarching**: Full-precision `R32Float` 3D textures (no optional `float32-filterable` GPU feature required), Interleaved Gradient Noise (IGN) ray jittering, central-difference gradient Phong shading, interactive histogram-backed opacity curves, transfer-function presets, and a live **3D Volume Clip Plane**.
 - **Inspection & Quantitative Plots**: 3D raycast picking (`Block:` patch path + `Reveal in Spreadsheet`), 2-point 3D distance ruler, searchable & CSV-exportable attribute spreadsheets, automatic `Plot Over Line` XY charts, and scalar histograms.
 - **Broad Scientific Format Support**:
-  - **VTK & 3D Meshes**: Legacy `.vtk`, VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`), partitioned `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.pvd` time series, **VTKHDF (`.vtkhdf`)**, `.stl`, `.obj`, `.ply`, `.csv`/`.tsv`
-  - **Medical & Volumetric**: NIfTI-1 (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), Raw binary volumes (`.raw`, `.bin`, `.vol`)
-  - **CFD / CAE / FEA**: **CGNS (`.cgns`)**, **Exodus II (`.exo`, `.e`, `.ex2`)**, EnSight Gold (`.case`), OpenFOAM (`constant/polyMesh` + fields), XDMF (`.xdmf`, `.xmf` with XML, Binary, and pure-Rust HDF5 `Format="HDF"` + temporal collections)
+  - **VTK & 3D Meshes**: Legacy `.vtk`, VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`), partitioned `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.pvd` & `.series` time series, **VTKHDF (`.vtkhdf`)**, `.stl`, `.obj`, `.ply`, `.off`, `.gltf`/`.glb`, `.x3d`, `.las`, `.csv`/`.tsv`
+  - **Medical & Volumetric**: NIfTI-1 (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), DICOM (`.dcm`), 2D images (`.png`, `.bmp`, `.ppm`/`.pgm`/`.pbm`), Raw binary volumes (`.raw`, `.bin`, `.vol`)
+  - **CFD / CAE / FEA / Climate / Molecular**: **CGNS (`.cgns`)**, **Exodus II (`.exo`, `.e`, `.ex2`)**, **YALES2 HDF5 (`.h5`)**, EnSight Gold (`.case`), OpenFOAM (`constant/polyMesh` + fields), XDMF (`.xdmf`, `.xmf` + HDF5), **Gmsh (`.msh`)**, **PLOT3D (`.xyz`, `.p3d` + `.q`)**, **Tecplot ASCII (`.dat`, `.tec`, `.plt`)**, **Abaqus (`.inp`)**, **NetCDF CF (`.nc`, `.cdf`)**, Molecular (`.xyz`, `.pdb`/`.ent`)
 - **Publication & Portable Web Exports**:
   - High-resolution **PNG** screenshots (with optional **transparent background**, **Scalar Color Bar**, **`Time:`** badge & **Viewport Annotations**)
   - Pure-Rust animated **GIF89a** exports (360° turntables & time series)

@@ -52,6 +52,6 @@ ParaViz covers single-workstation interactive exploration, multi-block CFD/FEA/m
 
 - **Distributed MPI / Client-Server (`pvserver`)**: Runs on a single workstation/server (parallelized across CPU cores with `rayon` and GPU via `wgpu`) without MPI domain decomposition or remote `pvserver` streaming.
 - **CPU/GPU Path Tracing**: No OSPRay or OptiX ray-traced global illumination; rendering uses rasterization, screen-space EDL, and WebGPU raymarched volumes.
-- **Specialized CAD / Niche Legacy Readers**: Silo, Plot3D, and STEP/IGES CAD B-Rep geometry kernels are not currently included (see [File Formats & I/O](file-formats.md) for all 20+ supported readers and writers including VTKHDF, CGNS, Exodus II, XDMF, OpenFOAM, EnSight, NIfTI, NRRD, and MetaImage).
+- **Specialized CAD / Niche Legacy Readers**: Silo, proprietary binary ANSYS Fluent `.cas`/`.dat`, and STEP/IGES CAD B-Rep geometry kernels are not currently included (see [File Formats & I/O](file-formats.md) for all 30+ supported readers and writers including VTKHDF, CGNS, Exodus II, YALES2 HDF5, XDMF, OpenFOAM, EnSight, Gmsh, PLOT3D, Tecplot, Abaqus, NetCDF CF, NIfTI, NRRD, MetaImage, DICOM, glTF/GLB, OFF, X3D, LAS, and XYZ/PDB).
 - **In-GUI Python Interpreter / Programmable Filter**: Custom pipeline stages are authored in Rust (`Source`/`Filter`/`MultiInputFilter`) or via standalone `paraviz-py`, while runtime expressions use `CalculatorFilter`.
 - **In-Situ Co-Processing**: No Catalyst or Ascent live simulation coupling yet.

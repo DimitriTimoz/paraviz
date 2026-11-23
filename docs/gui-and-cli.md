@@ -44,8 +44,9 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 - Active 3D pane supports **Orbit (`1`)**, **Pick (`2`)** (HUD shows `Block: <path>` on MultiBlock hits), **Ruler (`3`)**, interactive drag/bottom-right resize on **Scalar Color Bar**, and draggable **Annotation** badges.
 
 ### Left Dock Tabs
-1. **Pipeline Browser**: Visibility toggles, `All` / `None` / `Solo`, `Copy` / `Paste` (`Ctrl/Cmd+C` & `V`), `Copy Filter Chain`, Rename, `Dup`, Delete.
-2. **Properties**: `Auto-Apply` toggle (`Apply` / `Discard`), filter/source parameter editors with bounds & plane snap buttons, plus **MultiBlock Patches** hierarchy (`All`, `None`, `Invert`, `Solo`, search box, per-block visibility checkboxes, per-block RGBA color overrides + `"×"` reset).
+1. **Pipeline Browser**: Visibility toggles, `All` / `None` / `Solo`, `Undo` / `Redo` (`Ctrl/Cmd+Z`, `Ctrl/Cmd+Shift+Z`), `Copy` / `Paste` (`Ctrl/Cmd+C` & `V`), `Copy Filter Chain`, Rename, `Dup`, Delete.
+2. **Properties**: `Auto-Apply` toggle (`Apply` / `Discard`), filter/source parameter editors with bounds & plane snap buttons (including `Min / Max` ↔ `Center / Size` toggle for `Clip` Box), plus **MultiBlock Patches** hierarchy (`All`, `None`, `Invert`, `Solo`, search box, per-block visibility checkboxes, per-block RGBA color overrides + `"×"` reset).
+   - **Toolbar & Quick Command Palette (`Ctrl/Cmd+K` / `Ctrl+Space`)**: Keyboard-first search across all 39+ filters and global view/profile actions with frequency + favorite (`★`) ranking, `Undo`/`Redo`, and **Workspace Profiles** (`Full`, `CFD`, `Medical`, `Mesh`).
 3. **Display**:
    - `Representation` (`Surface`, `SurfaceWithEdges`, `Wireframe`, `Points`, `PointGaussian`, `Volume`, `Outline`)
    - `Color By` (`Solid Color`, `Point: ...`, `Cell: ...`, vector `Magnitude` or component `X/Y/Z`)
@@ -82,6 +83,8 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 | `T` | Toggle Turntable spin |
 | `Tab` | Toggle Left Inspector Dock |
 | `Space` | Play / Pause time steps |
+| `Ctrl/Cmd + K` / `Ctrl+Space` | Open Quick Command & Filter Palette |
+| `Ctrl/Cmd + Z` / `Shift+Z` | Undo / Redo pipeline action |
 | `Ctrl/Cmd + C` / `V` | Copy / Paste filter in Pipeline Browser |
 | `Delete` / `Backspace` | Remove selected pipeline node |
 | `F1` / `?` | Open Keyboard & Mouse Shortcuts modal |
@@ -90,7 +93,7 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 
 ## 4. Headless CLI Reference (`paraviz --help`)
 
-Supported CLI input formats include Legacy VTK (`.vtk`), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvtu`, `.pvti`), VTKHDF (`.vtkhdf`), CGNS (`.cgns`), Exodus II (`.exo`, `.e`, `.ex2`), XDMF (`.xdmf`, `.xmf`), EnSight Gold (`.case`), OpenFOAM (`.foam`), NIfTI (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), STL/OBJ/PLY, and CSV/TSV (plus saved `.json` session state).
+Supported CLI input formats include Legacy VTK (`.vtk`), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvtu`, `.pvti`), ParaView File Series (`.series`), VTKHDF (`.vtkhdf`), CGNS (`.cgns`), Exodus II (`.exo`, `.e`, `.ex2`), YALES2 HDF5 (`.h5`), XDMF (`.xdmf`, `.xmf`), EnSight Gold (`.case`), OpenFOAM (`.foam`), Gmsh (`.msh`), PLOT3D (`.xyz`, `.p3d`), Tecplot ASCII (`.dat`, `.tec`, `.plt`), Abaqus (`.inp`), NetCDF CF (`.nc`, `.cdf`), NIfTI (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), DICOM (`.dcm`), 2D Images (`.png`, `.bmp`, `.ppm`, `.pgm`, `.pbm`), STL/OBJ/PLY/OFF/glTF/GLB/X3D, LAS (`.las`), Molecular (`.xyz`, `.pdb`, `.ent`), and CSV/TSV (plus saved `.json` session state).
 
 ### `demo` — Render a built-in demo scene
 ```bash
