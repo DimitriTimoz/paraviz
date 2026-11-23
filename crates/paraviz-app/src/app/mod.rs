@@ -471,7 +471,18 @@ impl ParaVizApp {
         };
         match self.session.open_with_reader(path, reader) {
             Ok(id) => {
-                let _ = self.session.evaluate(id);
+                if let Err(e) = self.session.evaluate(id) {
+                    let _ = self.session.remove_node(id);
+                    let reader_desc = used_reader
+                        .map(|r| format!(" ({})", r.short_name()))
+                        .unwrap_or_default();
+                    self.error_message = Some(format!(
+                        "Failed to read '{}'{}: {e}",
+                        path.display(),
+                        reader_desc
+                    ));
+                    return;
+                }
                 self.session.show(id);
                 if is_first {
                     let _ = self.session.camera_preset(CameraPreset::Isometric);

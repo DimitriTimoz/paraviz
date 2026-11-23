@@ -1291,3 +1291,53 @@ fn xdmf_variants_and_reader_selection() {
     assert_eq!(tri_ug.num_cells(), 1);
     assert_eq!(tri_ug.points[1], [1.0, 0.0, 0.0]);
 }
+
+#[test]
+fn truncated_and_incomplete_files_return_error_without_panicking() {
+    let dir = TestDir::new("truncated_files");
+
+    // 1) Truncated XDMF XML mid-tag / unclosed
+    let trunc_xmf = dir.file("trunc.xmf");
+    fs::write(
+        &trunc_xmf,
+        r#"<?xml version="1.0" ?><Xdmf Version="2.0"><Domain><Grid Name="G"><Topology TopologyType="Triangle"><DataItem>"#,
+    )
+    .unwrap();
+    assert!(read_dataset(&trunc_xmf).is_err());
+
+    // 2) Truncated / garbage HDF5 referenced by XDMF
+    let bad_h5 = dir.file("half_written.h5");
+    fs::write(&bad_h5, b"\x89HDF\r\n\x1a\n\x00\x00\x00\x00truncated").unwrap();
+    let xmf_h5 = dir.file("half.xmf");
+    fs::write(
+        &xmf_h5,
+        r#"<?xml version="1.0" ?>
+<Xdmf Version="2.0"><Domain><Grid Name="G" GridType="Uniform">
+  <Topology TopologyType="Triangle" NumberOfElements="1">
+    <DataItem Dimensions="3" NumberType="Int" Format="HDF">half_written.h5:/topo</DataItem>
+  </Topology>
+  <Geometry GeometryType="XYZ">
+    <DataItem Dimensions="9" NumberType="Float" Format="HDF">half_written.h5:/xyz</DataItem>
+  </Geometry>
+</Grid></Domain></Xdmf>"#,
+    )
+    .unwrap();
+    assert!(read_dataset(&xmf_h5).is_err());
+
+    // 3) Out-of-range cell vertex index (half-written points vs topology)
+    let oob_xmf = dir.file("oob.xmf");
+    fs::write(
+        &oob_xmf,
+        r#"<?xml version="1.0" ?>
+<Xdmf Version="2.0"><Domain><Grid Name="G" GridType="Uniform">
+  <Topology TopologyType="Triangle" NumberOfElements="1">
+    <DataItem Dimensions="3" Format="XML">0 1 999</DataItem>
+  </Topology>
+  <Geometry GeometryType="XYZ">
+    <DataItem Dimensions="6" Format="XML">0 0 0  1 0 0</DataItem>
+  </Geometry>
+</Grid></Domain></Xdmf>"#,
+    )
+    .unwrap();
+    assert!(read_dataset(&oob_xmf).is_err());
+}

@@ -202,12 +202,22 @@ fn parse_xml_tree(xml: &str, base_dir: &Path, depth: usize) -> Result<XmlNode> {
                     }
                 }
             }
-            Event::Eof => break,
+            Event::Eof => {
+                if stack.len() > 1 {
+                    return Err(IoError::Parse(
+                        "Unexpected end of XDMF XML (file may be incomplete or still being written)"
+                            .into(),
+                    ));
+                }
+                break;
+            }
             _ => {}
         }
     }
 
-    Ok(stack.pop().unwrap())
+    stack
+        .pop()
+        .ok_or_else(|| IoError::Parse("Empty XDMF XML document".into()))
 }
 
 fn collect_named_data_items(node: &XmlNode, map: &mut HashMap<String, XmlNode>) {
@@ -419,28 +429,40 @@ fn parse_grid_node(grid_node: &XmlNode, ctx: &XdmfContext<'_>) -> Result<DataSet
     grid.field_data = field_data;
 
     if let Some(tn) = topo_node {
+        let num_pts = grid.points.len();
+        let validate_cell = |verts: &[u32]| -> Result<()> {
+            if let Some(&bad) = verts.iter().find(|&&v| (v as usize) >= num_pts) {
+                return Err(IoError::Parse(format!(
+                    "XDMF topology references point index {bad} >= {num_pts} (file may be incomplete)"
+                )));
+            }
+            Ok(())
+        };
         if let Some(di) = tn.data_items().next() {
             let (raw_topo, _) = read_data_item_u32(di, ctx)?;
             if topo_type.eq_ignore_ascii_case("Mixed") {
-                push_mixed_cells(&mut grid, &raw_topo);
+                push_mixed_cells(&mut grid, &raw_topo, num_pts)?;
             } else if topo_type.eq_ignore_ascii_case("Polyvertex") {
                 for &idx in &raw_topo {
+                    validate_cell(&[idx])?;
                     grid.push_cell(CellType::Vertex, &[idx]);
                 }
             } else if let Some((ct, stride)) = map_topology_type(topo_type, nodes_per_elem) {
                 if stride > 0 {
                     for chunk in raw_topo.chunks_exact(stride) {
+                        validate_cell(chunk)?;
                         grid.push_cell(ct, chunk);
                     }
                 }
             } else {
                 // Unknown topology name: if raw_topo is present, try Triangle (3)
                 for chunk in raw_topo.chunks_exact(3) {
+                    validate_cell(chunk)?;
                     grid.push_cell(CellType::Triangle, chunk);
                 }
             }
         } else if topo_type.eq_ignore_ascii_case("Polyvertex") {
-            for i in 0..grid.points.len() as u32 {
+            for i in 0..num_pts as u32 {
                 grid.push_cell(CellType::Vertex, &[i]);
             }
         }
@@ -620,7 +642,15 @@ fn map_topology_type(topo_type: &str, nodes_per_elem: Option<usize>) -> Option<(
     }
 }
 
-fn push_mixed_cells(grid: &mut UnstructuredGrid, raw: &[u32]) {
+fn push_mixed_cells(grid: &mut UnstructuredGrid, raw: &[u32], num_pts: usize) -> Result<()> {
+    let check_verts = |verts: &[u32]| -> Result<()> {
+        if let Some(&bad) = verts.iter().find(|&&v| (v as usize) >= num_pts) {
+            return Err(IoError::Parse(format!(
+                "XDMF Mixed topology references point index {bad} >= {num_pts} (file may be incomplete)"
+            )));
+        }
+        Ok(())
+    };
     let mut i = 0;
     while i < raw.len() {
         let code = raw[i];
@@ -632,6 +662,7 @@ fn push_mixed_cells(grid: &mut UnstructuredGrid, raw: &[u32]) {
                 let n = raw[i] as usize;
                 i += 1;
                 if i + n > raw.len() { break; }
+                check_verts(&raw[i..i + n])?;
                 grid.push_cell(CellType::PolyVertex, &raw[i..i + n]);
                 i += n;
             }
@@ -642,6 +673,7 @@ fn push_mixed_cells(grid: &mut UnstructuredGrid, raw: &[u32]) {
                 i += 1;
                 if i + n > raw.len() { break; }
                 let ct = if n == 2 { CellType::Line } else { CellType::PolyLine };
+                check_verts(&raw[i..i + n])?;
                 grid.push_cell(ct, &raw[i..i + n]);
                 i += n;
             }
@@ -651,87 +683,104 @@ fn push_mixed_cells(grid: &mut UnstructuredGrid, raw: &[u32]) {
                 let n = raw[i] as usize;
                 i += 1;
                 if i + n > raw.len() { break; }
+                check_verts(&raw[i..i + n])?;
                 grid.push_cell(CellType::Polygon, &raw[i..i + n]);
                 i += n;
             }
             4 => {
                 if i + 3 > raw.len() { break; }
+                check_verts(&raw[i..i + 3])?;
                 grid.push_cell(CellType::Triangle, &raw[i..i + 3]);
                 i += 3;
             }
             5 => {
                 if i + 4 > raw.len() { break; }
+                check_verts(&raw[i..i + 4])?;
                 grid.push_cell(CellType::Quad, &raw[i..i + 4]);
                 i += 4;
             }
             6 => {
                 if i + 4 > raw.len() { break; }
+                check_verts(&raw[i..i + 4])?;
                 grid.push_cell(CellType::Tetra, &raw[i..i + 4]);
                 i += 4;
             }
             7 => {
                 if i + 5 > raw.len() { break; }
+                check_verts(&raw[i..i + 5])?;
                 grid.push_cell(CellType::Pyramid, &raw[i..i + 5]);
                 i += 5;
             }
             8 => {
                 if i + 6 > raw.len() { break; }
+                check_verts(&raw[i..i + 6])?;
                 grid.push_cell(CellType::Wedge, &raw[i..i + 6]);
                 i += 6;
             }
             9 => {
                 if i + 8 > raw.len() { break; }
+                check_verts(&raw[i..i + 8])?;
                 grid.push_cell(CellType::Hexahedron, &raw[i..i + 8]);
                 i += 8;
             }
             0x22 => {
                 if i + 3 > raw.len() { break; }
+                check_verts(&raw[i..i + 3])?;
                 grid.push_cell(CellType::QuadraticEdge, &raw[i..i + 3]);
                 i += 3;
             }
             0x23 => {
                 if i + 9 > raw.len() { break; }
+                check_verts(&raw[i..i + 9])?;
                 grid.push_cell(CellType::BiQuadraticQuad, &raw[i..i + 9]);
                 i += 9;
             }
             0x24 => {
                 if i + 6 > raw.len() { break; }
+                check_verts(&raw[i..i + 6])?;
                 grid.push_cell(CellType::QuadraticTriangle, &raw[i..i + 6]);
                 i += 6;
             }
             0x25 => {
                 if i + 8 > raw.len() { break; }
+                check_verts(&raw[i..i + 8])?;
                 grid.push_cell(CellType::QuadraticQuad, &raw[i..i + 8]);
                 i += 8;
             }
             0x26 => {
                 if i + 10 > raw.len() { break; }
+                check_verts(&raw[i..i + 10])?;
                 grid.push_cell(CellType::QuadraticTetra, &raw[i..i + 10]);
                 i += 10;
             }
             0x27 => {
                 if i + 13 > raw.len() { break; }
+                check_verts(&raw[i..i + 13])?;
                 grid.push_cell(CellType::QuadraticPyramid, &raw[i..i + 13]);
                 i += 13;
             }
             0x28 => {
                 if i + 15 > raw.len() { break; }
+                check_verts(&raw[i..i + 15])?;
                 grid.push_cell(CellType::QuadraticWedge, &raw[i..i + 15]);
                 i += 15;
             }
             0x30 => {
                 if i + 20 > raw.len() { break; }
+                check_verts(&raw[i..i + 20])?;
                 grid.push_cell(CellType::QuadraticHexahedron, &raw[i..i + 20]);
                 i += 20;
             }
             0x32 => {
                 if i + 27 > raw.len() { break; }
+                check_verts(&raw[i..i + 27])?;
                 grid.push_cell(CellType::TriQuadraticHexahedron, &raw[i..i + 27]);
                 i += 27;
             }
             _ => break,
         }
     }
+    Ok(())
 }
 
 fn infer_num_components(attr_type: &str, di_dims: &[usize], total_len: usize) -> usize {

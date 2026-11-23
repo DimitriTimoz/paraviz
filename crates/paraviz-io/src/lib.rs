@@ -227,20 +227,34 @@ pub fn read_dataset_with_reader(
         DatasetReader::Auto => detect_reader(path)?,
         explicit => explicit,
     };
-    let ds = match resolved {
-        DatasetReader::Auto => unreachable!(),
-        DatasetReader::Xdmf => xdmf::read_xdmf(path)?,
-        DatasetReader::VtkXml => vtk_xml::read_vtk_xml(path)?,
-        DatasetReader::VtkLegacy => vtk_legacy::read_vtk_legacy(path)?,
-        DatasetReader::EnSight => ensight::read_ensight_case(path)?,
-        DatasetReader::OpenFoam => openfoam::read_openfoam(path)?,
-        DatasetReader::Stl => DataSet::PolyData(mesh::read_stl(path)?),
-        DatasetReader::Obj => DataSet::PolyData(mesh::read_obj(path)?),
-        DatasetReader::Ply => DataSet::PolyData(mesh::read_ply(path)?),
-        DatasetReader::Csv => DataSet::PolyData(csv::read_csv(path)?),
-        DatasetReader::Nifti => DataSet::ImageData(nifti::read_nifti(path)?),
-        DatasetReader::Nrrd => DataSet::ImageData(medical_volume::read_nrrd(path)?),
-        DatasetReader::MetaImage => DataSet::ImageData(medical_volume::read_metaimage(path)?),
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<DataSet> {
+        match resolved {
+            DatasetReader::Auto => unreachable!(),
+            DatasetReader::Xdmf => xdmf::read_xdmf(path),
+            DatasetReader::VtkXml => vtk_xml::read_vtk_xml(path),
+            DatasetReader::VtkLegacy => vtk_legacy::read_vtk_legacy(path),
+            DatasetReader::EnSight => ensight::read_ensight_case(path),
+            DatasetReader::OpenFoam => openfoam::read_openfoam(path),
+            DatasetReader::Stl => Ok(DataSet::PolyData(mesh::read_stl(path)?)),
+            DatasetReader::Obj => Ok(DataSet::PolyData(mesh::read_obj(path)?)),
+            DatasetReader::Ply => Ok(DataSet::PolyData(mesh::read_ply(path)?)),
+            DatasetReader::Csv => Ok(DataSet::PolyData(csv::read_csv(path)?)),
+            DatasetReader::Nifti => Ok(DataSet::ImageData(nifti::read_nifti(path)?)),
+            DatasetReader::Nrrd => Ok(DataSet::ImageData(medical_volume::read_nrrd(path)?)),
+            DatasetReader::MetaImage => {
+                Ok(DataSet::ImageData(medical_volume::read_metaimage(path)?))
+            }
+        }
+    }));
+    let ds = match res {
+        Ok(inner) => inner?,
+        Err(_) => {
+            return Err(IoError::Parse(format!(
+                "{} failed unexpectedly while reading '{}' (the file may be incomplete or still being written)",
+                resolved.short_name(),
+                path.display()
+            )));
+        }
     };
     Ok((ds, resolved))
 }
