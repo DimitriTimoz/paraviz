@@ -7,6 +7,7 @@ pub struct FileBrowserState {
     pub current_dir: PathBuf,
     pub filter_text: String,
     pub path_input: String,
+    pub return_to_modal: Option<Box<AppModal>>,
 }
 
 impl FileBrowserState {
@@ -17,6 +18,23 @@ impl FileBrowserState {
             current_dir,
             filter_text: String::new(),
             path_input,
+            return_to_modal: None,
+        }
+    }
+
+    pub fn for_save_modal(current_path: &str, return_modal: AppModal) -> Self {
+        let p = Path::new(current_path.trim());
+        let dir = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty() && d.is_dir())
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let path_input = dir.display().to_string();
+        Self {
+            current_dir: dir,
+            filter_text: String::new(),
+            path_input,
+            return_to_modal: Some(Box::new(return_modal)),
         }
     }
 }
@@ -190,38 +208,45 @@ pub fn draw_modal(
     match &mut modal {
         AppModal::FileBrowser(fb) => {
             let mut picked: Option<PathBuf> = None;
-            egui::Window::new("File Browser")
+            let mut pick_folder_for_save = false;
+            let mut cancel_to_return = false;
+            let is_save_picker = fb.return_to_modal.is_some();
+            let win_title = if is_save_picker {
+                "Choose Export Destination Folder"
+            } else {
+                "File Browser"
+            };
+            egui::Window::new(win_title)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([600.0, 450.0])
+                .default_size([620.0, 460.0])
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button(".. Up").clicked()
                             && let Some(parent) = fb.current_dir.parent()
                         {
                             fb.current_dir = parent.to_path_buf();
                             fb.path_input = fb.current_dir.display().to_string();
                         }
-                        if ui.button("CWD").clicked() {
-                            fb.current_dir =
-                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                            fb.path_input = fb.current_dir.display().to_string();
+                        for (label, dir_opt) in quick_location_dirs() {
+                            if let Some(dir) = dir_opt
+                                && ui.button(label).clicked()
+                            {
+                                fb.current_dir = dir;
+                                fb.path_input = fb.current_dir.display().to_string();
+                            }
                         }
-                        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-                            && ui.button("Home").clicked()
-                        {
-                            fb.current_dir = home;
-                            fb.path_input = fb.current_dir.display().to_string();
-                        }
+                    });
+                    ui.horizontal(|ui| {
                         let resp = ui.add(
-                            egui::TextEdit::singleline(&mut fb.path_input).desired_width(300.0),
+                            egui::TextEdit::singleline(&mut fb.path_input).desired_width(480.0),
                         );
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let p = PathBuf::from(fb.path_input.trim());
                             if p.is_dir() {
                                 fb.current_dir = p;
-                            } else if p.is_file() {
+                            } else if p.is_file() && !is_save_picker {
                                 picked = Some(p);
                             }
                         }
@@ -229,7 +254,7 @@ pub fn draw_modal(
                             let p = PathBuf::from(fb.path_input.trim());
                             if p.is_dir() {
                                 fb.current_dir = p;
-                            } else if p.is_file() {
+                            } else if p.is_file() && !is_save_picker {
                                 picked = Some(p);
                             }
                         }
@@ -241,13 +266,21 @@ pub fn draw_modal(
                                 .desired_width(210.0)
                                 .hint_text("search filename..."),
                         );
-                        ui.label(
-                            egui::RichText::new(
-                                ".vtk .vtp .vti .vtu .pvtp .pvtu .stl .obj .ply .csv .raw .json",
-                            )
-                            .size(10.5)
-                            .color(pal.muted),
-                        );
+                        if !is_save_picker {
+                            ui.label(
+                                egui::RichText::new(
+                                    ".vtk .vtp .vti .vtu .pvtp .pvtu .stl .obj .ply .csv .raw .json",
+                                )
+                                .size(10.5)
+                                .color(pal.muted),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("Navigate into a folder, then click \"Use This Folder\"")
+                                    .size(11.0)
+                                    .color(pal.muted),
+                            );
+                        }
                     });
                     ui.separator();
 
@@ -328,13 +361,40 @@ pub fn draw_modal(
 
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Close").clicked() {
+                        if is_save_picker {
+                            if ui.button("Use This Folder").clicked() {
+                                pick_folder_for_save = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel_to_return = true;
+                            }
+                        } else if ui.button("Close").clicked() {
                             keep_open = false;
                         }
                     });
                 });
 
+            if pick_folder_for_save
+                && let Some(mut ret) = fb.return_to_modal.take()
+            {
+                apply_dir_to_modal(&mut ret, &fb.current_dir);
+                *modal_slot = Some(*ret);
+                return ModalAction::None;
+            }
+            if cancel_to_return
+                && let Some(ret) = fb.return_to_modal.take()
+            {
+                *modal_slot = Some(*ret);
+                return ModalAction::None;
+            }
             if let Some(path) = picked {
+                if let Some(mut ret) = fb.return_to_modal.take() {
+                    if let Some(parent) = path.parent() {
+                        apply_dir_to_modal(&mut ret, parent);
+                    }
+                    *modal_slot = Some(*ret);
+                    return ModalAction::None;
+                }
                 if is_raw_volume_ext(&path) {
                     *modal_slot = Some(AppModal::RawVolume(RawVolumeModalState::with_path(
                         path.display().to_string(),
@@ -519,13 +579,13 @@ pub fn draw_modal(
 
         AppModal::SaveScreenshot(ss) => {
             let mut confirm = false;
+            let mut browse_folder = false;
             egui::Window::new("Save Screenshot (PNG)")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label("Output PNG path:");
-                    ui.add(egui::TextEdit::singleline(&mut ss.path).desired_width(360.0));
+                    browse_folder = draw_save_destination_picker(ui, "Output PNG path:", &mut ss.path);
                     ui.checkbox(&mut ss.use_viewport_size, "Match current viewport size");
                     if ss.use_viewport_size {
                         ss.width = viewport_size.0.max(640);
@@ -572,6 +632,13 @@ pub fn draw_modal(
                     });
                 });
 
+            if browse_folder {
+                let p = ss.path.clone();
+                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::for_save_modal(
+                    &p, modal,
+                )));
+                return ModalAction::None;
+            }
             if confirm {
                 let p = ss.path.trim();
                 if !p.is_empty() {
@@ -591,13 +658,13 @@ pub fn draw_modal(
 
         AppModal::ExportGif(gm) => {
             let mut confirm = false;
+            let mut browse_folder = false;
             egui::Window::new("Export Animation (GIF)")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
-                    ui.label("Output GIF path:");
-                    ui.add(egui::TextEdit::singleline(&mut gm.path).desired_width(360.0));
+                    browse_folder = draw_save_destination_picker(ui, "Output GIF path:", &mut gm.path);
                     ui.horizontal(|ui| {
                         ui.label("Mode:");
                         ui.radio_value(&mut gm.is_turntable, true, "360° Turntable");
@@ -640,6 +707,13 @@ pub fn draw_modal(
                     });
                 });
 
+            if browse_folder {
+                let p = gm.path.clone();
+                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::for_save_modal(
+                    &p, modal,
+                )));
+                return ModalAction::None;
+            }
             if confirm {
                 let p = gm.path.trim();
                 if !p.is_empty() {
@@ -766,6 +840,7 @@ pub fn draw_modal(
 
         AppModal::ExportSpreadsheetCsv(es) => {
             let mut confirm = false;
+            let mut browse_folder = false;
             egui::Window::new("Export Spreadsheet CSV")
                 .collapsible(false)
                 .resizable(false)
@@ -784,14 +859,8 @@ pub fn draw_modal(
                             ui.monospace(es.col_filter.trim());
                         });
                     }
-                    ui.label("Output CSV path:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut es.path)
-                            .desired_width(380.0)
-                            .hint_text("path/to/export.csv"),
-                    );
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        confirm = true;
+                    if draw_save_destination_picker(ui, "Output CSV path:", &mut es.path) {
+                        browse_folder = true;
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -804,6 +873,13 @@ pub fn draw_modal(
                     });
                 });
 
+            if browse_folder {
+                let p = es.path.clone();
+                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::for_save_modal(
+                    &p, modal,
+                )));
+                return ModalAction::None;
+            }
             if confirm {
                 let p = es.path.trim();
                 if !p.is_empty() {
@@ -836,6 +912,7 @@ pub fn draw_modal(
                 .show(ctx, |ui| {
                     let is_open = matches!(modal, AppModal::OpenFile(_));
                     let is_export = matches!(modal, AppModal::ExportDataset(_));
+                    let is_save = matches!(modal, AppModal::SaveState(_) | AppModal::ExportDataset(_));
                     let path_str = match &mut modal {
                         AppModal::OpenFile(s)
                         | AppModal::SaveState(s)
@@ -843,14 +920,20 @@ pub fn draw_modal(
                         | AppModal::ExportDataset(s) => s,
                         _ => unreachable!(),
                     };
-                    ui.label("File path:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(path_str)
-                            .desired_width(380.0)
-                            .hint_text("path/to/file"),
-                    );
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        confirm = true;
+                    if is_save {
+                        if draw_save_destination_picker(ui, "Save to:", path_str) {
+                            switch_to_browser = true;
+                        }
+                    } else {
+                        ui.label("File path:");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(path_str)
+                                .desired_width(380.0)
+                                .hint_text("path/to/file"),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            confirm = true;
+                        }
                     }
                     if is_export {
                         ui.horizontal_wrapped(|ui| {
@@ -898,7 +981,14 @@ pub fn draw_modal(
                 });
 
             if switch_to_browser {
-                *modal_slot = Some(AppModal::FileBrowser(FileBrowserState::new()));
+                let fb = match modal {
+                    AppModal::SaveState(ref s) | AppModal::ExportDataset(ref s) => {
+                        let p = s.clone();
+                        FileBrowserState::for_save_modal(&p, modal)
+                    }
+                    _ => FileBrowserState::new(),
+                };
+                *modal_slot = Some(AppModal::FileBrowser(fb));
                 return ModalAction::None;
             }
 
@@ -936,6 +1026,75 @@ pub fn draw_modal(
     }
 
     action
+}
+
+fn quick_location_dirs() -> [(&'static str, Option<PathBuf>); 5] {
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let desktop = home.as_ref().map(|h| h.join("Desktop")).filter(|p| p.is_dir());
+    let downloads = home
+        .as_ref()
+        .map(|h| h.join("Downloads"))
+        .filter(|p| p.is_dir());
+    let documents = home
+        .as_ref()
+        .map(|h| h.join("Documents"))
+        .filter(|p| p.is_dir());
+    [
+        ("Desktop", desktop),
+        ("Downloads", downloads),
+        ("Documents", documents),
+        ("Home", home),
+        ("CWD", cwd),
+    ]
+}
+
+fn replace_parent_dir(path_str: &mut String, dir: &Path) {
+    let cur = Path::new(path_str.trim());
+    let fname = cur
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("export");
+    *path_str = dir.join(fname).display().to_string();
+}
+
+fn apply_dir_to_modal(modal: &mut AppModal, dir: &Path) {
+    match modal {
+        AppModal::SaveScreenshot(ss) => replace_parent_dir(&mut ss.path, dir),
+        AppModal::ExportGif(gm) => replace_parent_dir(&mut gm.path, dir),
+        AppModal::ExportSpreadsheetCsv(es) => replace_parent_dir(&mut es.path, dir),
+        AppModal::SaveState(s) | AppModal::ExportDataset(s) => replace_parent_dir(s, dir),
+        _ => {}
+    }
+}
+
+fn draw_save_destination_picker(ui: &mut egui::Ui, label: &str, path_str: &mut String) -> bool {
+    let mut browse_clicked = false;
+    ui.label(label);
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(path_str).desired_width(310.0));
+        if ui
+            .button("Browse Folder...")
+            .on_hover_text("Choose destination folder")
+            .clicked()
+        {
+            browse_clicked = true;
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Folder:").size(11.0));
+        for (name, dir_opt) in quick_location_dirs() {
+            if let Some(dir) = dir_opt
+                && ui.small_button(name).clicked()
+            {
+                replace_parent_dir(path_str, &dir);
+            }
+        }
+    });
+    browse_clicked
 }
 
 fn format_short_size(bytes: u64) -> String {

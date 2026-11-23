@@ -48,7 +48,8 @@ impl ParaVizApp {
                 }
                 ui.separator();
                 if ui.button("Save State JSON...").clicked() {
-                    self.modal = Some(AppModal::SaveState("paraviz_state.json".into()));
+                    let path = self.default_export_path("paraviz_state.json");
+                    self.modal = Some(AppModal::SaveState(path));
                     ui.close();
                 }
                 if ui.button("Load State JSON...").clicked() {
@@ -61,13 +62,15 @@ impl ParaVizApp {
                     .add_enabled(has_sel, egui::Button::new("Export Active Dataset..."))
                     .clicked()
                 {
-                    self.modal = Some(AppModal::ExportDataset("export.vtp".into()));
+                    let path = self.default_export_path("export.vtp");
+                    self.modal = Some(AppModal::ExportDataset(path));
                     ui.close();
                 }
                 if ui.button("Save Screenshot PNG...").clicked() {
                     let (w, h) = self.viewport_tex_size;
+                    let path = self.default_export_path("screenshot.png");
                     self.modal = Some(AppModal::SaveScreenshot(ScreenshotModalState {
-                        path: "screenshot.png".into(),
+                        path,
                         width: w.max(1280),
                         height: h.max(720),
                         use_viewport_size: true,
@@ -79,8 +82,9 @@ impl ParaVizApp {
                 if ui.button("Export Animation (GIF)...").clicked() {
                     let (w, h) = self.viewport_tex_size;
                     let has_ts = !self.session.all_time_steps().is_empty();
+                    let path = self.default_export_path("paraviz_animation.gif");
                     self.modal = Some(AppModal::ExportGif(GifModalState {
-                        path: "paraviz_animation.gif".into(),
+                        path,
                         width: w.clamp(320, 1280),
                         height: h.clamp(240, 720),
                         frames: 36,

@@ -147,6 +147,7 @@ pub struct ParaVizApp {
     last_render_ms: f32,
 
     recent_files: Vec<PathBuf>,
+    last_export_dir: Option<PathBuf>,
     camera_bookmarks: Vec<CameraBookmark>,
     info_stats_cache: HashMap<(NodeId, String, AttributeAssociation), HistogramResult>,
     volume_tf_hist_cache: HashMap<(NodeId, String, AttributeAssociation, Option<usize>), HistogramResult>,
@@ -224,6 +225,7 @@ impl ParaVizApp {
             fps_smoothed: 60.0,
             last_render_ms: 0.0,
             recent_files: Vec::new(),
+            last_export_dir: None,
             camera_bookmarks: Vec::new(),
             info_stats_cache: HashMap::new(),
             volume_tf_hist_cache: HashMap::new(),
@@ -324,6 +326,22 @@ impl ParaVizApp {
             PickDomain::Cell => format!("Highlighted Cell #{row}"),
         };
         self.invalidate_viewport();
+    }
+
+    pub(super) fn default_export_path(&self, filename: &str) -> String {
+        if let Some(dir) = &self.last_export_dir {
+            dir.join(filename).display().to_string()
+        } else {
+            filename.to_string()
+        }
+    }
+
+    pub(super) fn remember_export_dir(&mut self, path: &Path) {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.last_export_dir = Some(parent.to_path_buf());
+        }
     }
 
     fn push_recent_file(&mut self, path: &Path) {
@@ -1180,6 +1198,7 @@ impl ParaVizApp {
             ModalAction::SaveState(p) => match self.session.save_state_json() {
                 Ok(json) => match std::fs::write(&p, json) {
                     Ok(()) => {
+                        self.remember_export_dir(&p);
                         self.error_message = None;
                         self.status_message = format!("Saved state -> {}", p.display());
                     }
@@ -1203,6 +1222,7 @@ impl ParaVizApp {
                     };
                     match res {
                         Ok(()) => {
+                            self.remember_export_dir(&p);
                             self.error_message = None;
                             self.status_message = format!("Exported dataset -> {}", p.display());
                         }
@@ -1222,6 +1242,7 @@ impl ParaVizApp {
                         &p,
                     ) {
                         Ok(msg) => {
+                            self.remember_export_dir(&p);
                             self.error_message = None;
                             self.status_message = msg;
                         }
@@ -1248,6 +1269,7 @@ impl ParaVizApp {
                 });
                 match res {
                     Ok(()) => {
+                        self.remember_export_dir(&path);
                         self.error_message = None;
                         self.status_message = format!(
                             "Saved screenshot ({width}x{height}) -> {}",
@@ -1282,6 +1304,7 @@ impl ParaVizApp {
                 self.session.settings.show_scalar_bar = prev_bar;
                 match res {
                     Ok(()) => {
+                        self.remember_export_dir(&path);
                         self.error_message = None;
                         self.status_message = format!(
                             "Exported animated GIF ({width}x{height}) -> {}",

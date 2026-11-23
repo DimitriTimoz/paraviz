@@ -178,11 +178,12 @@ impl ParaVizApp {
                     })
                     .collect();
                 let stem = stem.trim_matches('_');
-                let default_path = if stem.is_empty() {
+                let fname = if stem.is_empty() {
                     format!("spreadsheet_{domain_slug}.csv")
                 } else {
                     format!("{stem}_{domain_slug}.csv")
                 };
+                let default_path = self.default_export_path(&fname);
                 self.modal = Some(AppModal::ExportSpreadsheetCsv(ExportSpreadsheetModalState {
                     path: default_path,
                     domain_label: domain_label.to_string(),
