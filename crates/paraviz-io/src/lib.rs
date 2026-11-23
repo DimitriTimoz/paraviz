@@ -13,45 +13,74 @@
 //! - Mesh formats (`.stl` ASCII & Binary, `.obj`, `.ply` ASCII & Binary LE/BE)
 //! - Delimited point clouds (`.csv`, `.tsv`)
 
+pub mod abaqus;
 pub mod cgns;
 pub mod csv;
+pub mod dicom;
 pub mod ensight;
 pub mod error;
 pub mod exodus;
 pub mod gif;
 pub mod gltf;
+pub mod gmsh;
 pub(crate) mod hdf5_common;
 pub mod html_viewer;
+pub mod image2d;
+pub mod las;
 pub(crate) mod limits;
 pub mod medical_volume;
 pub mod mesh;
+pub mod molecular;
+pub mod netcdf_cf;
 pub mod nifti;
+pub mod off;
 pub mod openfoam;
+pub mod plot3d;
 pub mod raw_volume;
+pub mod series;
+pub mod tecplot;
 pub mod vtk_legacy;
 pub mod vtk_xml;
 pub mod vtkhdf;
+pub mod x3d;
 pub mod xdmf;
+pub mod yales2_hdf5;
 
+pub use abaqus::read_abaqus;
 pub use cgns::read_cgns;
+pub use dicom::read_dicom;
 pub use ensight::read_ensight_case;
 pub use error::{IoError, Result};
 pub use exodus::{inspect_exodus_time_steps, read_exodus, read_exodus_at_time};
 pub use gif::{encode_animated_gif_bytes, write_animated_gif};
-pub use gltf::write_glb;
+pub use gltf::{read_gltf, write_glb};
+pub use gmsh::read_gmsh;
 pub use html_viewer::{encode_html_viewer, write_html_viewer};
+pub use image2d::{read_bmp, read_png, read_pnm};
+pub use las::read_las;
 pub use medical_volume::{read_metaimage, read_nrrd, write_metaimage};
 pub use mesh::PlyFormat;
+pub use molecular::{
+    inspect_pdb_time_steps, inspect_xyz_time_steps, read_pdb, read_pdb_at_time, read_xyz,
+    read_xyz_at_time,
+};
+pub use netcdf_cf::{inspect_netcdf_time_steps, read_netcdf_cf, read_netcdf_cf_at_time};
 pub use nifti::{read_nifti, write_nifti};
+pub use off::{read_off, write_off};
 pub use openfoam::read_openfoam;
+pub use plot3d::read_plot3d;
 pub use raw_volume::{
     read_raw_volume, read_raw_volume_i16, read_raw_volume_u16, read_raw_volume_with_type,
     RawEndian, RawScalarType, RawVolumeDescriptor,
 };
+pub use series::{inspect_series_time_steps, read_series, read_series_at_time};
+pub use tecplot::read_tecplot;
 pub use vtk_legacy::VtkLegacyFormat;
 pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
 pub use vtkhdf::{inspect_vtkhdf_time_steps, read_vtkhdf, read_vtkhdf_at_time};
+pub use x3d::read_x3d;
 pub use xdmf::{inspect_xdmf_time_steps, read_xdmf, read_xdmf_at_time};
+pub use yales2_hdf5::read_yales2_hdf5;
 
 use paraviz_core::{DataSet, PipelineError, PipelineInfo, Source};
 use serde::{Deserialize, Serialize};
@@ -67,18 +96,33 @@ pub enum DatasetReader {
     VtkHdf,
     Cgns,
     Exodus,
+    Yales2Hdf5,
     Xdmf,
     VtkXml,
     VtkLegacy,
+    Series,
     EnSight,
     OpenFoam,
+    Gmsh,
+    Plot3d,
+    Tecplot,
+    Abaqus,
+    NetCdf,
     Stl,
     Obj,
     Ply,
+    Off,
+    Gltf,
+    X3d,
+    Las,
+    Xyz,
+    Pdb,
     Csv,
     Nifti,
     Nrrd,
     MetaImage,
+    Dicom,
+    Image2d,
 }
 
 impl DatasetReader {
@@ -88,18 +132,33 @@ impl DatasetReader {
         Self::VtkHdf,
         Self::Cgns,
         Self::Exodus,
+        Self::Yales2Hdf5,
         Self::Xdmf,
         Self::VtkXml,
         Self::VtkLegacy,
+        Self::Series,
         Self::EnSight,
         Self::OpenFoam,
+        Self::Gmsh,
+        Self::Plot3d,
+        Self::Tecplot,
+        Self::Abaqus,
+        Self::NetCdf,
         Self::Stl,
         Self::Obj,
         Self::Ply,
+        Self::Off,
+        Self::Gltf,
+        Self::X3d,
+        Self::Las,
+        Self::Xyz,
+        Self::Pdb,
         Self::Csv,
         Self::Nifti,
         Self::Nrrd,
         Self::MetaImage,
+        Self::Dicom,
+        Self::Image2d,
     ];
 
     /// Human-readable reader name shown in the UI and diagnostics.
@@ -109,18 +168,33 @@ impl DatasetReader {
             Self::VtkHdf => "VTKHDF Reader (.vtkhdf)",
             Self::Cgns => "CGNS Reader (.cgns)",
             Self::Exodus => "Exodus II Reader (.exo, .e, .ex2)",
+            Self::Yales2Hdf5 => "YALES2 HDF5 Reader (.h5)",
             Self::Xdmf => "XDMF Reader (.xdmf, .xmf)",
             Self::VtkXml => "VTK XML Reader (.vtp, .vtu, .vti, .vtr, .vts, .vtm)",
             Self::VtkLegacy => "VTK Legacy Reader (.vtk)",
+            Self::Series => "ParaView File Series (.series)",
             Self::EnSight => "EnSight Gold Reader (.case)",
             Self::OpenFoam => "OpenFOAM Reader (.foam, polyMesh)",
+            Self::Gmsh => "Gmsh Mesh Reader (.msh)",
+            Self::Plot3d => "PLOT3D Reader (.xyz, .p3d)",
+            Self::Tecplot => "Tecplot ASCII Reader (.dat, .tec, .plt)",
+            Self::Abaqus => "Abaqus Input Reader (.inp)",
+            Self::NetCdf => "NetCDF CF Reader (.nc, .cdf)",
             Self::Stl => "STL Mesh Reader (.stl)",
             Self::Obj => "Wavefront OBJ Reader (.obj)",
             Self::Ply => "PLY Mesh Reader (.ply)",
+            Self::Off => "Geomview OFF Reader (.off)",
+            Self::Gltf => "glTF 2.0 / GLB Reader (.gltf, .glb)",
+            Self::X3d => "X3D Scene Reader (.x3d)",
+            Self::Las => "LAS LiDAR Reader (.las)",
+            Self::Xyz => "XYZ Molecular Reader (.xyz)",
+            Self::Pdb => "PDB Molecular Reader (.pdb, .ent)",
             Self::Csv => "CSV / TSV Table Reader (.csv, .tsv)",
             Self::Nifti => "NIfTI Volume Reader (.nii, .nii.gz)",
             Self::Nrrd => "NRRD Volume Reader (.nrrd, .nhdr)",
             Self::MetaImage => "MetaImage Volume Reader (.mhd, .mha)",
+            Self::Dicom => "DICOM Image Reader (.dcm)",
+            Self::Image2d => "2D Image Reader (.png, .bmp, .ppm, .pgm, .pbm)",
         }
     }
 
@@ -131,18 +205,33 @@ impl DatasetReader {
             Self::VtkHdf => "VTKHDF Reader",
             Self::Cgns => "CGNS Reader",
             Self::Exodus => "Exodus II Reader",
+            Self::Yales2Hdf5 => "YALES2 HDF5 Reader",
             Self::Xdmf => "XDMF Reader",
             Self::VtkXml => "VTK XML Reader",
             Self::VtkLegacy => "VTK Legacy Reader",
+            Self::Series => "Series Reader",
             Self::EnSight => "EnSight Gold Reader",
             Self::OpenFoam => "OpenFOAM Reader",
+            Self::Gmsh => "Gmsh Reader",
+            Self::Plot3d => "PLOT3D Reader",
+            Self::Tecplot => "Tecplot Reader",
+            Self::Abaqus => "Abaqus Reader",
+            Self::NetCdf => "NetCDF CF Reader",
             Self::Stl => "STL Reader",
             Self::Obj => "OBJ Reader",
             Self::Ply => "PLY Reader",
+            Self::Off => "OFF Reader",
+            Self::Gltf => "glTF Reader",
+            Self::X3d => "X3D Reader",
+            Self::Las => "LAS Reader",
+            Self::Xyz => "XYZ Molecular Reader",
+            Self::Pdb => "PDB Reader",
             Self::Csv => "CSV/TSV Reader",
             Self::Nifti => "NIfTI Reader",
             Self::Nrrd => "NRRD Reader",
             Self::MetaImage => "MetaImage Reader",
+            Self::Dicom => "DICOM Reader",
+            Self::Image2d => "2D Image Reader",
         }
     }
 
@@ -153,20 +242,35 @@ impl DatasetReader {
             "vtkhdf" | "vtk-hdf" | "vtk_hdf" => Some(Self::VtkHdf),
             "cgns" => Some(Self::Cgns),
             "exodus" | "exodus2" | "exodusii" | "exo" | "ex2" | "e" => Some(Self::Exodus),
+            "yales2" | "yales2-hdf5" => Some(Self::Yales2Hdf5),
             "xdmf" | "xmf" => Some(Self::Xdmf),
             "vtkxml" | "vtk-xml" | "vtk_xml" | "vtp" | "vtu" | "vti" | "vtr" | "vts" | "vtm" => {
                 Some(Self::VtkXml)
             }
             "vtk" | "vtklegacy" | "vtk-legacy" | "vtk_legacy" => Some(Self::VtkLegacy),
+            "series" => Some(Self::Series),
             "ensight" | "case" => Some(Self::EnSight),
             "openfoam" | "foam" => Some(Self::OpenFoam),
+            "gmsh" | "msh" => Some(Self::Gmsh),
+            "plot3d" | "p3d" => Some(Self::Plot3d),
+            "tecplot" | "tec" | "plt" => Some(Self::Tecplot),
+            "abaqus" | "inp" => Some(Self::Abaqus),
+            "netcdf" | "nc" | "cdf" => Some(Self::NetCdf),
             "stl" => Some(Self::Stl),
             "obj" => Some(Self::Obj),
             "ply" => Some(Self::Ply),
+            "off" => Some(Self::Off),
+            "gltf" | "glb" => Some(Self::Gltf),
+            "x3d" => Some(Self::X3d),
+            "las" => Some(Self::Las),
+            "xyz" => Some(Self::Xyz),
+            "pdb" | "ent" => Some(Self::Pdb),
             "csv" | "tsv" => Some(Self::Csv),
             "nifti" | "nii" => Some(Self::Nifti),
             "nrrd" | "nhdr" => Some(Self::Nrrd),
             "metaimage" | "mhd" | "mha" => Some(Self::MetaImage),
+            "dicom" | "dcm" => Some(Self::Dicom),
+            "image" | "png" | "bmp" | "ppm" | "pgm" | "pbm" => Some(Self::Image2d),
             _ => None,
         }
     }
@@ -213,12 +317,43 @@ pub fn detect_reader(path: impl AsRef<Path>) -> Result<DatasetReader> {
         "h5" | "hdf" | "hdf5" => detect_hdf5_reader(path),
         "nrrd" | "nhdr" => Ok(DatasetReader::Nrrd),
         "mhd" | "mha" => Ok(DatasetReader::MetaImage),
+        "dcm" => Ok(DatasetReader::Dicom),
+        "png" | "bmp" | "ppm" | "pgm" | "pbm" => Ok(DatasetReader::Image2d),
         "case" => Ok(DatasetReader::EnSight),
         "xdmf" | "xmf" => Ok(DatasetReader::Xdmf),
+        "series" => Ok(DatasetReader::Series),
         "foam" => Ok(DatasetReader::OpenFoam),
+        "msh" => Ok(DatasetReader::Gmsh),
+        "p3d" => Ok(DatasetReader::Plot3d),
+        "xyz" => {
+            if molecular::looks_like_xyz_molecular(magic_str) {
+                Ok(DatasetReader::Xyz)
+            } else {
+                Ok(DatasetReader::Plot3d)
+            }
+        }
+        "pdb" | "ent" => Ok(DatasetReader::Pdb),
+        "tec" | "plt" => Ok(DatasetReader::Tecplot),
+        "dat" => {
+            let up = magic_str.to_ascii_uppercase();
+            if up.contains("VARIABLES") || up.contains("ZONE") || up.contains("TITLE") {
+                Ok(DatasetReader::Tecplot)
+            } else {
+                Err(IoError::UnsupportedFormat(format!(
+                    "Cannot detect format for '{}'",
+                    path.display()
+                )))
+            }
+        }
+        "inp" => Ok(DatasetReader::Abaqus),
+        "nc" | "cdf" => Ok(DatasetReader::NetCdf),
         "stl" => Ok(DatasetReader::Stl),
         "obj" => Ok(DatasetReader::Obj),
         "ply" => Ok(DatasetReader::Ply),
+        "off" => Ok(DatasetReader::Off),
+        "gltf" | "glb" => Ok(DatasetReader::Gltf),
+        "x3d" => Ok(DatasetReader::X3d),
+        "las" => Ok(DatasetReader::Las),
         "csv" | "tsv" => Ok(DatasetReader::Csv),
         _ => {
             if path.file_name().and_then(|s| s.to_str()) == Some("controlDict") {
@@ -264,9 +399,12 @@ fn detect_hdf5_reader(path: &Path) -> Result<DatasetReader> {
     if exodus::is_exodus_hdf5(&file) {
         return Ok(DatasetReader::Exodus);
     }
+    if yales2_hdf5::is_yales2_hdf5(&file) {
+        return Ok(DatasetReader::Yales2Hdf5);
+    }
 
     Err(IoError::UnsupportedFormat(format!(
-        "HDF5 file '{}' does not match VTKHDF, CGNS, or Exodus II layout",
+        "HDF5 file '{}' does not match VTKHDF, CGNS, Exodus II, or YALES2 layout",
         path.display()
     )))
 }
@@ -291,19 +429,45 @@ pub fn read_dataset_with_reader(
             DatasetReader::VtkHdf => vtkhdf::read_vtkhdf(path),
             DatasetReader::Cgns => cgns::read_cgns(path),
             DatasetReader::Exodus => exodus::read_exodus(path),
+            DatasetReader::Yales2Hdf5 => yales2_hdf5::read_yales2_hdf5(path),
             DatasetReader::Xdmf => xdmf::read_xdmf(path),
             DatasetReader::VtkXml => vtk_xml::read_vtk_xml(path),
             DatasetReader::VtkLegacy => vtk_legacy::read_vtk_legacy(path),
+            DatasetReader::Series => series::read_series(path),
             DatasetReader::EnSight => ensight::read_ensight_case(path),
             DatasetReader::OpenFoam => openfoam::read_openfoam(path),
+            DatasetReader::Gmsh => gmsh::read_gmsh(path),
+            DatasetReader::Plot3d => plot3d::read_plot3d(path),
+            DatasetReader::Tecplot => tecplot::read_tecplot(path),
+            DatasetReader::Abaqus => abaqus::read_abaqus(path),
+            DatasetReader::NetCdf => netcdf_cf::read_netcdf_cf(path),
             DatasetReader::Stl => Ok(DataSet::PolyData(mesh::read_stl(path)?)),
             DatasetReader::Obj => Ok(DataSet::PolyData(mesh::read_obj(path)?)),
             DatasetReader::Ply => Ok(DataSet::PolyData(mesh::read_ply(path)?)),
+            DatasetReader::Off => Ok(DataSet::PolyData(off::read_off(path)?)),
+            DatasetReader::Gltf => gltf::read_gltf(path),
+            DatasetReader::X3d => x3d::read_x3d(path),
+            DatasetReader::Las => las::read_las(path),
+            DatasetReader::Xyz => molecular::read_xyz(path),
+            DatasetReader::Pdb => molecular::read_pdb(path),
             DatasetReader::Csv => Ok(DataSet::PolyData(csv::read_csv(path)?)),
             DatasetReader::Nifti => Ok(DataSet::ImageData(nifti::read_nifti(path)?)),
             DatasetReader::Nrrd => Ok(DataSet::ImageData(medical_volume::read_nrrd(path)?)),
             DatasetReader::MetaImage => {
                 Ok(DataSet::ImageData(medical_volume::read_metaimage(path)?))
+            }
+            DatasetReader::Dicom => dicom::read_dicom(path),
+            DatasetReader::Image2d => {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+                match ext.as_str() {
+                    "png" => image2d::read_png(path),
+                    "bmp" => image2d::read_bmp(path),
+                    _ => image2d::read_pnm(path),
+                }
             }
         }
     }));
@@ -355,6 +519,13 @@ pub fn write_dataset(path: impl AsRef<Path>, dataset: &DataSet) -> Result<()> {
             DataSet::PolyData(p) => mesh::write_ply(path, p),
             other => Err(IoError::UnsupportedFormat(format!(
                 "PLY writer requires PolyData, got {}",
+                other.type_name()
+            ))),
+        },
+        "off" => match dataset {
+            DataSet::PolyData(p) => off::write_off(path, p),
+            other => Err(IoError::UnsupportedFormat(format!(
+                "OFF writer requires PolyData, got {}",
                 other.type_name()
             ))),
         },
@@ -462,6 +633,22 @@ impl VtkFileSource {
                 exodus::inspect_exodus_time_steps(&path).unwrap_or_default()
             }))
             .unwrap_or_default(),
+            Some(DatasetReader::Series) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                series::inspect_series_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default(),
+            Some(DatasetReader::Xyz) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                molecular::inspect_xyz_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default(),
+            Some(DatasetReader::Pdb) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                molecular::inspect_pdb_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default(),
+            Some(DatasetReader::NetCdf) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                netcdf_cf::inspect_netcdf_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default(),
             _ => Vec::new(),
         };
         Self {
@@ -536,6 +723,54 @@ impl Source for VtkFileSource {
                         Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
                         Err(_) => Err(PipelineError::ExecutionFailed(format!(
                             "Exodus II Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                Some(DatasetReader::Series) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        series::read_series_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "Series Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                Some(DatasetReader::Xyz) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        molecular::read_xyz_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "XYZ Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                Some(DatasetReader::Pdb) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        molecular::read_pdb_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "PDB Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                Some(DatasetReader::NetCdf) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        netcdf_cf::read_netcdf_cf_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "NetCDF CF Reader failed unexpectedly while reading '{}'",
                             self.path.display()
                         ))),
                     };

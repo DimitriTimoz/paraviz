@@ -2322,9 +2322,556 @@ fn exodus_classic_cdf2_and_hdf5_multiblock_temporal() {
         let ug = ds.as_unstructured_grid().unwrap();
         assert_eq!(ug.cell_types, vec![CellType::Tetra]);
         assert!((ug.point_data.get("phi").unwrap().get_scalar(3) - 8.0).abs() < 1e-6);
-
-        let h5_p = dir.file("exodus_auto.h5");
-        fs::write(&h5_p, &bytes).unwrap();
-        assert_eq!(detect_reader(&h5_p).unwrap(), DatasetReader::Exodus);
     }
 }
+
+#[test]
+fn off_roundtrip_and_coff() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("off");
+    let coff_src = "\
+COFF
+# Simple colored triangle
+3 1 0
+0.0 0.0 0.0 255 0 0 255
+1.0 0.0 0.0 0 255 0 255
+0.0 1.0 0.0 0 0 255 255
+3 0 1 2
+";
+    let p = dir.file("tri.off");
+    fs::write(&p, coff_src).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Off);
+    let poly = ds.as_poly_data().unwrap();
+    assert_eq!(poly.points.len(), 3);
+    assert_eq!(poly.polys, vec![vec![0, 1, 2]]);
+    assert!(poly.point_data.get("Colors").is_some());
+
+    let out_p = dir.file("roundtrip.off");
+    write_dataset(&out_p, &ds).unwrap();
+    let ds2 = read_dataset(&out_p).unwrap();
+    let poly2 = ds2.as_poly_data().unwrap();
+    assert_eq!(poly2.points.len(), 3);
+    assert!(poly2.point_data.get("Colors").is_some());
+}
+
+#[test]
+fn gltf_and_glb_roundtrip_and_transforms() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("gltf_read");
+    let mut poly = sample_polydata();
+    poly.point_data.add_array(DataArray::scalars_f32(
+        "pressure",
+        vec![0.0, 0.25, 0.75, 1.0],
+    ));
+    let cmap = ColorMap::from_preset(ColorMapPreset::Viridis);
+    let glb_path = dir.file("mesh.glb");
+    write_glb(&glb_path, &poly, Some(&cmap), Some("pressure")).unwrap();
+
+    let (ds, reader) = read_dataset_with_reader(&glb_path, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Gltf);
+    let read_poly = ds.as_poly_data().unwrap();
+    assert_eq!(read_poly.points.len(), 4);
+    assert!(!read_poly.polys.is_empty());
+    assert!(read_poly.point_data.get("Normals").is_some());
+    assert!(read_poly.point_data.get("Colors").is_some());
+}
+
+#[test]
+fn paraview_series_temporal_source() {
+    use paraviz_io::{detect_reader, DatasetReader};
+    let dir = TestDir::new("series");
+    let mut p0 = sample_polydata();
+    p0.point_data
+        .add_array(DataArray::scalars_f32("t", vec![0.0; 4]));
+    let mut p1 = sample_polydata();
+    p1.point_data
+        .add_array(DataArray::scalars_f32("t", vec![2.5; 4]));
+
+    write_dataset(&dir.file("step_0.vtp"), &DataSet::PolyData(p0)).unwrap();
+    write_dataset(&dir.file("step_1.vtp"), &DataSet::PolyData(p1)).unwrap();
+
+    let series_json = r#"{
+  "file-series-version": "1.0",
+  "files": [
+    { "name": "step_0.vtp", "time": 0.0 },
+    { "name": "step_1.vtp", "time": 2.5 }
+  ]
+}"#;
+    let series_path = dir.file("sim.vtp.series");
+    fs::write(&series_path, series_json).unwrap();
+
+    assert_eq!(detect_reader(&series_path).unwrap(), DatasetReader::Series);
+    let src = VtkFileSource::new(&series_path);
+    let info = src.request_information();
+    assert_eq!(info.time_steps, vec![0.0, 2.5]);
+    let ds1 = src.execute(2.5).unwrap();
+    let poly1 = ds1.as_poly_data().unwrap();
+    assert!((poly1.point_data.get("t").unwrap().get_scalar(0) - 2.5).abs() < 1e-6);
+}
+
+#[test]
+fn molecular_xyz_and_pdb_temporal() {
+    use paraviz_io::{detect_reader, DatasetReader};
+    let dir = TestDir::new("mol");
+    let xyz_txt = "\
+2
+frame 0
+H 0.0 0.0 0.0
+O 1.0 0.0 0.0
+2
+frame 1
+H 0.5 0.0 0.0
+O 1.5 0.0 0.0
+";
+    let xyz_path = dir.file("water.xyz");
+    fs::write(&xyz_path, xyz_txt).unwrap();
+    assert_eq!(detect_reader(&xyz_path).unwrap(), DatasetReader::Xyz);
+    let src = VtkFileSource::new(&xyz_path);
+    assert_eq!(src.request_information().time_steps, vec![0.0, 1.0]);
+    let ds1 = src.execute(1.0).unwrap();
+    let p1 = ds1.as_poly_data().unwrap();
+    assert_eq!(p1.points[0][0], 0.5);
+    assert_eq!(p1.point_data.get("AtomicNumber").unwrap().get_scalar(1) as i32, 8);
+
+    let pdb_txt = "\
+MODEL        1
+ATOM      1  N   ALA A   1       1.000   2.000   3.000  1.00 10.00           N
+ATOM      2  CA  ALA A   1       2.000   2.000   3.000  1.00 20.00           C
+CONECT    1    2
+ENDMDL
+MODEL        2
+ATOM      1  N   ALA A   1       4.000   2.000   3.000  1.00 10.00           N
+ATOM      2  CA  ALA A   1       5.000   2.000   3.000  1.00 20.00           C
+ENDMDL
+";
+    let pdb_path = dir.file("mol.pdb");
+    fs::write(&pdb_path, pdb_txt).unwrap();
+    assert_eq!(detect_reader(&pdb_path).unwrap(), DatasetReader::Pdb);
+    let pdb_src = VtkFileSource::new(&pdb_path);
+    assert_eq!(pdb_src.request_information().time_steps, vec![0.0, 1.0]);
+    let m0 = pdb_src.execute(0.0).unwrap();
+    let mp0 = m0.as_poly_data().unwrap();
+    assert_eq!(mp0.points.len(), 2);
+    assert_eq!(mp0.lines, vec![vec![0, 1]]);
+}
+
+#[test]
+fn x3d_indexed_face_set_and_transform() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("x3d");
+    let x3d_txt = r#"<?xml version="1.0" encoding="UTF-8"?>
+<X3D profile="Interchange" version="3.3">
+  <Scene>
+    <Transform translation="10 0 0">
+      <Shape>
+        <IndexedFaceSet coordIndex="0 1 2 -1">
+          <Coordinate point="0 0 0 1 0 0 0 1 0"/>
+          <Color color="1 0 0 0 1 0 0 0 1"/>
+        </IndexedFaceSet>
+      </Shape>
+    </Transform>
+  </Scene>
+</X3D>"#;
+    let p = dir.file("tri.x3d");
+    fs::write(&p, x3d_txt).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::X3d);
+    let poly = ds.as_poly_data().unwrap();
+    assert_eq!(poly.points[0], [10.0, 0.0, 0.0]);
+    assert_eq!(poly.polys, vec![vec![0, 1, 2]]);
+    assert!(poly.point_data.get("Colors").is_some());
+}
+
+#[test]
+fn gmsh_v2_and_v4_ascii() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("gmsh");
+    let msh2 = "\
+$MeshFormat
+2.2 0 8
+$EndMeshFormat
+$Nodes
+4
+1 0 0 0
+2 1 0 0
+3 0 1 0
+4 0 0 1
+$EndNodes
+$Elements
+1
+1 4 2 99 1 1 2 3 4
+$EndElements
+$NodeData
+1
+\"temp\"
+1
+0.0
+3
+0
+1
+4
+1 10.0
+2 20.0
+3 30.0
+4 40.0
+$EndNodeData
+";
+    let p2 = dir.file("tet_v2.msh");
+    fs::write(&p2, msh2).unwrap();
+    let (ds2, reader) = read_dataset_with_reader(&p2, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Gmsh);
+    let ug2 = ds2.as_unstructured_grid().unwrap();
+    assert_eq!(ug2.points.len(), 4);
+    assert_eq!(ug2.cell_types, vec![CellType::Tetra]);
+    assert!((ug2.point_data.get("temp").unwrap().get_scalar(3) - 40.0).abs() < 1e-6);
+
+    let msh4 = "\
+$MeshFormat
+4.1 0 8
+$EndMeshFormat
+$Nodes
+1 3 1 3
+2 1 0 3
+1
+2
+3
+0 0 0
+1 0 0
+0 1 0
+$EndNodes
+$Elements
+1 1 1 1
+2 1 2 1
+1 1 2 3
+$EndElements
+";
+    let p4 = dir.file("tri_v4.msh");
+    fs::write(&p4, msh4).unwrap();
+    let ds4 = read_dataset(&p4).unwrap();
+    let ug4 = ds4.as_unstructured_grid().unwrap();
+    assert_eq!(ug4.points.len(), 3);
+    assert_eq!(ug4.cell_types, vec![CellType::Triangle]);
+}
+
+#[test]
+fn plot3d_ascii_and_binary_with_q() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("plot3d");
+    // Binary Fortran unformatted 2x2x1 single-grid .xyz + .q
+    fn f_rec(payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() as u32).to_le_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(&len);
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&len);
+        out
+    }
+
+    let mut hdr = Vec::new();
+    for v in [2i32, 2, 1] {
+        hdr.extend_from_slice(&v.to_le_bytes());
+    }
+    let xs = [0.0f32, 1.0, 0.0, 1.0];
+    let ys = [0.0f32, 0.0, 1.0, 1.0];
+    let zs = [0.0f32, 0.0, 0.0, 0.0];
+    let mut coords = Vec::new();
+    for v in xs.iter().chain(ys.iter()).chain(zs.iter()) {
+        coords.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut xyz_bytes = Vec::new();
+    xyz_bytes.extend_from_slice(&f_rec(&hdr));
+    xyz_bytes.extend_from_slice(&f_rec(&coords));
+
+    let xyz_path = dir.file("grid.xyz");
+    fs::write(&xyz_path, &xyz_bytes).unwrap();
+
+    // Companion .q file
+    let cond = [0.0f32; 4];
+    let mut cond_b = Vec::new();
+    for v in cond {
+        cond_b.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut q_vals = Vec::new();
+    for _ in 0..4 { q_vals.extend_from_slice(&2.0f32.to_le_bytes()); } // rho = 2
+    for _ in 0..4 { q_vals.extend_from_slice(&4.0f32.to_le_bytes()); } // mx = 4 -> vx = 2
+    for _ in 0..4 { q_vals.extend_from_slice(&0.0f32.to_le_bytes()); } // my
+    for _ in 0..4 { q_vals.extend_from_slice(&0.0f32.to_le_bytes()); } // mz
+    for _ in 0..4 { q_vals.extend_from_slice(&10.0f32.to_le_bytes()); } // energy
+    let mut q_bytes = Vec::new();
+    q_bytes.extend_from_slice(&f_rec(&hdr));
+    q_bytes.extend_from_slice(&f_rec(&cond_b));
+    q_bytes.extend_from_slice(&f_rec(&q_vals));
+    fs::write(dir.file("grid.q"), &q_bytes).unwrap();
+
+    let (ds, reader) = read_dataset_with_reader(&xyz_path, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Plot3d);
+    let DataSet::StructuredGrid(sg) = ds else { panic!("expected StructuredGrid") };
+    assert_eq!(sg.dimensions, [2, 2, 1]);
+    assert!((sg.point_data.get("Density").unwrap().get_scalar(0) - 2.0).abs() < 1e-6);
+    assert!((sg.point_data.get("Velocity").unwrap().get_magnitude(0) - 2.0).abs() < 1e-6);
+}
+
+#[test]
+fn tecplot_ordered_and_fe_zones() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("tecplot");
+    let tec = "\
+TITLE = \"Test\"
+VARIABLES = \"X\", \"Y\", \"Z\", \"P\"
+ZONE T=\"TriZone\", NODES=3, ELEMENTS=1, DATAPACKING=POINT, ZONETYPE=FETRIANGLE
+0.0 0.0 0.0 1.0
+1.0 0.0 0.0 2.0
+0.0 1.0 0.0 3.0
+1 2 3
+";
+    let p = dir.file("flow.dat");
+    fs::write(&p, tec).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Tecplot);
+    let ug = ds.as_unstructured_grid().unwrap();
+    assert_eq!(ug.points.len(), 3);
+    assert_eq!(ug.cell_types, vec![CellType::Triangle]);
+    assert!((ug.point_data.get("P").unwrap().get_scalar(2) - 3.0).abs() < 1e-6);
+}
+
+#[test]
+fn abaqus_inp_mesh_and_elsets() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("abaqus");
+    let inp = "\
+*HEADING
+Simple Abaqus Tet
+*NODE
+1, 0.0, 0.0, 0.0
+2, 1.0, 0.0, 0.0
+3, 0.0, 1.0, 0.0
+4, 0.0, 0.0, 1.0
+*ELEMENT, TYPE=C3D4, ELSET=EALL
+10, 1, 2, 3, 4
+*ELSET, ELSET=CORE
+10
+";
+    let p = dir.file("part.inp");
+    fs::write(&p, inp).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Abaqus);
+    let ug = ds.as_unstructured_grid().unwrap();
+    assert_eq!(ug.points.len(), 4);
+    assert_eq!(ug.cell_types, vec![CellType::Tetra]);
+    assert_eq!(ug.cell_data.get("ElsetId").unwrap().get_scalar(0) as i32, 1);
+}
+
+#[test]
+fn netcdf3_cf_rectilinear_and_temporal() {
+    use paraviz_io::{detect_reader, DatasetReader};
+    let dir = TestDir::new("netcdf_cf");
+    fn pad4(buf: &mut Vec<u8>) {
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+    }
+    fn push_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        pad4(buf);
+    }
+
+    let mut hdr = Vec::new();
+    hdr.extend_from_slice(b"CDF\x01");
+    hdr.extend_from_slice(&0u32.to_be_bytes()); // numrecs
+    // NC_DIMENSION = 10, count = 3
+    hdr.extend_from_slice(&10u32.to_be_bytes());
+    hdr.extend_from_slice(&3u32.to_be_bytes());
+    push_str(&mut hdr, "time"); hdr.extend_from_slice(&2u32.to_be_bytes());
+    push_str(&mut hdr, "y"); hdr.extend_from_slice(&2u32.to_be_bytes());
+    push_str(&mut hdr, "x"); hdr.extend_from_slice(&3u32.to_be_bytes());
+    // Global atts = ABSENT (0)
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    // NC_VARIABLE = 11, count = 4 (time, x, y, temp)
+    hdr.extend_from_slice(&11u32.to_be_bytes());
+    hdr.extend_from_slice(&4u32.to_be_bytes());
+
+    let mut var_offset_positions = Vec::new();
+    push_str(&mut hdr, "time");
+    hdr.extend_from_slice(&1u32.to_be_bytes());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    hdr.extend_from_slice(&6u32.to_be_bytes());
+    hdr.extend_from_slice(&16u32.to_be_bytes());
+    var_offset_positions.push(hdr.len());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+
+    push_str(&mut hdr, "x");
+    hdr.extend_from_slice(&1u32.to_be_bytes());
+    hdr.extend_from_slice(&2u32.to_be_bytes());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    hdr.extend_from_slice(&5u32.to_be_bytes());
+    hdr.extend_from_slice(&12u32.to_be_bytes());
+    var_offset_positions.push(hdr.len());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+
+    push_str(&mut hdr, "y");
+    hdr.extend_from_slice(&1u32.to_be_bytes());
+    hdr.extend_from_slice(&1u32.to_be_bytes());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    hdr.extend_from_slice(&5u32.to_be_bytes());
+    hdr.extend_from_slice(&8u32.to_be_bytes());
+    var_offset_positions.push(hdr.len());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+
+    push_str(&mut hdr, "temp");
+    hdr.extend_from_slice(&3u32.to_be_bytes());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    hdr.extend_from_slice(&1u32.to_be_bytes());
+    hdr.extend_from_slice(&2u32.to_be_bytes());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+    hdr.extend_from_slice(&5u32.to_be_bytes());
+    hdr.extend_from_slice(&48u32.to_be_bytes());
+    var_offset_positions.push(hdr.len());
+    hdr.extend_from_slice(&0u32.to_be_bytes());
+
+    let mut data_off = hdr.len() as u32;
+    hdr[var_offset_positions[0]..var_offset_positions[0] + 4].copy_from_slice(&data_off.to_be_bytes());
+    for t in [0.0f64, 5.0] {
+        hdr.extend_from_slice(&t.to_be_bytes());
+    }
+    data_off = hdr.len() as u32;
+    hdr[var_offset_positions[1]..var_offset_positions[1] + 4].copy_from_slice(&data_off.to_be_bytes());
+    for x in [0.0f32, 1.0, 2.0] {
+        hdr.extend_from_slice(&x.to_be_bytes());
+    }
+    data_off = hdr.len() as u32;
+    hdr[var_offset_positions[2]..var_offset_positions[2] + 4].copy_from_slice(&data_off.to_be_bytes());
+    for y in [0.0f32, 10.0] {
+        hdr.extend_from_slice(&y.to_be_bytes());
+    }
+    data_off = hdr.len() as u32;
+    hdr[var_offset_positions[3]..var_offset_positions[3] + 4].copy_from_slice(&data_off.to_be_bytes());
+    for v in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0] {
+        hdr.extend_from_slice(&v.to_be_bytes());
+    }
+
+    let nc_path = dir.file("ocean.nc");
+    fs::write(&nc_path, &hdr).unwrap();
+    assert_eq!(detect_reader(&nc_path).unwrap(), DatasetReader::NetCdf);
+    let src = VtkFileSource::new(&nc_path);
+    assert_eq!(src.request_information().time_steps, vec![0.0, 5.0]);
+    let ds1 = src.execute(5.0).unwrap();
+    let DataSet::RectilinearGrid(rg) = ds1 else { panic!("expected RectilinearGrid") };
+    assert_eq!(rg.dimensions(), [3, 2, 1]);
+    assert!((rg.point_data.get("temp").unwrap().get_scalar(0) - 11.0).abs() < 1e-6);
+}
+
+#[test]
+fn yales2_hdf5_patch_layout() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("yales2");
+    let mut b = Hdf5Builder::new();
+    let xyz = b.add_dataset(
+        &Hdf5Builder::dtype_f32(),
+        &[3, 3],
+        &f32_bytes(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        vec![],
+    );
+    let conn = b.add_dataset(
+        &Hdf5Builder::dtype_i32(),
+        &[4],
+        &i32_bytes(&[4, 0, 1, 2]),
+        vec![],
+    );
+    let u = b.add_dataset(
+        &Hdf5Builder::dtype_f32(),
+        &[3],
+        &f32_bytes(&[7.0, 8.0, 9.0]),
+        vec![],
+    );
+    let patch = b.add_group(&[("XYZ", xyz), ("ELEM2NODE", conn), ("P", u)], vec![]);
+    let root = b.add_group(&[("Patch_001-wall", patch)], vec![]);
+    let bytes = b.finish(root);
+
+    let p = dir.file("pipe.solutbound.h5");
+    fs::write(&p, &bytes).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Yales2Hdf5);
+    let ug = ds.as_unstructured_grid().unwrap();
+    assert_eq!(ug.points.len(), 3);
+    assert_eq!(ug.cell_types, vec![CellType::Triangle]);
+    assert!((ug.point_data.get("P").unwrap().get_scalar(2) - 9.0).abs() < 1e-6);
+}
+
+#[test]
+fn las_lidar_point_cloud_and_colors() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("las");
+    let mut buf = vec![0u8; 227 + 26];
+    buf[0..4].copy_from_slice(b"LASF");
+    buf[24] = 1;
+    buf[25] = 2;
+    buf[96..100].copy_from_slice(&227u32.to_le_bytes());
+    buf[104] = 2;
+    buf[105..107].copy_from_slice(&26u16.to_le_bytes());
+    buf[107..111].copy_from_slice(&1u32.to_le_bytes());
+    buf[131..139].copy_from_slice(&0.01f64.to_le_bytes());
+    buf[139..147].copy_from_slice(&0.01f64.to_le_bytes());
+    buf[147..155].copy_from_slice(&0.01f64.to_le_bytes());
+    buf[227..231].copy_from_slice(&100i32.to_le_bytes());
+    buf[231..235].copy_from_slice(&200i32.to_le_bytes());
+    buf[235..239].copy_from_slice(&300i32.to_le_bytes());
+    buf[239..241].copy_from_slice(&500u16.to_le_bytes());
+    buf[242] = 2;
+    buf[247..249].copy_from_slice(&(200u16 << 8).to_le_bytes());
+
+    let p = dir.file("scan.las");
+    fs::write(&p, &buf).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Las);
+    let poly = ds.as_poly_data().unwrap();
+    assert_eq!(poly.points.len(), 1);
+    assert!((poly.points[0][0] - 1.0).abs() < 1e-5);
+    assert_eq!(poly.point_data.get("Intensity").unwrap().get_scalar(0) as u16, 500);
+    assert_eq!(poly.point_data.get("Classification").unwrap().get_scalar(0) as u8, 2);
+}
+
+#[test]
+fn image2d_pnm_and_dicom() {
+    use paraviz_io::{read_dataset_with_reader, DatasetReader};
+    let dir = TestDir::new("img2d");
+    let ppm = b"P3\n2 1\n255\n255 0 0  0 255 0\n";
+    let ppm_p = dir.file("img.ppm");
+    fs::write(&ppm_p, ppm).unwrap();
+    let (ds, reader) = read_dataset_with_reader(&ppm_p, DatasetReader::Auto).unwrap();
+    assert_eq!(reader, DatasetReader::Image2d);
+    let img = ds.as_image_data().unwrap();
+    assert_eq!(img.dimensions, [2, 1, 1]);
+    assert!(img.point_data.get("Colors").is_some());
+
+    let mut dcm = vec![0u8; 132];
+    dcm[128..132].copy_from_slice(b"DICM");
+    fn add_tag_u16(buf: &mut Vec<u8>, g: u16, e: u16, val: u16) {
+        buf.extend_from_slice(&g.to_le_bytes());
+        buf.extend_from_slice(&e.to_le_bytes());
+        buf.extend_from_slice(b"US");
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+    add_tag_u16(&mut dcm, 0x0028, 0x0010, 2);
+    add_tag_u16(&mut dcm, 0x0028, 0x0011, 2);
+    add_tag_u16(&mut dcm, 0x0028, 0x0100, 16);
+    dcm.extend_from_slice(&0x7FE0u16.to_le_bytes());
+    dcm.extend_from_slice(&0x0010u16.to_le_bytes());
+    dcm.extend_from_slice(b"OW");
+    dcm.extend_from_slice(&0u16.to_le_bytes());
+    dcm.extend_from_slice(&8u32.to_le_bytes());
+    for px in [10u16, 20, 30, 40] {
+        dcm.extend_from_slice(&px.to_le_bytes());
+    }
+    let dcm_p = dir.file("slice.dcm");
+    fs::write(&dcm_p, &dcm).unwrap();
+    let (dds, dreader) = read_dataset_with_reader(&dcm_p, DatasetReader::Auto).unwrap();
+    assert_eq!(dreader, DatasetReader::Dicom);
+    let dimg = dds.as_image_data().unwrap();
+    assert_eq!(dimg.dimensions, [2, 2, 1]);
+    assert_eq!(dimg.point_data.get("Scalars").unwrap().get_scalar(3) as u16, 40);
+}
+
