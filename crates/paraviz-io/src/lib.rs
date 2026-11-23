@@ -1,18 +1,26 @@
+#![forbid(unsafe_code)]
+
 //! ParaViz scientific file format I/O.
 //!
 //! Provides readers, writers, and pipeline [`Source`] implementations for:
 //! - Legacy VTK (`.vtk`, ASCII and Big-Endian Binary)
 //! - VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvti`, `.pvtu`, ASCII / Base64 Binary / Appended / Zlib)
+//! - VTKHDF (`.vtkhdf`, HDF5-backed ImageData / PolyData / UnstructuredGrid / Composite + Steps)
+//! - CGNS (`.cgns`, HDF5-backed Structured / Unstructured + FlowSolution)
+//! - Exodus II (`.exo`, `.e`, `.ex2`, NetCDF Classic / 64-bit Offset / HDF5 NetCDF-4)
 //! - Raw binary 3D volumes (`.raw`)
 //! - Binary glTF 2.0 export (`.glb`)
 //! - Mesh formats (`.stl` ASCII & Binary, `.obj`, `.ply` ASCII & Binary LE/BE)
 //! - Delimited point clouds (`.csv`, `.tsv`)
 
+pub mod cgns;
 pub mod csv;
 pub mod ensight;
 pub mod error;
+pub mod exodus;
 pub mod gif;
 pub mod gltf;
+pub(crate) mod hdf5_common;
 pub mod html_viewer;
 pub(crate) mod limits;
 pub mod medical_volume;
@@ -22,10 +30,13 @@ pub mod openfoam;
 pub mod raw_volume;
 pub mod vtk_legacy;
 pub mod vtk_xml;
+pub mod vtkhdf;
 pub mod xdmf;
 
+pub use cgns::read_cgns;
 pub use ensight::read_ensight_case;
 pub use error::{IoError, Result};
+pub use exodus::{inspect_exodus_time_steps, read_exodus, read_exodus_at_time};
 pub use gif::{encode_animated_gif_bytes, write_animated_gif};
 pub use gltf::write_glb;
 pub use html_viewer::{encode_html_viewer, write_html_viewer};
@@ -39,6 +50,7 @@ pub use raw_volume::{
 };
 pub use vtk_legacy::VtkLegacyFormat;
 pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
+pub use vtkhdf::{inspect_vtkhdf_time_steps, read_vtkhdf, read_vtkhdf_at_time};
 pub use xdmf::{inspect_xdmf_time_steps, read_xdmf, read_xdmf_at_time};
 
 use paraviz_core::{DataSet, PipelineError, PipelineInfo, Source};
@@ -52,6 +64,9 @@ use std::path::{Path, PathBuf};
 pub enum DatasetReader {
     #[default]
     Auto,
+    VtkHdf,
+    Cgns,
+    Exodus,
     Xdmf,
     VtkXml,
     VtkLegacy,
@@ -70,6 +85,9 @@ impl DatasetReader {
     /// All selectable reader options, starting with [`DatasetReader::Auto`].
     pub const ALL: &'static [DatasetReader] = &[
         Self::Auto,
+        Self::VtkHdf,
+        Self::Cgns,
+        Self::Exodus,
         Self::Xdmf,
         Self::VtkXml,
         Self::VtkLegacy,
@@ -88,6 +106,9 @@ impl DatasetReader {
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto-detect",
+            Self::VtkHdf => "VTKHDF Reader (.vtkhdf)",
+            Self::Cgns => "CGNS Reader (.cgns)",
+            Self::Exodus => "Exodus II Reader (.exo, .e, .ex2)",
             Self::Xdmf => "XDMF Reader (.xdmf, .xmf)",
             Self::VtkXml => "VTK XML Reader (.vtp, .vtu, .vti, .vtr, .vts, .vtm)",
             Self::VtkLegacy => "VTK Legacy Reader (.vtk)",
@@ -107,6 +128,9 @@ impl DatasetReader {
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
+            Self::VtkHdf => "VTKHDF Reader",
+            Self::Cgns => "CGNS Reader",
+            Self::Exodus => "Exodus II Reader",
             Self::Xdmf => "XDMF Reader",
             Self::VtkXml => "VTK XML Reader",
             Self::VtkLegacy => "VTK Legacy Reader",
@@ -126,6 +150,9 @@ impl DatasetReader {
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "auto" | "auto-detect" => Some(Self::Auto),
+            "vtkhdf" | "vtk-hdf" | "vtk_hdf" => Some(Self::VtkHdf),
+            "cgns" => Some(Self::Cgns),
+            "exodus" | "exodus2" | "exodusii" | "exo" | "ex2" | "e" => Some(Self::Exodus),
             "xdmf" | "xmf" => Some(Self::Xdmf),
             "vtkxml" | "vtk-xml" | "vtk_xml" | "vtp" | "vtu" | "vti" | "vtr" | "vts" | "vtm" => {
                 Some(Self::VtkXml)
@@ -180,6 +207,10 @@ pub fn detect_reader(path: impl AsRef<Path>) -> Result<DatasetReader> {
         }
         "vtp" | "vti" | "vtu" | "vtr" | "vts" | "vtm" | "pvd" | "pvtp" | "pvti" | "pvtu"
         | "pvtr" | "pvts" => Ok(DatasetReader::VtkXml),
+        "vtkhdf" => Ok(DatasetReader::VtkHdf),
+        "cgns" => Ok(DatasetReader::Cgns),
+        "exo" | "e" | "ex2" => Ok(DatasetReader::Exodus),
+        "h5" | "hdf" | "hdf5" => detect_hdf5_reader(path),
         "nrrd" | "nhdr" => Ok(DatasetReader::Nrrd),
         "mhd" | "mha" => Ok(DatasetReader::MetaImage),
         "case" => Ok(DatasetReader::EnSight),
@@ -192,6 +223,10 @@ pub fn detect_reader(path: impl AsRef<Path>) -> Result<DatasetReader> {
         _ => {
             if path.file_name().and_then(|s| s.to_str()) == Some("controlDict") {
                 Ok(DatasetReader::OpenFoam)
+            } else if magic.starts_with(b"CDF\x01") || magic.starts_with(b"CDF\x02") {
+                Ok(DatasetReader::Exodus)
+            } else if magic.starts_with(b"\x89HDF\r\n\x1a\n") {
+                detect_hdf5_reader(path)
             } else if magic_str.starts_with("# vtk DataFile Version") {
                 Ok(DatasetReader::VtkLegacy)
             } else if magic_str.contains("<Xdmf") || magic_str.contains("<xdmf") {
@@ -214,6 +249,28 @@ pub fn detect_reader(path: impl AsRef<Path>) -> Result<DatasetReader> {
     }
 }
 
+fn detect_hdf5_reader(path: &Path) -> Result<DatasetReader> {
+    let file = hdf5_common::open_hdf5(path)?;
+    let root = file
+        .root_group()
+        .map_err(|e| IoError::Parse(format!("Failed to inspect HDF5 root group: {e}")))?;
+
+    if root.group("VTKHDF").is_ok() || hdf5_common::group_attr_string(&root, "Type").is_some() {
+        return Ok(DatasetReader::VtkHdf);
+    }
+    if cgns::is_cgns_hdf5(&file) {
+        return Ok(DatasetReader::Cgns);
+    }
+    if exodus::is_exodus_hdf5(&file) {
+        return Ok(DatasetReader::Exodus);
+    }
+
+    Err(IoError::UnsupportedFormat(format!(
+        "HDF5 file '{}' does not match VTKHDF, CGNS, or Exodus II layout",
+        path.display()
+    )))
+}
+
 /// Reads a scientific dataset from `path` using `reader` (or auto-detecting if [`DatasetReader::Auto`]),
 /// returning both the loaded [`DataSet`] and the concrete [`DatasetReader`] that was used.
 pub fn read_dataset_with_reader(
@@ -231,6 +288,9 @@ pub fn read_dataset_with_reader(
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<DataSet> {
         match resolved {
             DatasetReader::Auto => unreachable!(),
+            DatasetReader::VtkHdf => vtkhdf::read_vtkhdf(path),
+            DatasetReader::Cgns => cgns::read_cgns(path),
+            DatasetReader::Exodus => exodus::read_exodus(path),
             DatasetReader::Xdmf => xdmf::read_xdmf(path),
             DatasetReader::VtkXml => vtk_xml::read_vtk_xml(path),
             DatasetReader::VtkLegacy => vtk_legacy::read_vtk_legacy(path),
@@ -361,12 +421,13 @@ fn read_magic_prefix(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 /// Pipeline [`Source`] that reads any single dataset file supported by `paraviz-io`
-/// (including temporal XDMF collections on demand).
+/// (including temporal XDMF, VTKHDF, and Exodus II collections on demand).
 #[derive(Debug, Clone)]
 pub struct VtkFileSource {
     path: PathBuf,
     label: String,
     reader: DatasetReader,
+    resolved_reader: Option<DatasetReader>,
     time_steps: Vec<f64>,
 }
 
@@ -384,20 +445,30 @@ impl VtkFileSource {
             .and_then(|s| s.to_str())
             .unwrap_or("VtkFileSource")
             .to_string();
-        let is_xdmf = reader == DatasetReader::Xdmf
-            || (reader == DatasetReader::Auto && detect_reader(&path).ok() == Some(DatasetReader::Xdmf));
-        let time_steps = if is_xdmf {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let resolved_reader = match reader {
+            DatasetReader::Auto => detect_reader(&path).ok(),
+            explicit => Some(explicit),
+        };
+        let time_steps = match resolved_reader {
+            Some(DatasetReader::Xdmf) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 xdmf::inspect_xdmf_time_steps(&path).unwrap_or_default()
             }))
-            .unwrap_or_default()
-        } else {
-            Vec::new()
+            .unwrap_or_default(),
+            Some(DatasetReader::VtkHdf) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                vtkhdf::inspect_vtkhdf_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default(),
+            Some(DatasetReader::Exodus) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                exodus::inspect_exodus_time_steps(&path).unwrap_or_default()
+            }))
+            .unwrap_or_default(),
+            _ => Vec::new(),
         };
         Self {
             path,
             label,
             reader,
+            resolved_reader,
             time_steps,
         }
     }
@@ -428,17 +499,49 @@ impl Source for VtkFileSource {
 
     fn execute(&self, time: f64) -> std::result::Result<DataSet, PipelineError> {
         if !self.time_steps.is_empty() {
+            let resolved = self
+                .resolved_reader
+                .or_else(|| detect_reader(&self.path).ok());
             let path = self.path.clone();
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                xdmf::read_xdmf_at_time(&path, time)
-            }));
-            return match res {
-                Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
-                Err(_) => Err(PipelineError::ExecutionFailed(format!(
-                    "XDMF Reader failed unexpectedly while reading '{}'",
-                    self.path.display()
-                ))),
-            };
+            match resolved {
+                Some(DatasetReader::Xdmf) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        xdmf::read_xdmf_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "XDMF Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                Some(DatasetReader::VtkHdf) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        vtkhdf::read_vtkhdf_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "VTKHDF Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                Some(DatasetReader::Exodus) => {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        exodus::read_exodus_at_time(&path, time)
+                    }));
+                    return match res {
+                        Ok(inner) => inner.map_err(|e| PipelineError::ExecutionFailed(e.to_string())),
+                        Err(_) => Err(PipelineError::ExecutionFailed(format!(
+                            "Exodus II Reader failed unexpectedly while reading '{}'",
+                            self.path.display()
+                        ))),
+                    };
+                }
+                _ => {}
+            }
         }
         read_dataset_with_reader(&self.path, self.reader)
             .map(|(ds, _)| ds)

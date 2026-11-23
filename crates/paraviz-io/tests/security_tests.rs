@@ -147,3 +147,69 @@ fn path_traversal_blocked_across_readers() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn exodus_netcdf_rejects_huge_counts_and_truncated_data_without_oom() {
+    // 1) CDF\x01 claiming 400_000_000 dimensions in a 20-byte file
+    let mut huge_dims = Vec::new();
+    huge_dims.extend_from_slice(b"CDF\x01");
+    huge_dims.extend_from_slice(&0u32.to_be_bytes()); // numrecs
+    huge_dims.extend_from_slice(&10u32.to_be_bytes()); // NC_DIMENSION
+    huge_dims.extend_from_slice(&400_000_000u32.to_be_bytes());
+    assert!(paraviz_io::exodus::read_exodus_bytes(&huge_dims).is_err());
+
+    // 2) Truncated NetCDF header
+    assert!(paraviz_io::exodus::read_exodus_bytes(b"CDF\x01\x00\x00").is_err());
+
+    // 3) Out-of-bounds 1-based connectivity index in Exodus II
+    let mut bad_conn = Vec::new();
+    bad_conn.extend_from_slice(b"CDF\x01");
+    bad_conn.extend_from_slice(&0u32.to_be_bytes()); // numrecs
+    // 3 dims: num_nodes=2, num_el_in_blk1=1, num_nod_per_el1=3
+    bad_conn.extend_from_slice(&10u32.to_be_bytes());
+    bad_conn.extend_from_slice(&3u32.to_be_bytes());
+    for (name, len) in [("num_nodes", 2u32), ("num_el_in_blk1", 1u32), ("num_nod_per_el1", 3u32)] {
+        bad_conn.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        bad_conn.extend_from_slice(name.as_bytes());
+        let pad = (4 - (name.len() % 4)) % 4;
+        bad_conn.extend(std::iter::repeat_n(0u8, pad));
+        bad_conn.extend_from_slice(&len.to_be_bytes());
+    }
+    // global attrs = ABSENT
+    bad_conn.extend_from_slice(&[0u8; 8]);
+    // 3 vars: coordx, coordy, connect1
+    bad_conn.extend_from_slice(&11u32.to_be_bytes());
+    bad_conn.extend_from_slice(&3u32.to_be_bytes());
+    let mut begin_slots = Vec::new();
+    for (name, dimids, nc_type, vsize) in [
+        ("coordx", vec![0u32], 5u32, 8u32),
+        ("coordy", vec![0u32], 5u32, 8u32),
+        ("connect1", vec![1u32, 2u32], 4u32, 12u32),
+    ] {
+        bad_conn.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        bad_conn.extend_from_slice(name.as_bytes());
+        let pad = (4 - (name.len() % 4)) % 4;
+        bad_conn.extend(std::iter::repeat_n(0u8, pad));
+        bad_conn.extend_from_slice(&(dimids.len() as u32).to_be_bytes());
+        for d in dimids {
+            bad_conn.extend_from_slice(&d.to_be_bytes());
+        }
+        bad_conn.extend_from_slice(&[0u8; 8]); // attrs ABSENT
+        bad_conn.extend_from_slice(&nc_type.to_be_bytes());
+        bad_conn.extend_from_slice(&vsize.to_be_bytes());
+        begin_slots.push(bad_conn.len());
+        bad_conn.extend_from_slice(&0u32.to_be_bytes());
+    }
+    let cx_off = bad_conn.len() as u32;
+    bad_conn.extend_from_slice(&[0u8; 8]);
+    let cy_off = bad_conn.len() as u32;
+    bad_conn.extend_from_slice(&[0u8; 8]);
+    let conn_off = bad_conn.len() as u32;
+    for idx in [1i32, 2, 999] {
+        bad_conn.extend_from_slice(&idx.to_be_bytes());
+    }
+    bad_conn[begin_slots[0]..begin_slots[0] + 4].copy_from_slice(&cx_off.to_be_bytes());
+    bad_conn[begin_slots[1]..begin_slots[1] + 4].copy_from_slice(&cy_off.to_be_bytes());
+    bad_conn[begin_slots[2]..begin_slots[2] + 4].copy_from_slice(&conn_off.to_be_bytes());
+    assert!(paraviz_io::exodus::read_exodus_bytes(&bad_conn).is_err());
+}

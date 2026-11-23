@@ -1427,3 +1427,904 @@ fn xdmf_temporal_collection_time_steps_and_source() {
             < 1e-6
     );
 }
+
+// ============================================================================
+// Pure-Rust HDF5 v2 & NetCDF Classic / CDF-2 test fixture builders
+// ============================================================================
+
+struct Hdf5Builder {
+    buf: Vec<u8>,
+}
+
+impl Hdf5Builder {
+    fn new() -> Self {
+        // Reserve 48 bytes for v2 superblock
+        Self { buf: vec![0u8; 48] }
+    }
+
+    fn finish(mut self, root_addr: u64) -> Vec<u8> {
+        let total_len = self.buf.len() as u64;
+        let mut sb = Vec::with_capacity(48);
+        sb.extend_from_slice(b"\x89HDF\r\n\x1a\n");
+        sb.push(2); // version
+        sb.push(8); // offset_size
+        sb.push(8); // length_size
+        sb.push(0); // consistency_flags
+        sb.extend_from_slice(&0u64.to_le_bytes()); // base_address
+        sb.extend_from_slice(&u64::MAX.to_le_bytes()); // extension_address
+        sb.extend_from_slice(&total_len.to_le_bytes()); // eof_address
+        sb.extend_from_slice(&root_addr.to_le_bytes());
+        let csum = hdf5_reader::checksum::jenkins_lookup3(&sb[..44]);
+        sb.extend_from_slice(&csum.to_le_bytes());
+        self.buf[..48].copy_from_slice(&sb);
+        self.buf
+    }
+
+    fn write_blob(&mut self, data: &[u8]) -> u64 {
+        let addr = self.buf.len() as u64;
+        self.buf.extend_from_slice(data);
+        addr
+    }
+
+    fn write_ohdr_v2(&mut self, msgs: &[(u8, Vec<u8>)]) -> u64 {
+        let addr = self.buf.len() as u64;
+        let mut payload = Vec::new();
+        for (ty, data) in msgs {
+            payload.push(*ty);
+            payload.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            payload.push(0); // msg_flags
+            payload.extend_from_slice(data);
+        }
+        let mut ohdr = Vec::new();
+        ohdr.extend_from_slice(b"OHDR");
+        ohdr.push(2); // version
+        ohdr.push(0x02); // flags: 4-byte chunk0_size, no timestamps, no attr phase change, no creation order
+        ohdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        ohdr.extend_from_slice(&payload);
+        let csum = hdf5_reader::checksum::jenkins_lookup3(&ohdr);
+        ohdr.extend_from_slice(&csum.to_le_bytes());
+        self.buf.extend_from_slice(&ohdr);
+        addr
+    }
+
+    fn link_msg(name: &str, target_addr: u64) -> (u8, Vec<u8>) {
+        let mut m = Vec::new();
+        m.push(1); // version 1
+        m.push(0x00); // flags: 1-byte name len, hard link
+        m.push(name.len() as u8);
+        m.extend_from_slice(name.as_bytes());
+        m.extend_from_slice(&target_addr.to_le_bytes());
+        (0x06, m)
+    }
+
+    fn dtype_f32() -> Vec<u8> {
+        let mut m = Vec::new();
+        // class=1 (float), version=1, flags=0 (LE)
+        m.extend_from_slice(&((1u32) | (1u32 << 4)).to_le_bytes());
+        m.extend_from_slice(&4u32.to_le_bytes()); // size=4
+        // properties: bit_offset(0), bit_precision(32), exp_loc(23), exp_size(8), mant_loc(0), mant_size(23), exp_bias(127)
+        m.extend_from_slice(&0u16.to_le_bytes());
+        m.extend_from_slice(&32u16.to_le_bytes());
+        m.push(23);
+        m.push(8);
+        m.push(0);
+        m.push(23);
+        m.extend_from_slice(&127u32.to_le_bytes());
+        m
+    }
+
+    fn dtype_f64() -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&((1u32) | (1u32 << 4)).to_le_bytes());
+        m.extend_from_slice(&8u32.to_le_bytes());
+        m.extend_from_slice(&0u16.to_le_bytes());
+        m.extend_from_slice(&64u16.to_le_bytes());
+        m.push(52);
+        m.push(11);
+        m.push(0);
+        m.push(52);
+        m.extend_from_slice(&1023u32.to_le_bytes());
+        m
+    }
+
+    fn dtype_i32() -> Vec<u8> {
+        let mut m = Vec::new();
+        // class=0, version=1, flags=0x08 (signed, LE) => class_and_flags = (1<<4) | (0x08<<8)
+        m.extend_from_slice(&((1u32 << 4) | (0x08u32 << 8)).to_le_bytes());
+        m.extend_from_slice(&4u32.to_le_bytes());
+        m.extend_from_slice(&0u16.to_le_bytes());
+        m.extend_from_slice(&32u16.to_le_bytes());
+        m
+    }
+
+    fn dtype_i64() -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&((1u32 << 4) | (0x08u32 << 8)).to_le_bytes());
+        m.extend_from_slice(&8u32.to_le_bytes());
+        m.extend_from_slice(&0u16.to_le_bytes());
+        m.extend_from_slice(&64u16.to_le_bytes());
+        m
+    }
+
+    fn dtype_u8() -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&(1u32 << 4).to_le_bytes());
+        m.extend_from_slice(&1u32.to_le_bytes());
+        m.extend_from_slice(&0u16.to_le_bytes());
+        m.extend_from_slice(&8u16.to_le_bytes());
+        m
+    }
+
+    fn dtype_fixed_str(len: usize) -> Vec<u8> {
+        let mut m = Vec::new();
+        // class=3 (string), version=1, padding=0 (NullTerminate), charset=0 (ASCII)
+        m.extend_from_slice(&(3u32 | (1u32 << 4)).to_le_bytes());
+        m.extend_from_slice(&(len as u32).to_le_bytes());
+        m
+    }
+
+    fn dataspace_v2(dims: &[u64]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.push(2); // version 2
+        m.push(dims.len() as u8); // rank
+        m.push(0); // flags
+        m.push(if dims.is_empty() { 0 } else { 1 }); // Scalar=0, Simple=1
+        for &d in dims {
+            m.extend_from_slice(&d.to_le_bytes());
+        }
+        m
+    }
+
+    fn attr_v2(name: &str, dt: &[u8], dims: &[u64], raw: &[u8]) -> (u8, Vec<u8>) {
+        let ds = Self::dataspace_v2(dims);
+        let name_bytes = format!("{name}\0");
+        let mut m = Vec::new();
+        m.push(2); // version 2
+        m.push(0); // flags
+        m.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        m.extend_from_slice(&(dt.len() as u16).to_le_bytes());
+        m.extend_from_slice(&(ds.len() as u16).to_le_bytes());
+        m.extend_from_slice(name_bytes.as_bytes());
+        m.extend_from_slice(dt);
+        m.extend_from_slice(&ds);
+        m.extend_from_slice(raw);
+        (0x0C, m)
+    }
+
+    fn attr_str(name: &str, val: &str) -> (u8, Vec<u8>) {
+        let s = format!("{val}\0");
+        let dt = Self::dtype_fixed_str(s.len());
+        Self::attr_v2(name, &dt, &[], s.as_bytes())
+    }
+
+    fn attr_i32_1d(name: &str, vals: &[i32]) -> (u8, Vec<u8>) {
+        let dt = Self::dtype_i32();
+        let mut raw = Vec::with_capacity(vals.len() * 4);
+        for &v in vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        Self::attr_v2(name, &dt, &[vals.len() as u64], &raw)
+    }
+
+    fn attr_f64_1d(name: &str, vals: &[f64]) -> (u8, Vec<u8>) {
+        let dt = Self::dtype_f64();
+        let mut raw = Vec::with_capacity(vals.len() * 8);
+        for &v in vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        Self::attr_v2(name, &dt, &[vals.len() as u64], &raw)
+    }
+
+    fn add_dataset(&mut self, dt: &[u8], dims: &[u64], raw: &[u8], attrs: Vec<(u8, Vec<u8>)>) -> u64 {
+        let data_addr = self.write_blob(raw);
+        let ds = Self::dataspace_v2(dims);
+        let mut layout = Vec::new();
+        layout.push(3); // version 3
+        layout.push(1); // contiguous
+        layout.extend_from_slice(&data_addr.to_le_bytes());
+        layout.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+
+        let mut msgs = vec![
+            (0x01, ds),
+            (0x03, dt.to_vec()),
+            (0x08, layout),
+        ];
+        msgs.extend(attrs);
+        self.write_ohdr_v2(&msgs)
+    }
+
+    fn add_group(&mut self, children: &[(&str, u64)], attrs: Vec<(u8, Vec<u8>)>) -> u64 {
+        let mut msgs = Vec::new();
+        for &(name, addr) in children {
+            msgs.push(Self::link_msg(name, addr));
+        }
+        msgs.extend(attrs);
+        self.write_ohdr_v2(&msgs)
+    }
+}
+
+fn f32_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(vals.len() * 4);
+    for &v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+fn f64_bytes(vals: &[f64]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(vals.len() * 8);
+    for &v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+fn i64_bytes(vals: &[i64]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(vals.len() * 8);
+    for &v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+fn i32_bytes(vals: &[i32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(vals.len() * 4);
+    for &v in vals {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+struct NcBuilder {
+    is_cdf2: bool,
+    numrecs: u32,
+    dims: Vec<(String, u32)>,
+    vars: Vec<NcVarSpec>,
+}
+
+struct NcVarSpec {
+    name: String,
+    dimids: Vec<u32>,
+    attrs: Vec<(String, u32, Vec<u8>)>, // name, nc_type, raw_be_bytes
+    nc_type: u32,
+    is_record: bool,
+    data_be: Vec<u8>, // flat BE bytes (for record var, numrecs concatenated records)
+}
+
+impl NcBuilder {
+    fn new(is_cdf2: bool, numrecs: u32) -> Self {
+        Self {
+            is_cdf2,
+            numrecs,
+            dims: Vec::new(),
+            vars: Vec::new(),
+        }
+    }
+
+    fn add_dim(&mut self, name: &str, len: u32) -> u32 {
+        let id = self.dims.len() as u32;
+        self.dims.push((name.to_string(), len));
+        id
+    }
+
+    fn add_var(
+        &mut self,
+        name: &str,
+        dimids: Vec<u32>,
+        nc_type: u32,
+        attrs: Vec<(String, u32, Vec<u8>)>,
+        data_be: Vec<u8>,
+    ) {
+        let is_record = !dimids.is_empty() && self.dims[dimids[0] as usize].1 == 0;
+        self.vars.push(NcVarSpec {
+            name: name.to_string(),
+            dimids,
+            attrs,
+            nc_type,
+            is_record,
+            data_be,
+        });
+    }
+
+    fn write_nc_string(out: &mut Vec<u8>, s: &str) {
+        let b = s.as_bytes();
+        out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        out.extend_from_slice(b);
+        let pad = (4 - (b.len() % 4)) % 4;
+        out.extend(std::iter::repeat_n(0u8, pad));
+    }
+
+    fn write_attrs(out: &mut Vec<u8>, attrs: &[(String, u32, Vec<u8>)]) {
+        if attrs.is_empty() {
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            return;
+        }
+        out.extend_from_slice(&12u32.to_be_bytes());
+        out.extend_from_slice(&(attrs.len() as u32).to_be_bytes());
+        for (name, nc_type, raw) in attrs {
+            Self::write_nc_string(out, name);
+            out.extend_from_slice(&nc_type.to_be_bytes());
+            let elem_sz = match nc_type {
+                1 | 2 => 1,
+                3 => 2,
+                4 | 5 => 4,
+                6 => 8,
+                _ => 1,
+            };
+            out.extend_from_slice(&((raw.len() / elem_sz) as u32).to_be_bytes());
+            out.extend_from_slice(raw);
+            let pad = (4 - (raw.len() % 4)) % 4;
+            out.extend(std::iter::repeat_n(0u8, pad));
+        }
+    }
+
+    fn build(self) -> Vec<u8> {
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(if self.is_cdf2 { b"CDF\x02" } else { b"CDF\x01" });
+        hdr.extend_from_slice(&self.numrecs.to_be_bytes());
+
+        // dim_list
+        if self.dims.is_empty() {
+            hdr.extend_from_slice(&0u32.to_be_bytes());
+            hdr.extend_from_slice(&0u32.to_be_bytes());
+        } else {
+            hdr.extend_from_slice(&10u32.to_be_bytes());
+            hdr.extend_from_slice(&(self.dims.len() as u32).to_be_bytes());
+            for (name, len) in &self.dims {
+                Self::write_nc_string(&mut hdr, name);
+                hdr.extend_from_slice(&len.to_be_bytes());
+            }
+        }
+
+        // global attrs (empty)
+        Self::write_attrs(&mut hdr, &[]);
+
+        // var_list with placeholder begin offsets
+        if self.vars.is_empty() {
+            hdr.extend_from_slice(&0u32.to_be_bytes());
+            hdr.extend_from_slice(&0u32.to_be_bytes());
+        } else {
+            hdr.extend_from_slice(&11u32.to_be_bytes());
+            hdr.extend_from_slice(&(self.vars.len() as u32).to_be_bytes());
+        }
+
+        let mut begin_positions = Vec::with_capacity(self.vars.len());
+        let mut var_vsizes = Vec::with_capacity(self.vars.len());
+
+        for v in &self.vars {
+            Self::write_nc_string(&mut hdr, &v.name);
+            hdr.extend_from_slice(&(v.dimids.len() as u32).to_be_bytes());
+            for &did in &v.dimids {
+                hdr.extend_from_slice(&did.to_be_bytes());
+            }
+            Self::write_attrs(&mut hdr, &v.attrs);
+            hdr.extend_from_slice(&v.nc_type.to_be_bytes());
+
+            let per_rec_bytes = if v.is_record {
+                let nr = self.numrecs.max(1) as usize;
+                v.data_be.len() / nr
+            } else {
+                v.data_be.len()
+            };
+            let padded_vsize = ((per_rec_bytes + 3) & !3) as u32;
+            var_vsizes.push((per_rec_bytes, padded_vsize));
+            hdr.extend_from_slice(&padded_vsize.to_be_bytes());
+            begin_positions.push(hdr.len());
+            if self.is_cdf2 {
+                hdr.extend_from_slice(&0u64.to_be_bytes());
+            } else {
+                hdr.extend_from_slice(&0u32.to_be_bytes());
+            }
+        }
+
+        let mut file = hdr;
+        // Write fixed variables first, then interleaved record variables
+        for (i, v) in self.vars.iter().enumerate() {
+            if v.is_record {
+                continue;
+            }
+            let start = file.len() as u64;
+            let pos = begin_positions[i];
+            if self.is_cdf2 {
+                file[pos..pos + 8].copy_from_slice(&start.to_be_bytes());
+            } else {
+                file[pos..pos + 4].copy_from_slice(&(start as u32).to_be_bytes());
+            }
+            file.extend_from_slice(&v.data_be);
+            let pad = (4 - (v.data_be.len() % 4)) % 4;
+            file.extend(std::iter::repeat_n(0u8, pad));
+        }
+
+        let mut rec_offset = file.len() as u64;
+        for (i, v) in self.vars.iter().enumerate() {
+            if !v.is_record {
+                continue;
+            }
+            let pos = begin_positions[i];
+            if self.is_cdf2 {
+                file[pos..pos + 8].copy_from_slice(&rec_offset.to_be_bytes());
+            } else {
+                file[pos..pos + 4].copy_from_slice(&(rec_offset as u32).to_be_bytes());
+            }
+            rec_offset += var_vsizes[i].1 as u64;
+        }
+
+        for r in 0..(self.numrecs as usize) {
+            for (i, v) in self.vars.iter().enumerate() {
+                if !v.is_record {
+                    continue;
+                }
+                let (per_rec_bytes, padded_vsize) = var_vsizes[i];
+                let s = r * per_rec_bytes;
+                file.extend_from_slice(&v.data_be[s..s + per_rec_bytes]);
+                let pad = (padded_vsize as usize) - per_rec_bytes;
+                file.extend(std::iter::repeat_n(0u8, pad));
+            }
+        }
+
+        file
+    }
+}
+
+#[test]
+fn vtkhdf_imagedata_polydata_ugrid_composite_and_temporal() {
+    use paraviz_core::Source;
+    use paraviz_io::{
+        detect_reader, inspect_vtkhdf_time_steps, read_dataset_with_reader, read_vtkhdf,
+        read_vtkhdf_at_time, DatasetReader,
+    };
+
+    let dir = TestDir::new("vtkhdf");
+
+    // 1) ImageData (static)
+    {
+        let mut b = Hdf5Builder::new();
+        let dens = b.add_dataset(
+            &Hdf5Builder::dtype_f32(),
+            &[2, 2, 3],
+            &f32_bytes(&(0..12).map(|i| i as f32).collect::<Vec<_>>()),
+            vec![],
+        );
+        let pd = b.add_group(&[("density", dens)], vec![]);
+        let cval = b.add_dataset(
+            &Hdf5Builder::dtype_f64(),
+            &[1, 1, 2],
+            &f64_bytes(&[10.0, 20.0]),
+            vec![],
+        );
+        let cd = b.add_group(&[("cell_val", cval)], vec![]);
+        let vtkhdf_grp = b.add_group(
+            &[("PointData", pd), ("CellData", cd)],
+            vec![
+                Hdf5Builder::attr_str("Type", "ImageData"),
+                Hdf5Builder::attr_i32_1d("WholeExtent", &[0, 2, 0, 1, 0, 1]),
+                Hdf5Builder::attr_f64_1d("Origin", &[-1.0, 0.5, 2.0]),
+                Hdf5Builder::attr_f64_1d("Spacing", &[0.5, 0.25, 1.0]),
+            ],
+        );
+        let root = b.add_group(&[("VTKHDF", vtkhdf_grp)], vec![]);
+        let bytes = b.finish(root);
+
+        let p = dir.file("img.vtkhdf");
+        fs::write(&p, &bytes).unwrap();
+        assert_eq!(detect_reader(&p).unwrap(), DatasetReader::VtkHdf);
+        let ds = read_vtkhdf(&p).unwrap();
+        let img = ds.as_image_data().unwrap();
+        assert_eq!(img.dimensions, [3, 2, 2]);
+        assert_eq!(img.origin, [-1.0, 0.5, 2.0]);
+        assert_eq!(img.spacing, [0.5, 0.25, 1.0]);
+        assert_eq!(img.point_data.get("density").unwrap().num_tuples(), 12);
+        assert_eq!(img.cell_data.get("cell_val").unwrap().num_tuples(), 2);
+
+        // Also verify .h5 auto-detection for VTKHDF
+        let h5_p = dir.file("img_auto.h5");
+        fs::write(&h5_p, &bytes).unwrap();
+        assert_eq!(detect_reader(&h5_p).unwrap(), DatasetReader::VtkHdf);
+    }
+
+    // 2) Temporal PolyData with 2 time steps
+    {
+        let mut b = Hdf5Builder::new();
+        let npts = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[3, 3]), vec![]);
+        let pts = b.add_dataset(
+            &Hdf5Builder::dtype_f32(),
+            &[6, 3],
+            &f32_bytes(&[
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, // step 0
+                0.0, 0.0, 1.0, 2.0, 0.0, 1.0, 0.0, 2.0, 1.0, // step 1
+            ]),
+            vec![],
+        );
+        let p_ncells = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[1, 1]), vec![]);
+        let p_nconn = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[3, 3]), vec![]);
+        let p_offs = b.add_dataset(&Hdf5Builder::dtype_i64(), &[4], &i64_bytes(&[0, 3, 0, 3]), vec![]);
+        let p_conn = b.add_dataset(&Hdf5Builder::dtype_i64(), &[6], &i64_bytes(&[0, 1, 2, 0, 1, 2]), vec![]);
+        let polygons = b.add_group(
+            &[
+                ("NumberOfCells", p_ncells),
+                ("NumberOfConnectivityIds", p_nconn),
+                ("Offsets", p_offs),
+                ("Connectivity", p_conn),
+            ],
+            vec![],
+        );
+        let temp_ds = b.add_dataset(
+            &Hdf5Builder::dtype_f64(),
+            &[6],
+            &f64_bytes(&[10.0, 10.0, 10.0, 99.0, 99.0, 99.0]),
+            vec![],
+        );
+        let pd = b.add_group(&[("Temp", temp_ds)], vec![]);
+
+        let s_vals = b.add_dataset(&Hdf5Builder::dtype_f64(), &[2], &f64_bytes(&[0.25, 1.5]), vec![]);
+        let s_poff = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[0, 3]), vec![]);
+        let s_partoff = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[0, 1]), vec![]);
+        let s_nparts = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[1, 1]), vec![]);
+        let s_coff = b.add_dataset(
+            &Hdf5Builder::dtype_i64(),
+            &[2, 4],
+            &i64_bytes(&[0, 0, 0, 0, 0, 0, 1, 0]),
+            vec![],
+        );
+        let s_cid = b.add_dataset(
+            &Hdf5Builder::dtype_i64(),
+            &[2, 4],
+            &i64_bytes(&[0, 0, 0, 0, 0, 0, 3, 0]),
+            vec![],
+        );
+        let s_pdo = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[0, 3]), vec![]);
+        let pd_offs = b.add_group(&[("Temp", s_pdo)], vec![]);
+        let steps = b.add_group(
+            &[
+                ("Values", s_vals),
+                ("PointOffsets", s_poff),
+                ("PartOffsets", s_partoff),
+                ("NumberOfParts", s_nparts),
+                ("CellOffsets", s_coff),
+                ("ConnectivityIdOffsets", s_cid),
+                ("PointDataOffsets", pd_offs),
+            ],
+            vec![],
+        );
+        let vtkhdf_grp = b.add_group(
+            &[
+                ("NumberOfPoints", npts),
+                ("Points", pts),
+                ("Polygons", polygons),
+                ("PointData", pd),
+                ("Steps", steps),
+            ],
+            vec![Hdf5Builder::attr_str("Type", "PolyData")],
+        );
+        let root = b.add_group(&[("VTKHDF", vtkhdf_grp)], vec![]);
+        let p = dir.file("poly_steps.vtkhdf");
+        fs::write(&p, b.finish(root)).unwrap();
+
+        assert_eq!(inspect_vtkhdf_time_steps(&p).unwrap(), vec![0.25, 1.5]);
+        let ds1 = read_vtkhdf_at_time(&p, 1.5).unwrap();
+        let poly1 = ds1.as_poly_data().unwrap();
+        assert_eq!(poly1.num_points(), 3);
+        assert_eq!(poly1.polys, vec![vec![0, 1, 2]]);
+        assert_eq!(poly1.points[1], [2.0, 0.0, 1.0]);
+        assert!((poly1.point_data.get("Temp").unwrap().get_scalar(0) - 99.0).abs() < 1e-6);
+
+        let src = VtkFileSource::new(&p);
+        assert_eq!(src.request_information().time_steps, vec![0.25, 1.5]);
+        let s0 = src.execute(0.25).unwrap();
+        assert!((s0.as_poly_data().unwrap().point_data.get("Temp").unwrap().get_scalar(0) - 10.0).abs() < 1e-6);
+    }
+
+    // 3) UnstructuredGrid inside MultiBlockDataSet
+    {
+        let mut b = Hdf5Builder::new();
+        let npts = b.add_dataset(&Hdf5Builder::dtype_i64(), &[1], &i64_bytes(&[4]), vec![]);
+        let pts = b.add_dataset(
+            &Hdf5Builder::dtype_f32(),
+            &[4, 3],
+            &f32_bytes(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            vec![],
+        );
+        let ncells = b.add_dataset(&Hdf5Builder::dtype_i64(), &[1], &i64_bytes(&[1]), vec![]);
+        let types = b.add_dataset(&Hdf5Builder::dtype_u8(), &[1], &[10u8], vec![]); // VTK_TETRA=10
+        let offs = b.add_dataset(&Hdf5Builder::dtype_i64(), &[2], &i64_bytes(&[0, 4]), vec![]);
+        let conn = b.add_dataset(&Hdf5Builder::dtype_i64(), &[4], &i64_bytes(&[0, 1, 2, 3]), vec![]);
+        let mat = b.add_dataset(&Hdf5Builder::dtype_i32(), &[1], &i32_bytes(&[7]), vec![]);
+        let cd = b.add_group(&[("mat", mat)], vec![]);
+        let block0 = b.add_group(
+            &[
+                ("NumberOfPoints", npts),
+                ("Points", pts),
+                ("NumberOfCells", ncells),
+                ("Types", types),
+                ("Offsets", offs),
+                ("Connectivity", conn),
+                ("CellData", cd),
+            ],
+            vec![Hdf5Builder::attr_str("Type", "UnstructuredGrid")],
+        );
+        let mb = b.add_group(
+            &[("TetBlock", block0)],
+            vec![Hdf5Builder::attr_str("Type", "MultiBlockDataSet")],
+        );
+        let root = b.add_group(&[("VTKHDF", mb)], vec![]);
+        let p = dir.file("composite.vtkhdf");
+        fs::write(&p, b.finish(root)).unwrap();
+
+        let (ds, r) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+        assert_eq!(r, DatasetReader::VtkHdf);
+        let DataSet::MultiBlock(mb_ds) = ds else {
+            panic!("expected MultiBlock");
+        };
+        assert_eq!(mb_ds.blocks.len(), 1);
+        assert_eq!(mb_ds.blocks[0].0, "TetBlock");
+        let ug = mb_ds.blocks[0].1.as_unstructured_grid().unwrap();
+        assert_eq!(ug.cell_types, vec![CellType::Tetra]);
+        assert_eq!(ug.cell_data.get("mat").unwrap().get_scalar(0) as i32, 7);
+    }
+}
+
+#[test]
+fn cgns_structured_and_unstructured_zones() {
+    use paraviz_io::{detect_reader, read_cgns, DatasetReader};
+
+    let dir = TestDir::new("cgns");
+
+    // Structured zone + Unstructured zone (MIXED + TRI_3) in one CGNS file
+    let mut b = Hdf5Builder::new();
+    let lib_ver = b.add_dataset(&Hdf5Builder::dtype_f32(), &[1], &f32_bytes(&[4.2]), vec![]);
+
+    // Zone 1: Structured 2x2x2
+    let z1_data = b.add_dataset(&Hdf5Builder::dtype_i32(), &[3, 3], &i32_bytes(&[2, 2, 2, 1, 1, 1, 0, 0, 0]), vec![]);
+    let z1_zt_data = b.add_dataset(&Hdf5Builder::dtype_u8(), &[10], b"Structured", vec![]);
+    let z1_zt = b.add_group(&[(" data", z1_zt_data)], vec![Hdf5Builder::attr_str("label", "ZoneType_t")]);
+    let cx = b.add_dataset(&Hdf5Builder::dtype_f32(), &[2, 2, 2], &f32_bytes(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]), vec![]);
+    let cy = b.add_dataset(&Hdf5Builder::dtype_f32(), &[2, 2, 2], &f32_bytes(&[0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]), vec![]);
+    let cz = b.add_dataset(&Hdf5Builder::dtype_f32(), &[2, 2, 2], &f32_bytes(&[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]), vec![]);
+    let z1_gc = b.add_group(
+        &[("CoordinateX", cx), ("CoordinateY", cy), ("CoordinateZ", cz)],
+        vec![Hdf5Builder::attr_str("label", "GridCoordinates_t")],
+    );
+    let pres_d = b.add_dataset(&Hdf5Builder::dtype_f64(), &[2, 2, 2], &f64_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), vec![]);
+    let pres_g = b.add_group(&[(" data", pres_d)], vec![Hdf5Builder::attr_str("label", "DataArray_t")]);
+    let gl_v_d = b.add_dataset(&Hdf5Builder::dtype_u8(), &[6], b"Vertex", vec![]);
+    let gl_v = b.add_group(&[(" data", gl_v_d)], vec![Hdf5Builder::attr_str("label", "GridLocation_t")]);
+    let z1_fs = b.add_group(
+        &[("GridLocation", gl_v), ("Pressure", pres_g)],
+        vec![Hdf5Builder::attr_str("label", "FlowSolution_t")],
+    );
+    let zone1 = b.add_group(
+        &[(" data", z1_data), ("ZoneType", z1_zt), ("GridCoordinates", z1_gc), ("FlowSolution", z1_fs)],
+        vec![Hdf5Builder::attr_str("label", "Zone_t")],
+    );
+
+    // Zone 2: Unstructured with MIXED (1 TRI_3 + 1 QUAD_4) and CellCenter solution
+    let z2_data = b.add_dataset(&Hdf5Builder::dtype_i32(), &[3], &i32_bytes(&[4, 2, 0]), vec![]);
+    let z2_zt_data = b.add_dataset(&Hdf5Builder::dtype_u8(), &[12], b"Unstructured", vec![]);
+    let z2_zt = b.add_group(&[(" data", z2_zt_data)], vec![Hdf5Builder::attr_str("label", "ZoneType_t")]);
+    let ucx = b.add_dataset(&Hdf5Builder::dtype_f32(), &[4], &f32_bytes(&[0.0, 1.0, 1.0, 0.0]), vec![]);
+    let ucy = b.add_dataset(&Hdf5Builder::dtype_f32(), &[4], &f32_bytes(&[0.0, 0.0, 1.0, 1.0]), vec![]);
+    let z2_gc = b.add_group(
+        &[("CoordinateX", ucx), ("CoordinateY", ucy)],
+        vec![Hdf5Builder::attr_str("label", "GridCoordinates_t")],
+    );
+    // Elements_t: MIXED (20), Range=[1, 2], Connectivity = [5, 1, 2, 3,  7, 1, 2, 3, 4] (1-based!)
+    let el_meta = b.add_dataset(&Hdf5Builder::dtype_i32(), &[2], &i32_bytes(&[20, 0]), vec![]);
+    let el_range = b.add_dataset(&Hdf5Builder::dtype_i32(), &[2], &i32_bytes(&[1, 2]), vec![]);
+    let el_conn = b.add_dataset(&Hdf5Builder::dtype_i32(), &[9], &i32_bytes(&[5, 1, 2, 3, 7, 1, 2, 3, 4]), vec![]);
+    let elems = b.add_group(
+        &[(" data", el_meta), ("ElementRange", el_range), ("ElementConnectivity", el_conn)],
+        vec![Hdf5Builder::attr_str("label", "Elements_t")],
+    );
+    let gl_c_d = b.add_dataset(&Hdf5Builder::dtype_u8(), &[10], b"CellCenter", vec![]);
+    let gl_c = b.add_group(&[(" data", gl_c_d)], vec![Hdf5Builder::attr_str("label", "GridLocation_t")]);
+    let mach_d = b.add_dataset(&Hdf5Builder::dtype_f64(), &[2], &f64_bytes(&[0.8, 1.2]), vec![]);
+    let z2_fs = b.add_group(
+        &[("GridLocation", gl_c), ("Mach", mach_d)],
+        vec![Hdf5Builder::attr_str("label", "FlowSolution_t")],
+    );
+    let zone2 = b.add_group(
+        &[(" data", z2_data), ("ZoneType", z2_zt), ("GridCoordinates", z2_gc), ("MixedElems", elems), ("FlowSolutionCells", z2_fs)],
+        vec![Hdf5Builder::attr_str("label", "Zone_t")],
+    );
+
+    let base = b.add_group(
+        &[("StructuredZone", zone1), ("UnstructuredZone", zone2)],
+        vec![Hdf5Builder::attr_str("label", "CGNSBase_t")],
+    );
+    let root = b.add_group(&[("CGNSLibraryVersion", lib_ver), ("Base", base)], vec![]);
+    let bytes = b.finish(root);
+
+    let p = dir.file("flow.cgns");
+    fs::write(&p, &bytes).unwrap();
+    assert_eq!(detect_reader(&p).unwrap(), DatasetReader::Cgns);
+
+    let h5_p = dir.file("flow_auto.h5");
+    fs::write(&h5_p, &bytes).unwrap();
+    assert_eq!(detect_reader(&h5_p).unwrap(), DatasetReader::Cgns);
+
+    let ds = read_cgns(&p).unwrap();
+    let DataSet::MultiBlock(mb) = ds else {
+        panic!("expected MultiBlock");
+    };
+    assert_eq!(mb.blocks.len(), 2);
+    let DataSet::StructuredGrid(sg) = &mb.blocks[0].1 else {
+        panic!("expected StructuredGrid");
+    };
+    assert_eq!(sg.dimensions, [2, 2, 2]);
+    assert_eq!(sg.point_data.get("Pressure").unwrap().num_tuples(), 8);
+
+    let ug = mb.blocks[1].1.as_unstructured_grid().unwrap();
+    assert_eq!(ug.num_points(), 4);
+    assert_eq!(ug.cell_types, vec![CellType::Triangle, CellType::Quad]);
+    assert!((ug.cell_data.get("Mach").unwrap().get_scalar(1) - 1.2).abs() < 1e-6);
+}
+
+#[test]
+fn exodus_classic_cdf2_and_hdf5_multiblock_temporal() {
+    use paraviz_core::Source;
+    use paraviz_io::{
+        detect_reader, inspect_exodus_time_steps, read_dataset_with_reader, read_exodus_at_time,
+        DatasetReader,
+    };
+
+    let dir = TestDir::new("exodus");
+
+    // 1) NetCDF Classic (CDF\x01) multi-block with nodal/elem vars & time_whole
+    let build_exodus_nc = |is_cdf2: bool| -> Vec<u8> {
+        let mut nc = NcBuilder::new(is_cdf2, 2);
+        let d_time = nc.add_dim("time_step", 0);
+        let d_nodes = nc.add_dim("num_nodes", 5);
+        let d_el1 = nc.add_dim("num_el_in_blk1", 1);
+        let d_npel1 = nc.add_dim("num_nod_per_el1", 3);
+        let d_el2 = nc.add_dim("num_el_in_blk2", 1);
+        let d_npel2 = nc.add_dim("num_nod_per_el2", 4);
+        let d_blk = nc.add_dim("num_el_blk", 2);
+        let d_nvar = nc.add_dim("num_nod_var", 1);
+        let d_evar = nc.add_dim("num_elem_var", 1);
+        let d_str = nc.add_dim("len_string", 8);
+
+        let f64_be = |vals: &[f64]| -> Vec<u8> {
+            vals.iter().flat_map(|v| v.to_be_bytes()).collect()
+        };
+        let i32_be = |vals: &[i32]| -> Vec<u8> {
+            vals.iter().flat_map(|v| v.to_be_bytes()).collect()
+        };
+
+        nc.add_var("coordx", vec![d_nodes], 6, vec![], f64_be(&[0.0, 1.0, 0.0, 1.0, 2.0]));
+        nc.add_var("coordy", vec![d_nodes], 6, vec![], f64_be(&[0.0, 0.0, 1.0, 1.0, 0.5]));
+        nc.add_var(
+            "connect1",
+            vec![d_el1, d_npel1],
+            4,
+            vec![("elem_type".into(), 2, b"TRI3\0".to_vec())],
+            i32_be(&[1, 2, 3]), // 1-based!
+        );
+        nc.add_var(
+            "connect2",
+            vec![d_el2, d_npel2],
+            4,
+            vec![("elem_type".into(), 2, b"QUAD4\0".to_vec())],
+            i32_be(&[2, 5, 4, 3]),
+        );
+        nc.add_var(
+            "eb_names",
+            vec![d_blk, d_str],
+            2,
+            vec![],
+            b"TriPart\0QuadPrt\0".to_vec(),
+        );
+        nc.add_var("time_whole", vec![d_time], 6, vec![], f64_be(&[0.1, 2.0]));
+        nc.add_var("name_nod_var", vec![d_nvar, d_str], 2, vec![], b"disp_x\0\0".to_vec());
+        nc.add_var("name_elem_var", vec![d_evar, d_str], 2, vec![], b"stress\0\0".to_vec());
+        nc.add_var(
+            "vals_nod_var1",
+            vec![d_time, d_nodes],
+            6,
+            vec![],
+            f64_be(&[
+                0.0, 0.1, 0.2, 0.3, 0.4, // step 0
+                1.0, 1.1, 1.2, 1.3, 1.4, // step 1
+            ]),
+        );
+        nc.add_var(
+            "vals_elem_var1eb1",
+            vec![d_time, d_el1],
+            6,
+            vec![],
+            f64_be(&[100.0, 250.0]),
+        );
+        nc.add_var(
+            "vals_elem_var1eb2",
+            vec![d_time, d_el2],
+            6,
+            vec![],
+            f64_be(&[300.0, 450.0]),
+        );
+        nc.build()
+    };
+
+    for (tag, is_cdf2, ext_file) in [
+        ("cdf1", false, "mesh.exo"),
+        ("cdf2", true, "mesh_64.ex2"),
+    ] {
+        let bytes = build_exodus_nc(is_cdf2);
+        let p = dir.file(ext_file);
+        fs::write(&p, &bytes).unwrap();
+        assert_eq!(detect_reader(&p).unwrap(), DatasetReader::Exodus, "{tag}");
+
+        // Extensionless magic detection
+        let magic_p = dir.file(&format!("noext_{tag}"));
+        fs::write(&magic_p, &bytes).unwrap();
+        assert_eq!(detect_reader(&magic_p).unwrap(), DatasetReader::Exodus);
+
+        let steps = inspect_exodus_time_steps(&p).unwrap();
+        assert_eq!(steps, vec![0.1, 2.0]);
+
+        let ds1 = read_exodus_at_time(&p, 2.0).unwrap();
+        let DataSet::MultiBlock(mb) = ds1 else {
+            panic!("expected MultiBlock");
+        };
+        assert_eq!(mb.blocks.len(), 2);
+        assert_eq!(mb.blocks[0].0, "TriPart");
+        assert_eq!(mb.blocks[1].0, "QuadPrt");
+
+        let b0 = mb.blocks[0].1.as_unstructured_grid().unwrap();
+        assert_eq!(b0.cell_types, vec![CellType::Triangle]);
+        assert!((b0.point_data.get("disp_x").unwrap().get_scalar(0) - 1.0).abs() < 1e-6);
+        assert!((b0.cell_data.get("stress").unwrap().get_scalar(0) - 250.0).abs() < 1e-6);
+
+        let b1 = mb.blocks[1].1.as_unstructured_grid().unwrap();
+        assert_eq!(b1.cell_types, vec![CellType::Quad]);
+        assert!((b1.cell_data.get("stress").unwrap().get_scalar(0) - 450.0).abs() < 1e-6);
+
+        let src = VtkFileSource::new(&p);
+        assert_eq!(src.request_information().time_steps, vec![0.1, 2.0]);
+        let ds0 = src.execute(0.1).unwrap();
+        let DataSet::MultiBlock(mb0) = ds0 else {
+            panic!("expected MultiBlock");
+        };
+        let b0_s0 = mb0.blocks[0].1.as_unstructured_grid().unwrap();
+        assert!((b0_s0.cell_data.get("stress").unwrap().get_scalar(0) - 100.0).abs() < 1e-6);
+    }
+
+    // 2) HDF5-backed NetCDF-4 Exodus II single block (.e)
+    {
+        let mut b = Hdf5Builder::new();
+        let cx = b.add_dataset(&Hdf5Builder::dtype_f64(), &[4], &f64_bytes(&[0.0, 1.0, 0.0, 0.0]), vec![]);
+        let cy = b.add_dataset(&Hdf5Builder::dtype_f64(), &[4], &f64_bytes(&[0.0, 0.0, 1.0, 0.0]), vec![]);
+        let cz = b.add_dataset(&Hdf5Builder::dtype_f64(), &[4], &f64_bytes(&[0.0, 0.0, 0.0, 1.0]), vec![]);
+        let conn1 = b.add_dataset(
+            &Hdf5Builder::dtype_i32(),
+            &[1, 4],
+            &i32_bytes(&[1, 2, 3, 4]),
+            vec![Hdf5Builder::attr_str("elem_type", "TETRA")],
+        );
+        let nod_names = b.add_dataset(&Hdf5Builder::dtype_u8(), &[1, 4], b"phi\0", vec![]);
+        let vals_nod1 = b.add_dataset(&Hdf5Builder::dtype_f32(), &[1, 4], &f32_bytes(&[5.0, 6.0, 7.0, 8.0]), vec![]);
+        let root = b.add_group(
+            &[
+                ("coordx", cx),
+                ("coordy", cy),
+                ("coordz", cz),
+                ("connect1", conn1),
+                ("name_nod_var", nod_names),
+                ("vals_nod_var1", vals_nod1),
+            ],
+            vec![],
+        );
+        let bytes = b.finish(root);
+
+        let p = dir.file("single_tet.e");
+        fs::write(&p, &bytes).unwrap();
+        let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
+        assert_eq!(reader, DatasetReader::Exodus);
+        let ug = ds.as_unstructured_grid().unwrap();
+        assert_eq!(ug.cell_types, vec![CellType::Tetra]);
+        assert!((ug.point_data.get("phi").unwrap().get_scalar(3) - 8.0).abs() < 1e-6);
+
+        let h5_p = dir.file("exodus_auto.h5");
+        fs::write(&h5_p, &bytes).unwrap();
+        assert_eq!(detect_reader(&h5_p).unwrap(), DatasetReader::Exodus);
+    }
+}
