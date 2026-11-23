@@ -5,12 +5,12 @@ use paraviz_core::{
     PipelineInfo, Source, TransferFunction,
 };
 use paraviz_filters::{
-    CalculatorFilter, CellCentersFilter, CellDataToPointDataFilter, ClipFilter,
-    ConnectivityFilter, ContourFilter, ElevationFilter, ExtractSurface, FeatureEdgesFilter,
-    GenerateNormalsFilter, GlyphFilter, GradientFilter, PointDataToCellDataFilter,
-    ProbeOverLineFilter, ReflectFilter, ShrinkFilter, SliceFilter, SmoothFilter,
-    StreamTracerFilter, ThresholdFilter, TransformFilter, TubeFilter, WarpByScalarFilter,
-    WarpByVectorFilter,
+    CalculatorFilter, CellCentersFilter, CellDataToPointDataFilter, CleanPolyDataFilter,
+    ClipFilter, ConnectivityFilter, ContourFilter, ElevationFilter, ExtractEdgesFilter,
+    ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter, GradientFilter,
+    PointDataToCellDataFilter, ProbeOverLineFilter, ReflectFilter, ShrinkFilter, SliceFilter,
+    SmoothFilter, StreamTracerFilter, ThresholdFilter, TransformFilter, TriangulateFilter,
+    TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
 };
 use paraviz_io::{
     read_dataset, read_raw_volume, write_dataset, write_glb, IoError, PvdSeriesSource,
@@ -173,6 +173,9 @@ pub enum FilterConfig {
     Reflect(ReflectFilter),
     GenerateNormals(GenerateNormalsFilter),
     Elevation(ElevationFilter),
+    Triangulate(TriangulateFilter),
+    ExtractEdges(ExtractEdgesFilter),
+    CleanPolyData(CleanPolyDataFilter),
 }
 
 impl FilterConfig {
@@ -203,6 +206,9 @@ impl FilterConfig {
             Self::Reflect(_) => "Reflect",
             Self::GenerateNormals(_) => "GenerateNormals",
             Self::Elevation(_) => "Elevation",
+            Self::Triangulate(_) => "Triangulate",
+            Self::ExtractEdges(_) => "ExtractEdges",
+            Self::CleanPolyData(_) => "CleanPolyData",
         }
     }
 
@@ -233,6 +239,9 @@ impl FilterConfig {
             Self::Reflect(f) => Box::new(f.clone()),
             Self::GenerateNormals(f) => Box::new(f.clone()),
             Self::Elevation(f) => Box::new(f.clone()),
+            Self::Triangulate(f) => Box::new(f.clone()),
+            Self::ExtractEdges(f) => Box::new(f.clone()),
+            Self::CleanPolyData(f) => Box::new(f.clone()),
         }
     }
 }

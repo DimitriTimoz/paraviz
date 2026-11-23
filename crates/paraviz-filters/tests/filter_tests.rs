@@ -5,12 +5,13 @@ use paraviz_core::{
 };
 use paraviz_filters::{
     append_datasets, compute_histogram, extract_surface, AppendDatasetsFilter, CalculatorFilter,
-    CellCentersFilter, CellDataToPointDataFilter, ClipFilter, ConnectivityFilter, ContourFilter,
-    ElevationFilter, ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter,
-    GlyphShape, GradientFilter, ImplicitFunction, IntegrationDirection, Integrator,
-    PointDataToCellDataFilter, ProbeOverLineFilter, ReflectFilter, ReflectPlane, ScaleMode,
-    SeedSource, ShrinkFilter, SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter,
-    ThresholdFilter, TransformFilter, TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
+    CellCentersFilter, CellDataToPointDataFilter, CleanPolyDataFilter, ClipFilter,
+    ConnectivityFilter, ContourFilter, ElevationFilter, ExtractEdgesFilter, ExtractSurface,
+    FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter, GlyphShape, GradientFilter,
+    ImplicitFunction, IntegrationDirection, Integrator, PointDataToCellDataFilter,
+    ProbeOverLineFilter, ReflectFilter, ReflectPlane, ScaleMode, SeedSource, ShrinkFilter,
+    SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter, ThresholdFilter,
+    TransformFilter, TriangulateFilter, TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
 };
 use paraviz_sources::{LineSource, PlaneSource, SphereSource, VectorFieldSource, WaveletSource};
 use std::collections::HashMap;
@@ -1268,4 +1269,54 @@ fn test_compute_histogram() {
     assert!(compute_histogram(&ds, "vals", AttributeAssociation::Point, None, 0).is_err());
     assert!(compute_histogram(&ds, "missing", AttributeAssociation::Point, None, 4).is_err());
     assert!(compute_histogram(&ds, "vec", AttributeAssociation::Cell, Some(5), 2).is_err());
+}
+
+#[test]
+fn test_triangulate_extract_edges_and_clean_polydata() {
+    // Quad + pentagon -> 2 + 3 = 5 triangles, preserving cell_data
+    let mut pd = PolyData::new();
+    pd.points = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [2.0, 0.5, 0.0],
+        [0.0, 0.0, 0.0], // duplicate of point 0
+    ];
+    pd.polys = vec![vec![0, 1, 2, 3], vec![1, 4, 2]];
+    pd.cell_data
+        .set_scalars(DataArray::scalars_f32("cid", vec![10.0, 20.0]));
+
+    let tri_ds = TriangulateFilter::new()
+        .apply(&DataSet::PolyData(pd.clone()))
+        .unwrap();
+    let tri = tri_ds.as_poly_data().unwrap();
+    assert_eq!(tri.polys.len(), 3);
+    assert!(tri.polys.iter().all(|p| p.len() == 3));
+    let cid = tri.cell_data.get("cid").unwrap();
+    assert_eq!(cid.num_tuples(), 3);
+    assert!((cid.get_scalar(0) - 10.0).abs() < 1e-6);
+    assert!((cid.get_scalar(1) - 10.0).abs() < 1e-6);
+    assert!((cid.get_scalar(2) - 20.0).abs() < 1e-6);
+
+    // ExtractEdges on ImageData (2x2x2 cube = 12 unique edges)
+    let img = ImageData::new([2, 2, 2], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let edges_ds = ExtractEdgesFilter::new()
+        .apply(&DataSet::ImageData(img))
+        .unwrap();
+    let edges = edges_ds.as_poly_data().unwrap();
+    assert_eq!(edges.lines.len(), 12);
+
+    // CleanPolyData merges duplicate point 5 with point 0
+    let mut dup_pd = pd.clone();
+    dup_pd.polys.push(vec![5, 1, 2]);
+    dup_pd
+        .cell_data
+        .set_scalars(DataArray::scalars_f32("cid", vec![10.0, 20.0, 30.0]));
+    let clean_ds = CleanPolyDataFilter::new(1e-4)
+        .apply(&DataSet::PolyData(dup_pd))
+        .unwrap();
+    let clean = clean_ds.as_poly_data().unwrap();
+    assert_eq!(clean.num_points(), 5);
+    assert_eq!(clean.polys.len(), 3);
 }

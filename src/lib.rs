@@ -64,13 +64,14 @@ pub mod prelude {
     pub use crate::demos::DemoPreset;
     pub use crate::filters::{
         append_datasets, compute_histogram, AppendDatasetsFilter, CalculatorFilter,
-        CellCentersFilter, CellDataToPointDataFilter, ClipFilter, ConnectivityFilter,
-        ContourFilter, ElevationFilter, ExtractSurface, FeatureEdgesFilter, GenerateNormalsFilter,
-        GlyphFilter, GlyphShape, GradientFilter, HistogramResult, ImplicitFunction,
-        IntegrationDirection, Integrator, PointDataToCellDataFilter, ProbeOverLineFilter,
-        ReflectFilter, ReflectPlane, ScaleMode, SeedSource, ShrinkFilter, SliceFilter,
-        SmoothFilter, SmoothingMethod, StreamTracerFilter, ThresholdFilter, TransformFilter,
-        TubeFilter, WarpByScalarFilter, WarpByVectorFilter,
+        CellCentersFilter, CellDataToPointDataFilter, CleanPolyDataFilter, ClipFilter,
+        ConnectivityFilter, ContourFilter, ElevationFilter, ExtractEdgesFilter, ExtractSurface,
+        FeatureEdgesFilter, GenerateNormalsFilter, GlyphFilter, GlyphShape, GradientFilter,
+        HistogramResult, ImplicitFunction, IntegrationDirection, Integrator,
+        PointDataToCellDataFilter, ProbeOverLineFilter, ReflectFilter, ReflectPlane, ScaleMode,
+        SeedSource, ShrinkFilter, SliceFilter, SmoothFilter, SmoothingMethod, StreamTracerFilter,
+        ThresholdFilter, TransformFilter, TriangulateFilter, TubeFilter, WarpByScalarFilter,
+        WarpByVectorFilter,
     };
     pub use crate::io::{
         read_dataset, read_pvd_series, read_raw_volume, write_dataset, write_glb,
