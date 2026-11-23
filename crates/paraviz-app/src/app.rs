@@ -1,5 +1,15 @@
+use crate::charts::{draw_chart_tab, ChartMode, ChartState};
 use crate::cli::format_memory_bytes;
+use crate::modals::{
+    draw_modal, is_raw_volume_ext, AppModal, FileBrowserState, GpuContourModalState, ModalAction,
+    RawVolumeModalState, ScreenshotModalState,
+};
+use crate::theme::{
+    apply_theme, node_badge_style, paint_logo_badge, palette, pill_badge, section_card,
+    visibility_eye_button, UiTheme, ViewportBgPreset,
+};
 use paraviz::prelude::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,6 +19,7 @@ enum InspectorTab {
     Properties,
     Display,
     Information,
+    Scene,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,12 +27,6 @@ enum DrawerTab {
     Spreadsheet,
     Chart,
     RustTrace,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChartMode {
-    XYPlot,
-    Histogram,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,35 +40,21 @@ enum ViewportMode {
 enum SpreadsheetTarget {
     Points,
     Cells,
+    Field,
+}
+
+struct PipelineTreeRow {
+    id: NodeId,
+    depth: usize,
+    name: String,
+    visible: bool,
+    badge: (&'static str, egui::Color32, egui::Color32),
 }
 
 #[derive(Debug, Clone)]
-struct FileBrowserState {
-    current_dir: PathBuf,
-    filter_text: String,
-    path_input: String,
-}
-
-impl FileBrowserState {
-    fn new() -> Self {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let path_input = current_dir.display().to_string();
-        Self {
-            current_dir,
-            filter_text: String::new(),
-            path_input,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum PathModal {
-    OpenFile(String),
-    FileBrowser(FileBrowserState),
-    SaveState(String),
-    LoadState(String),
-    ExportDataset(String),
-    SaveScreenshot(String),
+struct CameraBookmark {
+    name: String,
+    camera: Camera,
 }
 
 pub struct ParaVizApp {
@@ -74,20 +65,24 @@ pub struct ParaVizApp {
     viewport_tex_id: Option<egui::TextureId>,
     viewport_tex_size: (u32, u32),
 
+    theme: UiTheme,
+    theme_applied: bool,
     selected_node: Option<NodeId>,
+    renaming_node: Option<(NodeId, String)>,
     auto_apply: bool,
     pending_source: Option<(NodeId, SourceConfig)>,
     pending_filter: Option<(NodeId, FilterConfig)>,
 
     inspector_tab: InspectorTab,
+    show_left_dock: bool,
+    zen_mode: bool,
     show_drawer: bool,
     drawer_tab: DrawerTab,
-    chart_mode: ChartMode,
-    hist_array_name: String,
-    hist_association: AttributeAssociation,
-    hist_component: Option<usize>,
-    hist_bins: usize,
+    chart_state: ChartState,
     spreadsheet_target: SpreadsheetTarget,
+    spreadsheet_offset: usize,
+    spreadsheet_page_size: usize,
+    spreadsheet_filter: String,
     show_scalar_bar: bool,
     show_widgets: bool,
 
@@ -95,6 +90,9 @@ pub struct ParaVizApp {
     last_pick: Option<PickResult>,
     ruler_points: Vec<[f32; 3]>,
     export_glb_colors: bool,
+
+    turntable_enabled: bool,
+    turntable_speed: f32,
 
     playing: bool,
     time_accumulator: f64,
@@ -104,7 +102,11 @@ pub struct ParaVizApp {
     fps_smoothed: f32,
     last_render_ms: f32,
 
-    modal: Option<PathModal>,
+    recent_files: Vec<PathBuf>,
+    camera_bookmarks: Vec<CameraBookmark>,
+    info_stats_cache: HashMap<(NodeId, String, AttributeAssociation), HistogramResult>,
+
+    modal: Option<AppModal>,
     status_message: String,
     error_message: Option<String>,
 }
@@ -125,6 +127,9 @@ impl ParaVizApp {
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
+        let theme = UiTheme::DarkStudio;
+        apply_theme(&cc.egui_ctx, theme);
+
         let mut app = Self {
             session: ParaViz::new(),
             renderer,
@@ -132,31 +137,40 @@ impl ParaVizApp {
             egui_renderer,
             viewport_tex_id: None,
             viewport_tex_size: (0, 0),
+            theme,
+            theme_applied: true,
             selected_node: None,
+            renaming_node: None,
             auto_apply: true,
             pending_source: None,
             pending_filter: None,
             inspector_tab: InspectorTab::Properties,
+            show_left_dock: true,
+            zen_mode: false,
             show_drawer: false,
             drawer_tab: DrawerTab::Spreadsheet,
-            chart_mode: ChartMode::Histogram,
-            hist_array_name: String::new(),
-            hist_association: AttributeAssociation::Point,
-            hist_component: None,
-            hist_bins: 20,
+            chart_state: ChartState::default(),
             spreadsheet_target: SpreadsheetTarget::Points,
+            spreadsheet_offset: 0,
+            spreadsheet_page_size: 200,
+            spreadsheet_filter: String::new(),
             show_scalar_bar: true,
             show_widgets: true,
             viewport_mode: ViewportMode::Orbit,
             last_pick: None,
             ruler_points: Vec::new(),
             export_glb_colors: true,
+            turntable_enabled: false,
+            turntable_speed: 0.45,
             playing: false,
             time_accumulator: 0.0,
             play_fps: 4.0,
             last_frame_time: Instant::now(),
             fps_smoothed: 60.0,
             last_render_ms: 0.0,
+            recent_files: Vec::new(),
+            camera_bookmarks: Vec::new(),
+            info_stats_cache: HashMap::new(),
             modal: None,
             status_message: "Ready".into(),
             error_message: None,
@@ -171,6 +185,13 @@ impl ParaVizApp {
         app
     }
 
+    fn push_recent_file(&mut self, path: &Path) {
+        let p = path.to_path_buf();
+        self.recent_files.retain(|existing| existing != &p);
+        self.recent_files.insert(0, p);
+        self.recent_files.truncate(8);
+    }
+
     fn load_demo(&mut self, preset: DemoPreset) {
         match preset.build() {
             Ok(mut pv) => {
@@ -179,6 +200,10 @@ impl ParaVizApp {
                 self.session = pv;
                 self.pending_source = None;
                 self.pending_filter = None;
+                self.renaming_node = None;
+                self.last_pick = None;
+                self.ruler_points.clear();
+                self.info_stats_cache.clear();
                 self.playing = false;
                 self.error_message = None;
                 self.status_message = format!("Loaded demo: {}", preset.name());
@@ -190,6 +215,13 @@ impl ParaVizApp {
     }
 
     fn load_path(&mut self, path: &Path) {
+        if is_raw_volume_ext(path) {
+            self.modal = Some(AppModal::RawVolume(RawVolumeModalState::with_path(
+                path.display().to_string(),
+            )));
+            return;
+        }
+
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
@@ -206,8 +238,13 @@ impl ParaVizApp {
                     self.session = pv;
                     self.pending_source = None;
                     self.pending_filter = None;
+                    self.renaming_node = None;
+                    self.last_pick = None;
+                    self.ruler_points.clear();
+                    self.info_stats_cache.clear();
                     self.playing = false;
                     self.error_message = None;
+                    self.push_recent_file(path);
                     self.status_message = format!("Loaded state: {}", path.display());
                 }
                 Err(e) => {
@@ -227,14 +264,59 @@ impl ParaVizApp {
                 } else {
                     let _ = self.session.reset_camera();
                 }
-                self.selected_node = Some(id);
-                self.pending_source = None;
-                self.pending_filter = None;
+                self.select_node(id);
+                self.info_stats_cache.clear();
                 self.error_message = None;
+                self.push_recent_file(path);
                 self.status_message = format!("Opened '{}'", path.display());
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to open '{}': {e}", path.display()));
+            }
+        }
+    }
+
+    fn import_raw_volume(&mut self, rv: RawVolumeModalState) {
+        let desc = RawVolumeDescriptor {
+            dimensions: rv.dimensions,
+            scalar_type: paraviz_core::ScalarType::F32, // overridden by read_raw_volume_with_type
+            origin: rv.origin,
+            spacing: rv.spacing,
+            endian: rv.endian,
+            header_bytes: rv.header_bytes,
+            array_name: if rv.array_name.trim().is_empty() {
+                "Scalars".into()
+            } else {
+                rv.array_name.trim().to_string()
+            },
+        };
+        let path = PathBuf::from(rv.path.trim());
+        match paraviz::io::read_raw_volume_with_type(&path, &desc, rv.scalar_type) {
+            Ok(img) => {
+                let is_first = self.session.nodes().is_empty();
+                let base_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("RawVolume");
+                let label = self.unique_label(base_name);
+                let id = self.session.add_dataset(label.clone(), DataSet::ImageData(img));
+                let _ = self.session.evaluate(id);
+                self.session.show(id).representation(Representation::Volume);
+                if is_first {
+                    let _ = self.session.camera_preset(CameraPreset::Isometric);
+                } else {
+                    let _ = self.session.reset_camera();
+                }
+                self.select_node(id);
+                self.error_message = None;
+                self.push_recent_file(&path);
+                self.status_message = format!(
+                    "Imported raw volume '{label}' ({}×{}×{})",
+                    rv.dimensions[0], rv.dimensions[1], rv.dimensions[2]
+                );
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Raw volume import failed: {e}"));
             }
         }
     }
@@ -251,9 +333,7 @@ impl ParaVizApp {
                 } else {
                     let _ = self.session.reset_camera();
                 }
-                self.selected_node = Some(id);
-                self.pending_source = None;
-                self.pending_filter = None;
+                self.select_node(id);
                 self.error_message = None;
                 self.status_message = format!("Added source '{label}'");
             }
@@ -269,7 +349,6 @@ impl ParaVizApp {
             return;
         };
 
-        // Populate smart defaults from the parent's dataset.
         if let Ok(ds) = self.session.evaluate(parent_id) {
             let bb = ds.bounds();
             let center = bb.center().to_array();
@@ -342,11 +421,10 @@ impl ParaVizApp {
                         f.expression = format!("{name} * 2.0");
                     }
                 }
-                FilterConfig::ProbeOverLine(f)
-                    if bb.is_valid() => {
-                        f.point1 = [bb.min.x, center[1], center[2]];
-                        f.point2 = [bb.max.x, center[1], center[2]];
-                    }
+                FilterConfig::ProbeOverLine(f) if bb.is_valid() => {
+                    f.point1 = [bb.min.x, center[1], center[2]];
+                    f.point2 = [bb.max.x, center[1], center[2]];
+                }
                 FilterConfig::Elevation(f) if bb.is_valid() => {
                     let dz = (bb.max.z - bb.min.z).abs();
                     let dy = (bb.max.y - bb.min.y).abs();
@@ -366,7 +444,10 @@ impl ParaVizApp {
         }
 
         let is_cell_centers = matches!(cfg, FilterConfig::CellCenters(_));
-        let is_feature_edges = matches!(cfg, FilterConfig::FeatureEdges(_));
+        let is_wire_edges = matches!(
+            cfg,
+            FilterConfig::FeatureEdges(_) | FilterConfig::ExtractEdges(_)
+        );
         let is_probe = matches!(cfg, FilterConfig::ProbeOverLine(_));
         let label = self.unique_label(cfg.default_label());
         match self.session.add_filter_cfg(label.clone(), parent_id, cfg) {
@@ -375,7 +456,7 @@ impl ParaVizApp {
                 let handle = self.session.show(id);
                 if is_cell_centers {
                     handle.representation(Representation::Points);
-                } else if is_feature_edges {
+                } else if is_wire_edges {
                     handle.representation(Representation::Wireframe);
                 }
                 if let Err(e) = eval_res {
@@ -384,12 +465,12 @@ impl ParaVizApp {
                     self.error_message = None;
                     self.status_message = format!("Applied filter '{label}'");
                 }
+                self.select_node(id);
                 if is_probe {
-                    self.chart_mode = ChartMode::XYPlot;
+                    self.chart_state.mode = ChartMode::XYPlot;
+                    self.drawer_tab = DrawerTab::Chart;
+                    self.show_drawer = true;
                 }
-                self.selected_node = Some(id);
-                self.pending_source = None;
-                self.pending_filter = None;
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to add filter: {e}"));
@@ -397,7 +478,7 @@ impl ParaVizApp {
         }
     }
 
-    fn apply_gpu_contour_to_selected(&mut self) {
+    fn open_gpu_contour_modal(&mut self) {
         let Some(sel_id) = self.selected_node else {
             self.error_message = Some("Select an ImageData node first.".into());
             return;
@@ -411,26 +492,43 @@ impl ParaVizApp {
                 Some("GPU Compute Contour requires an ImageData dataset.".into());
             return;
         };
-        let scalar_info = img
+        let arrays: Vec<(String, (f64, f64))> = img
+            .point_data
+            .arrays()
+            .iter()
+            .map(|a| (a.name.clone(), a.range(None)))
+            .collect();
+        let (field_name, range) = img
             .point_data
             .active_scalars_array()
-            .or_else(|| img.point_data.arrays().first())
-            .map(|a| (a.name.clone(), a.range(None)));
-        let (field_name, iso_value) = match scalar_info {
-            Some((name, (mn, mx))) => (Some(name), (mn + mx) * 0.5),
-            None => (None, 0.0),
-        };
+            .map(|a| (a.name.clone(), a.range(None)))
+            .or_else(|| arrays.first().cloned())
+            .unwrap_or_else(|| (String::new(), (0.0, 1.0)));
+        let iso_value = 0.5 * (range.0 + range.1);
+        self.modal = Some(AppModal::GpuContour(GpuContourModalState {
+            node_id: sel_id,
+            available_arrays: arrays,
+            field_name,
+            iso_value,
+            range,
+        }));
+    }
+
+    fn run_gpu_contour(&mut self, node_id: NodeId, field_name: &str, iso_value: f64) {
         let label = self.unique_label("GpuContour");
+        let field_opt = if field_name.is_empty() {
+            None
+        } else {
+            Some(field_name)
+        };
         match self
             .session
-            .gpu_contour(label.clone(), sel_id, field_name.as_deref(), iso_value)
+            .gpu_contour(label.clone(), node_id, field_opt, iso_value)
         {
             Ok(new_id) => {
                 let _ = self.session.evaluate(new_id);
                 self.session.show(new_id);
-                self.selected_node = Some(new_id);
-                self.pending_source = None;
-                self.pending_filter = None;
+                self.select_node(new_id);
                 self.error_message = None;
                 self.status_message =
                     format!("Applied GPU Compute Contour '{label}' (iso={iso_value:.3})");
@@ -466,14 +564,87 @@ impl ParaVizApp {
                 let id = self.session.add_dataset(label.clone(), ds);
                 let _ = self.session.evaluate(id);
                 self.session.show(id);
-                self.selected_node = Some(id);
-                self.pending_source = None;
-                self.pending_filter = None;
+                self.select_node(id);
                 self.error_message = None;
                 self.status_message = format!("Appended visible datasets -> '{label}'");
             }
             Err(e) => {
                 self.error_message = Some(format!("Append Datasets failed: {e}"));
+            }
+        }
+    }
+
+    fn focus_selected_node(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            let _ = self.session.reset_camera();
+            return;
+        };
+        let _ = self.session.evaluate(sel_id);
+        if let Ok(node) = self.session.node(sel_id)
+            && let Some(ds) = node.dataset()
+        {
+            let bb = ds.bounds();
+            if bb.is_valid() {
+                self.session.camera.fit_bounds(&bb);
+                return;
+            }
+        }
+        let _ = self.session.reset_camera();
+    }
+
+    fn duplicate_selected_node(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            return;
+        };
+        let Ok(node) = self.session.node(sel_id).cloned() else {
+            return;
+        };
+        let label = self.unique_label(&format!("{}_copy", node.name));
+        let new_id_res = if let Some(src) = node.source_config {
+            self.session.add_source_cfg(label.clone(), src)
+        } else if let (Some(parent), Some(flt)) = (node.parent, node.filter_config) {
+            self.session.add_filter_cfg(label.clone(), parent, flt)
+        } else if let Some(ds) = node.cached_dataset {
+            Ok(self.session.add_dataset(label.clone(), (*ds).clone()))
+        } else {
+            return;
+        };
+        match new_id_res {
+            Ok(new_id) => {
+                if let Ok(n) = self.session.node_mut(new_id) {
+                    n.style = node.style;
+                }
+                let _ = self.session.evaluate(new_id);
+                self.select_node(new_id);
+                self.status_message = format!("Duplicated node -> '{label}'");
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Duplicate failed: {e}"));
+            }
+        }
+    }
+
+    fn solo_selected_node(&mut self) {
+        let Some(sel_id) = self.selected_node else {
+            return;
+        };
+        let ids: Vec<NodeId> = self.session.nodes().iter().map(|n| n.id).collect();
+        for id in ids {
+            if id == sel_id {
+                self.session.show(id);
+            } else {
+                self.session.hide(id);
+            }
+        }
+    }
+
+    fn set_all_visibility(&mut self, visible: bool) {
+        let ids: Vec<NodeId> = self.session.nodes().iter().map(|n| n.id).collect();
+        for id in ids {
+            if visible {
+                self.session.show(id);
+            } else {
+                self.session.hide(id);
             }
         }
     }
@@ -592,6 +763,8 @@ impl ParaVizApp {
             self.selected_node = Some(id);
             self.pending_source = None;
             self.pending_filter = None;
+            self.renaming_node = None;
+            self.spreadsheet_offset = 0;
             let has_arc = self
                 .session
                 .node(id)
@@ -599,11 +772,23 @@ impl ParaVizApp {
                 .and_then(|n| n.dataset())
                 .and_then(|ds| ds.as_poly_data())
                 .is_some_and(|pd| pd.point_data.get("ArcLength").is_some());
-            self.chart_mode = if has_arc {
+            self.chart_state.mode = if has_arc {
                 ChartMode::XYPlot
             } else {
                 ChartMode::Histogram
             };
+        }
+    }
+
+    fn delete_selected_node(&mut self) {
+        if let Some(id) = self.selected_node {
+            let removed = self.session.remove_node(id);
+            self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
+            if self.selected_node.is_some_and(|s| removed.contains(&s)) {
+                self.selected_node = self.session.nodes().last().map(|n| n.id);
+                self.pending_source = None;
+                self.pending_filter = None;
+            }
         }
     }
 
@@ -625,6 +810,7 @@ impl ParaVizApp {
         let next_idx =
             (cur_idx as isize + delta_steps).rem_euclid(steps.len() as isize) as usize;
         self.session.set_time(steps[next_idx]);
+        self.info_stats_cache.clear();
     }
 
     fn handle_shortcuts_and_drops(&mut self, ctx: &egui::Context) {
@@ -639,9 +825,56 @@ impl ParaVizApp {
             self.load_path(&path);
         }
 
-        if !ctx.egui_wants_keyboard_input() && self.modal.is_none() {
+        if !ctx.egui_wants_keyboard_input() && self.modal.is_none() && self.renaming_node.is_none() {
             if ctx.input(|i| i.key_pressed(egui::Key::R)) {
                 let _ = self.session.reset_camera();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                self.focus_selected_node();
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+                self.viewport_mode = ViewportMode::Orbit;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num2)) {
+                self.viewport_mode = ViewportMode::Pick;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Num3)) {
+                self.viewport_mode = ViewportMode::Ruler;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+                self.show_widgets = !self.show_widgets;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+                self.session.settings.edl_enabled = !self.session.settings.edl_enabled;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+                self.session.settings.msaa_samples = if self.session.settings.msaa_samples >= 4 {
+                    1
+                } else {
+                    4
+                };
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+                self.session.settings.show_axes_gizmo = !self.session.settings.show_axes_gizmo;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+                self.session.settings.show_bounding_box =
+                    !self.session.settings.show_bounding_box;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+                self.turntable_enabled = !self.turntable_enabled;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+                self.show_left_dock = !self.show_left_dock;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F1))
+                || ctx.input(|i| i.key_pressed(egui::Key::Questionmark))
+            {
+                self.modal = Some(AppModal::Shortcuts);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+            {
+                self.delete_selected_node();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Space))
                 && !self.session.all_time_steps().is_empty()
@@ -652,31 +885,57 @@ impl ParaVizApp {
     }
 
     fn draw_menu_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(self.theme);
         egui::MenuBar::new().ui(ui, |ui| {
+            paint_logo_badge(ui, self.theme);
+            ui.label(egui::RichText::new("ParaViz").strong().size(13.5));
+            pill_badge(
+                ui,
+                "WebGPU",
+                pal.accent_dim,
+                pal.accent,
+            );
+            ui.separator();
+
             ui.menu_button("File", |ui| {
                 if ui.button("File Browser...").clicked() {
-                    self.modal = Some(PathModal::FileBrowser(FileBrowserState::new()));
+                    self.modal = Some(AppModal::FileBrowser(FileBrowserState::new()));
                     ui.close();
                 }
                 if ui.button("Open File by Path...").clicked() {
-                    self.modal = Some(PathModal::OpenFile(String::new()));
+                    self.modal = Some(AppModal::OpenFile(String::new()));
                     ui.close();
                 }
-                ui.menu_button("Demo Scenes", |ui| {
-                    for &preset in DemoPreset::ALL {
-                        if ui.button(preset.name()).clicked() {
-                            self.load_demo(preset);
-                            ui.close();
+                if ui.button("Import Raw 3D Volume (.raw)...").clicked() {
+                    self.modal = Some(AppModal::RawVolume(RawVolumeModalState::with_path("")));
+                    ui.close();
+                }
+                if !self.recent_files.is_empty() {
+                    ui.menu_button("Recent Files", |ui| {
+                        let recents = self.recent_files.clone();
+                        for p in recents {
+                            let label = p
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("File");
+                            if ui
+                                .button(label)
+                                .on_hover_text(p.display().to_string())
+                                .clicked()
+                            {
+                                self.load_path(&p);
+                                ui.close();
+                            }
                         }
-                    }
-                });
+                    });
+                }
                 ui.separator();
                 if ui.button("Save State JSON...").clicked() {
-                    self.modal = Some(PathModal::SaveState("paraviz_state.json".into()));
+                    self.modal = Some(AppModal::SaveState("paraviz_state.json".into()));
                     ui.close();
                 }
                 if ui.button("Load State JSON...").clicked() {
-                    self.modal = Some(PathModal::LoadState("paraviz_state.json".into()));
+                    self.modal = Some(AppModal::LoadState("paraviz_state.json".into()));
                     ui.close();
                 }
                 ui.separator();
@@ -685,11 +944,17 @@ impl ParaVizApp {
                     .add_enabled(has_sel, egui::Button::new("Export Active Dataset..."))
                     .clicked()
                 {
-                    self.modal = Some(PathModal::ExportDataset("export.vtp".into()));
+                    self.modal = Some(AppModal::ExportDataset("export.vtp".into()));
                     ui.close();
                 }
                 if ui.button("Save Screenshot PNG...").clicked() {
-                    self.modal = Some(PathModal::SaveScreenshot("screenshot.png".into()));
+                    let (w, h) = self.viewport_tex_size;
+                    self.modal = Some(AppModal::SaveScreenshot(ScreenshotModalState {
+                        path: "screenshot.png".into(),
+                        width: w.max(1280),
+                        height: h.max(720),
+                        use_viewport_size: true,
+                    }));
                     ui.close();
                 }
                 ui.separator();
@@ -797,6 +1062,10 @@ impl ParaVizApp {
                         FilterConfig::FeatureEdges(FeatureEdgesFilter::default()),
                     ),
                     (
+                        "Extract All Edges",
+                        FilterConfig::ExtractEdges(ExtractEdgesFilter),
+                    ),
+                    (
                         "Connectivity",
                         FilterConfig::Connectivity(ConnectivityFilter::default()),
                     ),
@@ -809,6 +1078,14 @@ impl ParaVizApp {
                     (
                         "Generate Normals",
                         FilterConfig::GenerateNormals(GenerateNormalsFilter::default()),
+                    ),
+                    (
+                        "Triangulate",
+                        FilterConfig::Triangulate(TriangulateFilter::default()),
+                    ),
+                    (
+                        "Clean PolyData",
+                        FilterConfig::CleanPolyData(CleanPolyDataFilter::default()),
                     ),
                     (
                         "Elevation",
@@ -825,11 +1102,11 @@ impl ParaVizApp {
                 if ui
                     .add_enabled(
                         is_imagedata,
-                        egui::Button::new("GPU Compute Contour (WebGPU)"),
+                        egui::Button::new("GPU Compute Contour (WebGPU)..."),
                     )
                     .clicked()
                 {
-                    self.apply_gpu_contour_to_selected();
+                    self.open_gpu_contour_modal();
                     ui.close();
                 }
                 if ui
@@ -841,162 +1118,422 @@ impl ParaVizApp {
                 }
             });
 
+            ui.menu_button("Demos", |ui| {
+                if ui.button("Open Demo Gallery...").clicked() {
+                    self.modal = Some(AppModal::DemoGallery);
+                    ui.close();
+                }
+                ui.separator();
+                for &preset in DemoPreset::ALL {
+                    if ui.button(preset.name()).clicked() {
+                        self.load_demo(preset);
+                        ui.close();
+                    }
+                }
+            });
+
             ui.menu_button("View", |ui| {
+                ui.checkbox(&mut self.show_left_dock, "Inspector Dock (Tab)");
                 ui.checkbox(
                     &mut self.show_drawer,
-                    "Inspector Drawer (Spreadsheet / Chart / Trace)",
+                    "Data Drawer (Spreadsheet / Chart / Trace)",
                 );
+                ui.checkbox(&mut self.zen_mode, "Zen Mode (Full Viewport)");
+                ui.separator();
                 ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
-                ui.checkbox(&mut self.show_widgets, "3D Filter Widgets");
-                ui.checkbox(&mut self.session.settings.show_axes_gizmo, "Axes Gizmo");
+                ui.checkbox(&mut self.show_widgets, "3D Filter Widgets (W)");
+                ui.checkbox(&mut self.session.settings.show_axes_gizmo, "Axes Gizmo (G)");
                 ui.checkbox(
                     &mut self.session.settings.show_bounding_box,
-                    "Bounding Box",
+                    "Bounding Box (B)",
                 );
+                ui.checkbox(&mut self.turntable_enabled, "Turntable Spin (T)");
+                ui.separator();
                 let mut msaa_4x = self.session.settings.msaa_samples >= 4;
-                if ui.checkbox(&mut msaa_4x, "4x MSAA").changed() {
+                if ui.checkbox(&mut msaa_4x, "4x MSAA (M)").changed() {
                     self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
                 }
-                ui.checkbox(&mut self.session.settings.edl_enabled, "Eye-Dome Lighting");
+                ui.checkbox(
+                    &mut self.session.settings.edl_enabled,
+                    "Eye-Dome Lighting (E)",
+                );
                 if self.session.settings.edl_enabled {
                     ui.add(
                         egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
                             .text("EDL Strength"),
                     );
                 }
+                ui.separator();
+                ui.menu_button("UI Theme", |ui| {
+                    if ui
+                        .selectable_label(self.theme == UiTheme::DarkStudio, "Dark Studio")
+                        .clicked()
+                    {
+                        self.theme = UiTheme::DarkStudio;
+                        self.theme_applied = false;
+                        ui.close();
+                    }
+                    if ui
+                        .selectable_label(self.theme == UiTheme::LightStudio, "Light Studio")
+                        .clicked()
+                    {
+                        self.theme = UiTheme::LightStudio;
+                        self.theme_applied = false;
+                        ui.close();
+                    }
+                });
+            });
+
+            ui.menu_button("Help", |ui| {
+                if ui.button("Keyboard & Mouse Shortcuts (F1)").clicked() {
+                    self.modal = Some(AppModal::Shortcuts);
+                    ui.close();
+                }
+                if ui.button("Demo Gallery").clicked() {
+                    self.modal = Some(AppModal::DemoGallery);
+                    ui.close();
+                }
+            });
+
+            // Right-aligned quick utility pills
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("?").on_hover_text("Shortcuts (F1)").clicked() {
+                    self.modal = Some(AppModal::Shortcuts);
+                }
+                let theme_lbl = match self.theme {
+                    UiTheme::DarkStudio => "Light UI",
+                    UiTheme::LightStudio => "Dark UI",
+                };
+                if ui.small_button(theme_lbl).clicked() {
+                    self.theme = match self.theme {
+                        UiTheme::DarkStudio => UiTheme::LightStudio,
+                        UiTheme::LightStudio => UiTheme::DarkStudio,
+                    };
+                    self.theme_applied = false;
+                }
+                ui.toggle_value(&mut self.zen_mode, "Zen")
+                    .on_hover_text("Hide side & bottom panels");
+                if ui.small_button("Browse").on_hover_text("Open File Browser").clicked() {
+                    self.modal = Some(AppModal::FileBrowser(FileBrowserState::new()));
+                }
             });
         });
     }
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(self.theme);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Reset (R)").clicked() {
-                let _ = self.session.reset_camera();
-            }
-            for (label, preset) in [
-                ("+X", CameraPreset::PosX),
-                ("-X", CameraPreset::NegX),
-                ("+Y", CameraPreset::PosY),
-                ("-Y", CameraPreset::NegY),
-                ("+Z", CameraPreset::PosZ),
-                ("-Z", CameraPreset::NegZ),
-                ("Iso", CameraPreset::Isometric),
-            ] {
-                if ui.button(label).clicked() {
-                    let _ = self.session.camera_preset(preset);
-                }
-            }
-            ui.separator();
-            ui.label("Mode:");
-            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Orbit, "Orbit");
-            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Pick, "Pick");
-            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Ruler, "Ruler");
-            if !self.ruler_points.is_empty() && ui.button("Clear Ruler").clicked() {
-                self.ruler_points.clear();
-            }
+            // Camera group
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Reset").on_hover_text("Reset camera (R)").clicked() {
+                            let _ = self.session.reset_camera();
+                        }
+                        if ui.small_button("Fit").on_hover_text("Focus selected node (F)").clicked() {
+                            self.focus_selected_node();
+                        }
+                        for (label, preset) in [
+                            ("+X", CameraPreset::PosX),
+                            ("-X", CameraPreset::NegX),
+                            ("+Y", CameraPreset::PosY),
+                            ("-Y", CameraPreset::NegY),
+                            ("+Z", CameraPreset::PosZ),
+                            ("-Z", CameraPreset::NegZ),
+                            ("Iso", CameraPreset::Isometric),
+                        ] {
+                            if ui.small_button(label).clicked() {
+                                let _ = self.session.camera_preset(preset);
+                            }
+                        }
+                        ui.toggle_value(&mut self.session.camera.orthographic, "Ortho");
+                        ui.toggle_value(&mut self.turntable_enabled, "Spin")
+                            .on_hover_text("Turntable orbit spin (T)");
+                    });
+                });
 
-            ui.separator();
-            ui.toggle_value(&mut self.session.camera.orthographic, "Ortho");
-            ui.toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes");
-            ui.toggle_value(&mut self.session.settings.show_bounding_box, "Bounds");
-            ui.toggle_value(&mut self.show_widgets, "Widgets");
-            let mut msaa_4x = self.session.settings.msaa_samples >= 4;
-            if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
-                self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
-            }
-            ui.toggle_value(&mut self.session.settings.edl_enabled, "EDL");
-            if self.session.settings.edl_enabled {
-                ui.add(
-                    egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
-                        .text("Strength")
-                        .max_decimals(2),
-                );
-            }
-            ui.toggle_value(&mut self.show_scalar_bar, "ScalarBar");
-            ui.separator();
-            ui.toggle_value(&mut self.show_drawer, "Spreadsheet / Chart / Trace");
+            // Interaction mode group
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.viewport_mode, ViewportMode::Orbit, "Orbit")
+                            .on_hover_text("Orbit / Pan / Zoom (1)");
+                        ui.selectable_value(&mut self.viewport_mode, ViewportMode::Pick, "Pick")
+                            .on_hover_text("3D Raycast Pick (2)");
+                        ui.selectable_value(&mut self.viewport_mode, ViewportMode::Ruler, "Ruler")
+                            .on_hover_text("2-Point Distance Ruler (3)");
+                        if !self.ruler_points.is_empty() && ui.small_button("Clear").clicked() {
+                            self.ruler_points.clear();
+                        }
+                    });
+                });
 
+            // Render & overlay toggles
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes");
+                        ui.toggle_value(&mut self.session.settings.show_bounding_box, "Bounds");
+                        ui.toggle_value(&mut self.show_widgets, "Widgets");
+                        ui.toggle_value(&mut self.show_scalar_bar, "ColorBar");
+                        let mut msaa_4x = self.session.settings.msaa_samples >= 4;
+                        if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
+                            self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+                        }
+                        ui.toggle_value(&mut self.session.settings.edl_enabled, "EDL");
+                        if self.session.settings.edl_enabled {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.session.settings.edl_strength,
+                                    0.0..=4.0,
+                                )
+                                .max_decimals(2)
+                                .show_value(true),
+                            );
+                        }
+                    });
+                });
+
+            // Panel toggles
+            egui::Frame::new()
+                .fill(pal.card_bg)
+                .stroke(egui::Stroke::new(1.0, pal.card_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.toggle_value(&mut self.show_left_dock, "Inspector");
+                        ui.toggle_value(&mut self.show_drawer, "Data / Chart");
+                    });
+                });
+
+            // Time steps transport
             let steps = self.session.all_time_steps();
             if !steps.is_empty() {
-                ui.separator();
-                ui.label("Time:");
-                if ui.button("|<").clicked() {
-                    self.session.set_time(steps[0]);
-                }
-                if ui.button("<").clicked() {
-                    self.step_time(-1);
-                }
-                let play_label = if self.playing { "Pause" } else { "Play" };
-                if ui.button(play_label).clicked() {
-                    self.playing = !self.playing;
-                }
-                if ui.button(">").clicked() {
-                    self.step_time(1);
-                }
-                if ui.button(">|").clicked() {
-                    self.session.set_time(*steps.last().unwrap());
-                }
-                let min_t = steps[0];
-                let max_t = *steps.last().unwrap();
-                let mut t = self.session.time;
-                if (max_t - min_t).abs() > 1e-12 {
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut t, min_t..=max_t)
-                                .max_decimals(3)
-                                .show_value(true),
-                        )
-                        .changed()
-                    {
-                        self.session.set_time(t);
-                    }
-                } else {
-                    ui.label(format!("{t:.3}"));
-                }
+                egui::Frame::new()
+                    .fill(pal.card_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.card_border))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(6, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Time:");
+                            if ui.small_button("|<").clicked() {
+                                self.session.set_time(steps[0]);
+                            }
+                            if ui.small_button("<").clicked() {
+                                self.step_time(-1);
+                            }
+                            let play_label = if self.playing { "Pause" } else { "Play" };
+                            if ui.small_button(play_label).clicked() {
+                                self.playing = !self.playing;
+                            }
+                            if ui.small_button(">").clicked() {
+                                self.step_time(1);
+                            }
+                            if ui.small_button(">|").clicked() {
+                                self.session.set_time(*steps.last().unwrap());
+                            }
+                            let min_t = steps[0];
+                            let max_t = *steps.last().unwrap();
+                            let mut t = self.session.time;
+                            if (max_t - min_t).abs() > 1e-12 {
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut t, min_t..=max_t)
+                                            .max_decimals(3)
+                                            .show_value(true),
+                                    )
+                                    .changed()
+                                {
+                                    self.session.set_time(t);
+                                    self.info_stats_cache.clear();
+                                }
+                            } else {
+                                ui.label(format!("{t:.3}"));
+                            }
+                        });
+                    });
             }
         });
     }
 
     fn draw_left_dock(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Pipeline Browser");
-        ui.separator();
+        let pal = palette(self.theme);
 
-        // Build ordered tree list (roots then recursive children).
+        // Pipeline Browser Header + Quick Actions
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Pipeline").size(13.5).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let has_sel = self.selected_node.is_some();
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Del").small())
+                    .on_hover_text("Delete selected node (Del)")
+                    .clicked()
+                {
+                    self.delete_selected_node();
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Dup").small())
+                    .on_hover_text("Duplicate selected node")
+                    .clicked()
+                {
+                    self.duplicate_selected_node();
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Rename").small())
+                    .on_hover_text("Rename selected node")
+                    .clicked()
+                    && let Some(sel) = self.selected_node
+                    && let Ok(n) = self.session.node(sel)
+                {
+                    self.renaming_node = Some((sel, n.name.clone()));
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("Solo").small())
+                    .on_hover_text("Show only selected node")
+                    .clicked()
+                {
+                    self.solo_selected_node();
+                }
+                if ui
+                    .small_button("None")
+                    .on_hover_text("Hide all nodes")
+                    .clicked()
+                {
+                    self.set_all_visibility(false);
+                }
+                if ui
+                    .small_button("All")
+                    .on_hover_text("Show all nodes")
+                    .clicked()
+                {
+                    self.set_all_visibility(true);
+                }
+            });
+        });
+        ui.add_space(3.0);
+
         let ordered = self.pipeline_tree_order();
         let mut toggle_vis: Option<(NodeId, bool)> = None;
         let mut to_select: Option<NodeId> = None;
         let mut to_delete: Option<NodeId> = None;
+        let mut commit_rename: Option<(NodeId, String)> = None;
+        let mut cancel_rename = false;
 
-        egui::ScrollArea::vertical()
-            .id_salt("pipeline_browser_scroll")
-            .max_height(190.0)
+        egui::Frame::new()
+            .fill(pal.card_bg)
+            .stroke(egui::Stroke::new(1.0, pal.card_border))
+            .corner_radius(egui::CornerRadius::same(7))
+            .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
-                if ordered.is_empty() {
-                    ui.weak("Pipeline is empty. Use Sources or File -> Open.");
-                }
-                for (id, depth, name, visible) in ordered {
-                    ui.horizontal(|ui| {
-                        if depth > 0 {
-                            ui.add_space(depth as f32 * 14.0);
-                            ui.weak("└");
+                egui::ScrollArea::vertical()
+                    .id_salt("pipeline_browser_scroll")
+                    .max_height(185.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        if ordered.is_empty() {
+                            ui.weak("Pipeline empty. Load a Demo or Source.");
                         }
-                        let eye = if visible { "👁" } else { "○" };
-                        if ui.small_button(eye).on_hover_text("Toggle visibility").clicked() {
-                            toggle_vis = Some((id, !visible));
+                        for row in ordered {
+                            let id = row.id;
+                            let depth = row.depth;
+                            let name = row.name;
+                            let visible = row.visible;
+                            let badge = row.badge;
+                            let selected = self.selected_node == Some(id);
+                            let row_bg = if selected {
+                                pal.accent_dim
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            egui::Frame::new()
+                                .fill(row_bg)
+                                .corner_radius(egui::CornerRadius::same(5))
+                                .inner_margin(egui::Margin::symmetric(4, 2))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if depth > 0 {
+                                            ui.add_space((depth - 1) as f32 * 12.0);
+                                            ui.label(
+                                                egui::RichText::new("└")
+                                                    .color(pal.muted)
+                                                    .monospace(),
+                                            );
+                                        }
+                                        if visibility_eye_button(ui, visible, self.theme)
+                                            .on_hover_text("Toggle visibility")
+                                            .clicked()
+                                        {
+                                            toggle_vis = Some((id, !visible));
+                                        }
+                                        pill_badge(ui, badge.0, badge.1, badge.2);
+
+                                        if let Some((rid, ref mut buf)) = self.renaming_node
+                                            && rid == id
+                                        {
+                                            let r = ui.add(
+                                                egui::TextEdit::singleline(buf).desired_width(120.0),
+                                            );
+                                            if r.lost_focus()
+                                                || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                            {
+                                                commit_rename = Some((id, buf.clone()));
+                                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape))
+                                            {
+                                                cancel_rename = true;
+                                            }
+                                        } else {
+                                            let lbl = ui.selectable_label(selected, &name);
+                                            if lbl.clicked() {
+                                                to_select = Some(id);
+                                            }
+                                            if lbl.double_clicked() {
+                                                self.renaming_node = Some((id, name.clone()));
+                                            }
+                                        }
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button("×")
+                                                    .on_hover_text("Delete node")
+                                                    .clicked()
+                                                {
+                                                    to_delete = Some(id);
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
                         }
-                        let selected = self.selected_node == Some(id);
-                        if ui.selectable_label(selected, &name).clicked() {
-                            to_select = Some(id);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("✕").on_hover_text("Delete node").clicked() {
-                                to_delete = Some(id);
-                            }
-                        });
                     });
-                }
             });
 
+        if let Some((id, new_name)) = commit_rename {
+            let trimmed = new_name.trim();
+            if !trimmed.is_empty()
+                && let Ok(n) = self.session.node_mut(id)
+            {
+                n.name = trimmed.to_string();
+            }
+            self.renaming_node = None;
+        } else if cancel_rename {
+            self.renaming_node = None;
+        }
         if let Some((id, vis)) = toggle_vis {
             if vis {
                 self.session.show(id);
@@ -1009,6 +1546,7 @@ impl ParaVizApp {
         }
         if let Some(id) = to_delete {
             let removed = self.session.remove_node(id);
+            self.info_stats_cache.retain(|(nid, _, _), _| !removed.contains(nid));
             if self.selected_node.is_some_and(|s| removed.contains(&s)) {
                 self.selected_node = self.session.nodes().last().map(|n| n.id);
                 self.pending_source = None;
@@ -1016,21 +1554,29 @@ impl ParaVizApp {
             }
         }
 
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.inspector_tab,
-                InspectorTab::Properties,
-                "Properties",
-            );
-            ui.selectable_value(&mut self.inspector_tab, InspectorTab::Display, "Display");
-            ui.selectable_value(
-                &mut self.inspector_tab,
-                InspectorTab::Information,
-                "Information",
-            );
-        });
-        ui.separator();
+        ui.add_space(6.0);
+
+        // Segmented Inspector Tab Bar
+        let has_pending = self.pending_source.is_some() || self.pending_filter.is_some();
+        egui::Frame::new()
+            .fill(pal.card_bg)
+            .stroke(egui::Stroke::new(1.0, pal.card_border))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let prop_label = if has_pending { "Properties *" } else { "Properties" };
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Properties, prop_label);
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Display, "Display");
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Information,
+                        "Info",
+                    );
+                    ui.selectable_value(&mut self.inspector_tab, InspectorTab::Scene, "Scene");
+                });
+            });
+        ui.add_space(5.0);
 
         egui::ScrollArea::vertical()
             .id_salt("inspector_scroll")
@@ -1038,20 +1584,29 @@ impl ParaVizApp {
                 InspectorTab::Properties => self.draw_properties_tab(ui),
                 InspectorTab::Display => self.draw_display_tab(ui),
                 InspectorTab::Information => self.draw_information_tab(ui),
+                InspectorTab::Scene => self.draw_scene_tab(ui),
             });
     }
 
-    fn pipeline_tree_order(&self) -> Vec<(NodeId, usize, String, bool)> {
+    fn pipeline_tree_order(&self) -> Vec<PipelineTreeRow> {
         let mut out = Vec::new();
         fn visit(
             nodes: &[paraviz::SessionNode],
             parent: Option<NodeId>,
             depth: usize,
-            out: &mut Vec<(NodeId, usize, String, bool)>,
+            out: &mut Vec<PipelineTreeRow>,
         ) {
             for n in nodes {
                 if n.parent == parent {
-                    out.push((n.id, depth, n.name.clone(), n.style.visible));
+                    let badge =
+                        node_badge_style(n.dataset().map(|d| d.as_ref()), n.filter_config.is_some());
+                    out.push(PipelineTreeRow {
+                        id: n.id,
+                        depth,
+                        name: n.name.clone(),
+                        visible: n.style.visible,
+                        badge,
+                    });
                     visit(nodes, Some(n.id), depth + 1, out);
                 }
             }
@@ -1061,31 +1616,51 @@ impl ParaVizApp {
     }
 
     fn draw_properties_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(self.theme);
         let Some(sel_id) = self.selected_node else {
-            ui.weak("Select a node to edit its properties.");
+            section_card(ui, self.theme, "Properties", |ui| {
+                ui.weak("Select a node in the Pipeline Browser to configure its parameters.");
+            });
             return;
         };
 
-        let (src_cfg, flt_cfg) = match self.session.node(sel_id) {
-            Ok(n) => (n.source_config.clone(), n.filter_config.clone()),
+        let (parent_id, src_cfg, flt_cfg) = match self.session.node(sel_id) {
+            Ok(n) => (n.parent, n.source_config.clone(), n.filter_config.clone()),
             Err(_) => return,
         };
+        let parent_ds = parent_id
+            .and_then(|pid| self.session.node(pid).ok())
+            .and_then(|pn| pn.dataset().cloned());
 
         let mut apply_clicked = false;
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.auto_apply, "Auto-Apply");
-            if ui.button("Apply").clicked() {
-                apply_clicked = true;
-            }
+        let mut discard_clicked = false;
+        section_card(ui, self.theme, "", |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.auto_apply, "Auto-Apply");
+                if ui.button("Apply").clicked() {
+                    apply_clicked = true;
+                }
+                if (self.pending_source.is_some() || self.pending_filter.is_some())
+                    && ui.small_button("Discard").clicked()
+                {
+                    discard_clicked = true;
+                }
+            });
         });
-        ui.separator();
+        if discard_clicked {
+            self.pending_source = None;
+            self.pending_filter = None;
+        }
 
         if let Some(orig_src) = src_cfg {
             let mut working = match &self.pending_source {
                 Some((id, cfg)) if *id == sel_id => cfg.clone(),
                 _ => orig_src,
             };
-            let changed = edit_source_config(ui, &mut working);
+            let mut changed = false;
+            section_card(ui, self.theme, "Source Parameters", |ui| {
+                changed = edit_source_config(ui, &mut working);
+            });
             if changed {
                 if self.auto_apply {
                     if let Err(e) = self.session.update_source_cfg(sel_id, working) {
@@ -1093,25 +1668,31 @@ impl ParaVizApp {
                     } else {
                         self.pending_source = None;
                         self.error_message = None;
+                        self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
                     }
                 } else {
                     self.pending_source = Some((sel_id, working));
                 }
             } else if apply_clicked
                 && let Some((id, pending)) = self.pending_source.take()
-                    && id == sel_id {
-                        if let Err(e) = self.session.update_source_cfg(sel_id, pending) {
-                            self.error_message = Some(format!("Update source error: {e}"));
-                        } else {
-                            self.error_message = None;
-                        }
-                    }
+                && id == sel_id
+            {
+                if let Err(e) = self.session.update_source_cfg(sel_id, pending) {
+                    self.error_message = Some(format!("Update source error: {e}"));
+                } else {
+                    self.error_message = None;
+                    self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
+                }
+            }
         } else if let Some(orig_flt) = flt_cfg {
             let mut working = match &self.pending_filter {
                 Some((id, cfg)) if *id == sel_id => cfg.clone(),
                 _ => orig_flt,
             };
-            let changed = edit_filter_config(ui, &mut working);
+            let mut changed = false;
+            section_card(ui, self.theme, "Filter Parameters", |ui| {
+                changed = edit_filter_config(ui, &mut working, parent_ds.as_deref());
+            });
             if changed {
                 if self.auto_apply {
                     if let Err(e) = self.session.update_filter_cfg(sel_id, working) {
@@ -1119,27 +1700,37 @@ impl ParaVizApp {
                     } else {
                         self.pending_filter = None;
                         self.error_message = None;
+                        self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
                     }
                 } else {
                     self.pending_filter = Some((sel_id, working));
                 }
             } else if apply_clicked
                 && let Some((id, pending)) = self.pending_filter.take()
-                    && id == sel_id {
-                        if let Err(e) = self.session.update_filter_cfg(sel_id, pending) {
-                            self.error_message = Some(format!("Update filter error: {e}"));
-                        } else {
-                            self.error_message = None;
-                        }
-                    }
+                && id == sel_id
+            {
+                if let Err(e) = self.session.update_filter_cfg(sel_id, pending) {
+                    self.error_message = Some(format!("Update filter error: {e}"));
+                } else {
+                    self.error_message = None;
+                    self.info_stats_cache.retain(|(nid, _, _), _| *nid != sel_id);
+                }
+            }
         } else {
-            ui.weak("Custom in-memory node (no editable config).");
+            section_card(ui, self.theme, "In-Memory Dataset", |ui| {
+                ui.label(
+                    egui::RichText::new("Computed/merged node (no editable filter parameters).")
+                        .color(pal.muted),
+                );
+            });
         }
     }
 
     fn draw_display_tab(&mut self, ui: &mut egui::Ui) {
         let Some(sel_id) = self.selected_node else {
-            ui.weak("Select a node to configure display styling.");
+            section_card(ui, self.theme, "Display", |ui| {
+                ui.weak("Select a node to configure display styling.");
+            });
             return;
         };
 
@@ -1151,312 +1742,551 @@ impl ParaVizApp {
         let ds_opt = node.cached_dataset.clone();
         let style = &mut node.style;
 
-        ui.checkbox(&mut style.visible, "Visible");
-
-        // Representation
-        egui::ComboBox::from_label("Representation")
-            .selected_text(format!("{:?}", style.representation))
-            .show_ui(ui, |ui| {
-                for r in [
-                    Representation::Surface,
-                    Representation::SurfaceWithEdges,
-                    Representation::Wireframe,
-                    Representation::Points,
-                    Representation::Volume,
-                    Representation::Outline,
-                ] {
-                    ui.selectable_value(&mut style.representation, r, format!("{r:?}"));
-                }
-            });
-
-        // Color By
-        let mut color_label = match &style.color_by {
-            ColorBy::Solid(_) => "Solid Color".to_string(),
-            ColorBy::PointScalar { array, .. } => format!("Point: {array}"),
-            ColorBy::CellScalar { array, .. } => format!("Cell: {array}"),
-        };
-        let mut chosen_array_range: Option<(f64, f64)> = None;
-        let mut chosen_components: usize = 1;
-
-        if let Some(ds) = &ds_opt {
-            match &style.color_by {
-                ColorBy::PointScalar { array, component } => {
-                    if let Some(a) = ds.point_data().and_then(|p| p.get(array)) {
-                        chosen_array_range = Some(a.range(*component));
-                        chosen_components = a.num_components;
+        section_card(ui, self.theme, "Representation & Coloring", |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut style.visible, "Visible");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Reset Style").clicked() {
+                        let vis = style.visible;
+                        *style = ActorStyle {
+                            visible: vis,
+                            ..Default::default()
+                        };
                     }
-                }
-                ColorBy::CellScalar { array, component } => {
-                    if let Some(a) = ds.cell_data().and_then(|c| c.get(array)) {
-                        chosen_array_range = Some(a.range(*component));
-                        chosen_components = a.num_components;
-                    }
-                }
-                ColorBy::Solid(_) => {}
-            }
-        }
-
-        egui::ComboBox::from_label("Color By")
-            .selected_text(&color_label)
-            .show_ui(ui, |ui| {
-                let is_solid = matches!(style.color_by, ColorBy::Solid(_));
-                if ui.selectable_label(is_solid, "Solid Color").clicked() {
-                    style.color_by = ColorBy::Solid([0.82, 0.84, 0.88, 1.0]);
-                    color_label = "Solid Color".into();
-                }
-                if let Some(ds) = &ds_opt {
-                    if let Some(pd) = ds.point_data() {
-                        for arr in pd.arrays() {
-                            let active = matches!(
-                                &style.color_by,
-                                ColorBy::PointScalar { array, .. } if array == &arr.name
-                            );
-                            if ui
-                                .selectable_label(active, format!("Point: {}", arr.name))
-                                .clicked()
-                            {
-                                let rng = arr.range(None);
-                                style.color_by = ColorBy::PointScalar {
-                                    array: arr.name.clone(),
-                                    component: None,
-                                };
-                                if style.auto_range {
-                                    style.scalar_range = rng;
-                                    style.volume_tf.scalar_range = rng;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(cd) = ds.cell_data() {
-                        for arr in cd.arrays() {
-                            let active = matches!(
-                                &style.color_by,
-                                ColorBy::CellScalar { array, .. } if array == &arr.name
-                            );
-                            if ui
-                                .selectable_label(active, format!("Cell: {}", arr.name))
-                                .clicked()
-                            {
-                                let rng = arr.range(None);
-                                style.color_by = ColorBy::CellScalar {
-                                    array: arr.name.clone(),
-                                    component: None,
-                                };
-                                if style.auto_range {
-                                    style.scalar_range = rng;
-                                    style.volume_tf.scalar_range = rng;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
-        match &mut style.color_by {
-            ColorBy::Solid(rgba) => {
-                ui.horizontal(|ui| {
-                    ui.label("Solid RGBA:");
-                    ui.color_edit_button_rgba_unmultiplied(rgba);
                 });
-            }
-            ColorBy::PointScalar { component, .. } | ColorBy::CellScalar { component, .. } => {
-                if chosen_components > 1 {
-                    let comp_text = match *component {
-                        None => "Magnitude".to_string(),
-                        Some(c) => format!("Component {c}"),
-                    };
-                    egui::ComboBox::from_label("Component")
-                        .selected_text(comp_text)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(component, None, "Magnitude");
-                            for c in 0..chosen_components {
-                                let label = match c {
-                                    0 => "X (0)".to_string(),
-                                    1 => "Y (1)".to_string(),
-                                    2 => "Z (2)".to_string(),
-                                    _ => format!("Comp {c}"),
-                                };
-                                ui.selectable_value(component, Some(c), label);
-                            }
-                        });
+            });
+
+            egui::ComboBox::from_label("Representation")
+                .selected_text(format!("{:?}", style.representation))
+                .show_ui(ui, |ui| {
+                    for r in [
+                        Representation::Surface,
+                        Representation::SurfaceWithEdges,
+                        Representation::Wireframe,
+                        Representation::Points,
+                        Representation::Volume,
+                        Representation::Outline,
+                    ] {
+                        ui.selectable_value(&mut style.representation, r, format!("{r:?}"));
+                    }
+                });
+
+            let mut color_label = match &style.color_by {
+                ColorBy::Solid(_) => "Solid Color".to_string(),
+                ColorBy::PointScalar { array, .. } => format!("Point: {array}"),
+                ColorBy::CellScalar { array, .. } => format!("Cell: {array}"),
+            };
+            let mut chosen_array_range: Option<(f64, f64)> = None;
+            let mut chosen_components: usize = 1;
+
+            if let Some(ds) = &ds_opt {
+                match &style.color_by {
+                    ColorBy::PointScalar { array, component } => {
+                        if let Some(a) = ds.point_data().and_then(|p| p.get(array)) {
+                            chosen_array_range = Some(a.range(*component));
+                            chosen_components = a.num_components;
+                        }
+                    }
+                    ColorBy::CellScalar { array, component } => {
+                        if let Some(a) = ds.cell_data().and_then(|c| c.get(array)) {
+                            chosen_array_range = Some(a.range(*component));
+                            chosen_components = a.num_components;
+                        }
+                    }
+                    ColorBy::Solid(_) => {}
                 }
             }
-        }
 
-        ui.separator();
-        ui.label("Colormap");
-        egui::ComboBox::from_id_salt("colormap_preset_combo")
-            .selected_text(&style.colormap.name)
-            .show_ui(ui, |ui| {
-                for &preset in ColorMapPreset::ALL {
-                    let selected = style.colormap.name == preset.name();
-                    if ui.selectable_label(selected, preset.name()).clicked() {
-                        let log = style.colormap.log_scale;
-                        let mut cm = ColorMap::from_preset(preset);
-                        cm.log_scale = log;
-                        style.colormap = cm.clone();
-                        style.volume_tf.color_map = cm;
+            egui::ComboBox::from_label("Color By")
+                .selected_text(&color_label)
+                .show_ui(ui, |ui| {
+                    let is_solid = matches!(style.color_by, ColorBy::Solid(_));
+                    if ui.selectable_label(is_solid, "Solid Color").clicked() {
+                        style.color_by = ColorBy::Solid([0.82, 0.84, 0.88, 1.0]);
+                        color_label = "Solid Color".into();
                     }
+                    if let Some(ds) = &ds_opt {
+                        if let Some(pd) = ds.point_data() {
+                            for arr in pd.arrays() {
+                                let active = matches!(
+                                    &style.color_by,
+                                    ColorBy::PointScalar { array, .. } if array == &arr.name
+                                );
+                                if ui
+                                    .selectable_label(active, format!("Point: {}", arr.name))
+                                    .clicked()
+                                {
+                                    let rng = arr.range(None);
+                                    style.color_by = ColorBy::PointScalar {
+                                        array: arr.name.clone(),
+                                        component: None,
+                                    };
+                                    if style.auto_range {
+                                        style.scalar_range = rng;
+                                        style.volume_tf.scalar_range = rng;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(cd) = ds.cell_data() {
+                            for arr in cd.arrays() {
+                                let active = matches!(
+                                    &style.color_by,
+                                    ColorBy::CellScalar { array, .. } if array == &arr.name
+                                );
+                                if ui
+                                    .selectable_label(active, format!("Cell: {}", arr.name))
+                                    .clicked()
+                                {
+                                    let rng = arr.range(None);
+                                    style.color_by = ColorBy::CellScalar {
+                                        array: arr.name.clone(),
+                                        component: None,
+                                    };
+                                    if style.auto_range {
+                                        style.scalar_range = rng;
+                                        style.volume_tf.scalar_range = rng;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+            match &mut style.color_by {
+                ColorBy::Solid(rgba) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Solid RGBA:");
+                        ui.color_edit_button_rgba_unmultiplied(rgba);
+                    });
+                }
+                ColorBy::PointScalar { component, .. } | ColorBy::CellScalar { component, .. } => {
+                    if chosen_components > 1 {
+                        let comp_text = match *component {
+                            None => "Magnitude".to_string(),
+                            Some(c) => format!("Component {c}"),
+                        };
+                        egui::ComboBox::from_label("Component")
+                            .selected_text(comp_text)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(component, None, "Magnitude");
+                                for c in 0..chosen_components {
+                                    let label = match c {
+                                        0 => "X (0)".to_string(),
+                                        1 => "Y (1)".to_string(),
+                                        2 => "Z (2)".to_string(),
+                                        _ => format!("Comp {c}"),
+                                    };
+                                    ui.selectable_value(component, Some(c), label);
+                                }
+                            });
+                    }
+                }
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("colormap_preset_combo")
+                    .selected_text(&style.colormap.name)
+                    .show_ui(ui, |ui| {
+                        for &preset in ColorMapPreset::ALL {
+                            let selected = style.colormap.name == preset.name();
+                            if ui.selectable_label(selected, preset.name()).clicked() {
+                                let log = style.colormap.log_scale;
+                                let mut cm = ColorMap::from_preset(preset);
+                                cm.log_scale = log;
+                                style.colormap = cm.clone();
+                                style.volume_tf.color_map = cm;
+                            }
+                        }
+                    });
+                if ui
+                    .small_button("Invert")
+                    .on_hover_text("Invert colormap stop order")
+                    .clicked()
+                {
+                    for stop in &mut style.colormap.stops {
+                        stop.t = 1.0 - stop.t;
+                    }
+                    style
+                        .colormap
+                        .stops
+                        .sort_by(|a, b| a.t.total_cmp(&b.t));
+                    style.volume_tf.color_map = style.colormap.clone();
                 }
             });
 
-        // Live colormap gradient preview strip
-        paint_colormap_preview(ui, &style.colormap, 18.0);
+            paint_colormap_preview(ui, &style.colormap, 16.0);
 
-        if ui
-            .checkbox(&mut style.colormap.log_scale, "Log Scale")
-            .changed()
-        {
-            style.volume_tf.color_map.log_scale = style.colormap.log_scale;
-        }
+            if ui
+                .checkbox(&mut style.colormap.log_scale, "Log Scale")
+                .changed()
+            {
+                style.volume_tf.color_map.log_scale = style.colormap.log_scale;
+            }
 
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut style.auto_range, "Auto-Range");
-            if ui.button("Rescale to Data").clicked()
-                && let Some((mn, mx)) = chosen_array_range {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut style.auto_range, "Auto");
+                if ui.small_button("Fit Data").clicked()
+                    && let Some((mn, mx)) = chosen_array_range
+                {
                     style.scalar_range = (mn, mx);
                     style.volume_tf.scalar_range = (mn, mx);
                 }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Min:");
-            let mut mn = style.scalar_range.0;
-            if ui
-                .add(egui::DragValue::new(&mut mn).speed(0.1))
-                .changed()
-            {
-                style.auto_range = false;
-                style.scalar_range.0 = mn;
-                style.volume_tf.scalar_range.0 = mn;
-            }
-            ui.label("Max:");
-            let mut mx = style.scalar_range.1;
-            if ui
-                .add(egui::DragValue::new(&mut mx).speed(0.1))
-                .changed()
-            {
-                style.auto_range = false;
-                style.scalar_range.1 = mx;
-                style.volume_tf.scalar_range.1 = mx;
-            }
+                if ui
+                    .small_button("±Sym")
+                    .on_hover_text("Symmetric range around 0")
+                    .clicked()
+                {
+                    let (mn, mx) = chosen_array_range.unwrap_or(style.scalar_range);
+                    let m = mn.abs().max(mx.abs()).max(1e-6);
+                    style.auto_range = false;
+                    style.scalar_range = (-m, m);
+                    style.volume_tf.scalar_range = (-m, m);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Min:");
+                let mut mn = style.scalar_range.0;
+                if ui
+                    .add(egui::DragValue::new(&mut mn).speed(0.1))
+                    .changed()
+                {
+                    style.auto_range = false;
+                    style.scalar_range.0 = mn;
+                    style.volume_tf.scalar_range.0 = mn;
+                }
+                ui.label("Max:");
+                let mut mx = style.scalar_range.1;
+                if ui
+                    .add(egui::DragValue::new(&mut mx).speed(0.1))
+                    .changed()
+                {
+                    style.auto_range = false;
+                    style.scalar_range.1 = mx;
+                    style.volume_tf.scalar_range.1 = mx;
+                }
+            });
         });
 
-        ui.separator();
-        ui.add(egui::Slider::new(&mut style.opacity, 0.0..=1.0).text("Opacity"));
-        ui.add(egui::Slider::new(&mut style.point_size, 1.0..=24.0).text("Point Size"));
-        ui.add(egui::Slider::new(&mut style.line_width, 0.5..=10.0).text("Line Width"));
-        ui.add(egui::Slider::new(&mut style.edge_width, 0.25..=6.0).text("Edge Width"));
-        ui.horizontal(|ui| {
-            ui.label("Edge Color:");
-            ui.color_edit_button_rgba_unmultiplied(&mut style.edge_color);
+        section_card(ui, self.theme, "Material & Geometry Style", |ui| {
+            ui.add(egui::Slider::new(&mut style.opacity, 0.0..=1.0).text("Opacity"));
+            ui.add(egui::Slider::new(&mut style.ambient, 0.0..=1.0).text("Ambient"));
+            ui.add(egui::Slider::new(&mut style.specular, 0.0..=1.0).text("Specular"));
+            ui.add(egui::Slider::new(&mut style.shininess, 1.0..=128.0).text("Shininess"));
+            ui.checkbox(&mut style.two_sided, "Two-Sided Lighting");
+            ui.separator();
+            ui.add(egui::Slider::new(&mut style.point_size, 1.0..=24.0).text("Point Size"));
+            ui.add(egui::Slider::new(&mut style.line_width, 0.5..=10.0).text("Line Width"));
+            ui.add(egui::Slider::new(&mut style.edge_width, 0.25..=6.0).text("Edge Width"));
+            ui.horizontal(|ui| {
+                ui.label("Edge Color:");
+                ui.color_edit_button_rgba_unmultiplied(&mut style.edge_color);
+            });
         });
 
         if style.representation == Representation::Volume {
-            ui.separator();
-            ui.label("Volume Transfer Function");
-            ui.add(
-                egui::Slider::new(&mut style.volume_step_size, 0.05..=2.0).text("Step Size"),
-            );
-            ui.checkbox(&mut style.volume_shading, "Volume Shading");
-            let mut remove_idx: Option<usize> = None;
-            for (idx, pt) in style.volume_tf.opacity_points.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("#{idx}"));
-                    ui.add(
-                        egui::DragValue::new(&mut pt.t)
-                            .speed(0.01)
-                            .range(0.0..=1.0)
-                            .prefix("t="),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut pt.alpha)
-                            .speed(0.01)
-                            .range(0.0..=1.0)
-                            .prefix("a="),
-                    );
-                    if ui.small_button("✕").clicked() {
-                        remove_idx = Some(idx);
+            section_card(ui, self.theme, "Volume Transfer Function", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut style.volume_step_size, 0.05..=2.0).text("Step Size"),
+                );
+                ui.checkbox(&mut style.volume_shading, "Gradient Shading");
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Presets:");
+                    if ui.small_button("Linear").clicked() {
+                        style.volume_tf.opacity_points = vec![
+                            OpacityPoint { t: 0.0, alpha: 0.0 },
+                            OpacityPoint { t: 1.0, alpha: 0.85 },
+                        ];
+                    }
+                    if ui.small_button("Soft").clicked() {
+                        style.volume_tf.opacity_points = vec![
+                            OpacityPoint { t: 0.0, alpha: 0.0 },
+                            OpacityPoint { t: 0.25, alpha: 0.02 },
+                            OpacityPoint { t: 0.55, alpha: 0.35 },
+                            OpacityPoint { t: 0.85, alpha: 0.85 },
+                            OpacityPoint { t: 1.0, alpha: 0.98 },
+                        ];
+                    }
+                    if ui.small_button("Iso-Shell").clicked() {
+                        style.volume_tf.opacity_points = vec![
+                            OpacityPoint { t: 0.0, alpha: 0.0 },
+                            OpacityPoint { t: 0.42, alpha: 0.0 },
+                            OpacityPoint { t: 0.50, alpha: 0.85 },
+                            OpacityPoint { t: 0.58, alpha: 0.0 },
+                            OpacityPoint { t: 1.0, alpha: 0.0 },
+                        ];
+                    }
+                    if ui.small_button("Peak").clicked() {
+                        style.volume_tf.opacity_points = vec![
+                            OpacityPoint { t: 0.0, alpha: 0.0 },
+                            OpacityPoint { t: 0.70, alpha: 0.0 },
+                            OpacityPoint { t: 1.0, alpha: 0.98 },
+                        ];
                     }
                 });
-            }
-            if let Some(idx) = remove_idx
-                && style.volume_tf.opacity_points.len() > 2 {
+
+                let mut remove_idx: Option<usize> = None;
+                for (idx, pt) in style.volume_tf.opacity_points.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{idx}"));
+                        ui.add(
+                            egui::DragValue::new(&mut pt.t)
+                                .speed(0.01)
+                                .range(0.0..=1.0)
+                                .prefix("t="),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut pt.alpha)
+                                .speed(0.01)
+                                .range(0.0..=1.0)
+                                .prefix("a="),
+                        );
+                        if ui.small_button("×").clicked() {
+                            remove_idx = Some(idx);
+                        }
+                    });
+                }
+                if let Some(idx) = remove_idx
+                    && style.volume_tf.opacity_points.len() > 2
+                {
                     style.volume_tf.opacity_points.remove(idx);
                 }
-            if ui.button("+ Add Opacity Point").clicked() {
-                style
-                    .volume_tf
-                    .opacity_points
-                    .push(OpacityPoint { t: 0.5, alpha: 0.35 });
-                style
-                    .volume_tf
-                    .opacity_points
-                    .sort_by(|a, b| a.t.total_cmp(&b.t));
-            }
+                if ui.button("+ Add Opacity Point").clicked() {
+                    style
+                        .volume_tf
+                        .opacity_points
+                        .push(OpacityPoint { t: 0.5, alpha: 0.35 });
+                    style
+                        .volume_tf
+                        .opacity_points
+                        .sort_by(|a, b| a.t.total_cmp(&b.t));
+                }
+            });
         }
     }
 
     fn draw_information_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(self.theme);
         let Some(sel_id) = self.selected_node else {
-            ui.weak("Select a node to inspect dataset metadata.");
+            section_card(ui, self.theme, "Information", |ui| {
+                ui.weak("Select a node to inspect dataset metadata.");
+            });
             return;
         };
         let _ = self.session.evaluate(sel_id);
-        let Ok(node) = self.session.node(sel_id) else {
+        let Ok(node) = self.session.node(sel_id).cloned() else {
             return;
         };
-        let Some(ds) = node.dataset() else {
-            ui.weak("Dataset not evaluated yet.");
+        let Some(ds) = node.dataset().cloned() else {
+            section_card(ui, self.theme, "Information", |ui| {
+                ui.weak("Dataset not evaluated yet.");
+            });
             return;
         };
 
-        ui.label(format!("Name: {}", node.name));
-        ui.label(format!("Type: {}", ds.type_name()));
-        ui.label(format!("Points: {}", ds.num_points()));
-        ui.label(format!("Cells: {}", ds.num_cells()));
-        ui.label(format!(
-            "Memory: {}",
-            format_memory_bytes(ds.memory_bytes())
-        ));
+        section_card(ui, self.theme, "Dataset Summary", |ui| {
+            egui::Grid::new("info_summary_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Name").color(pal.muted));
+                    ui.strong(&node.name);
+                    ui.end_row();
+                    ui.label(egui::RichText::new("Type").color(pal.muted));
+                    ui.label(ds.type_name());
+                    ui.end_row();
+                    ui.label(egui::RichText::new("Points").color(pal.muted));
+                    ui.monospace(format!("{}", ds.num_points()));
+                    ui.end_row();
+                    ui.label(egui::RichText::new("Cells").color(pal.muted));
+                    ui.monospace(format!("{}", ds.num_cells()));
+                    ui.end_row();
+                    ui.label(egui::RichText::new("Memory").color(pal.muted));
+                    ui.monospace(format_memory_bytes(ds.memory_bytes()));
+                    ui.end_row();
+                });
+        });
+
         let bb = ds.bounds();
         if bb.is_valid() {
-            ui.separator();
-            ui.label("Bounds:");
-            ui.monospace(format!("X: [{:.4}, {:.4}]", bb.min.x, bb.max.x));
-            ui.monospace(format!("Y: [{:.4}, {:.4}]", bb.min.y, bb.max.y));
-            ui.monospace(format!("Z: [{:.4}, {:.4}]", bb.min.z, bb.max.z));
+            let ext = bb.max - bb.min;
+            section_card(ui, self.theme, "Spatial Bounds", |ui| {
+                ui.monospace(format!("X: [{:.4}, {:.4}]  (Δ {:.4})", bb.min.x, bb.max.x, ext.x));
+                ui.monospace(format!("Y: [{:.4}, {:.4}]  (Δ {:.4})", bb.min.y, bb.max.y, ext.y));
+                ui.monospace(format!("Z: [{:.4}, {:.4}]  (Δ {:.4})", bb.min.z, bb.max.z, ext.z));
+                ui.monospace(format!("Diagonal: {:.4}", bb.diagonal()));
+            });
         }
 
-        if let Some(pd) = ds.point_data() {
-            ui.separator();
-            ui.strong(format!("Point Arrays ({})", pd.len()));
-            for arr in pd.arrays() {
-                let (mn, mx) = arr.range(None);
-                ui.monospace(format!(
-                    "{} ({}, {}c) [{:.4}, {:.4}]",
-                    arr.name,
-                    arr.data.scalar_type().vtk_name(),
-                    arr.num_components,
-                    mn,
-                    mx
-                ));
+        if let Some(pd) = ds.as_poly_data() {
+            let area = polydata_surface_area(pd);
+            section_card(ui, self.theme, "Mesh Topology & Area", |ui| {
+                egui::Grid::new("poly_topo_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Surface Area").color(pal.muted));
+                        ui.monospace(format!("{area:.5}"));
+                        ui.end_row();
+                        ui.label(egui::RichText::new("Polygons / Strips").color(pal.muted));
+                        ui.monospace(format!("{} / {}", pd.polys.len(), pd.strips.len()));
+                        ui.end_row();
+                        ui.label(egui::RichText::new("Lines / Verts").color(pal.muted));
+                        ui.monospace(format!("{} / {}", pd.lines.len(), pd.verts.len()));
+                        ui.end_row();
+                    });
+            });
+        }
+
+        for (title, assoc, fd_opt) in [
+            ("Point Arrays", AttributeAssociation::Point, ds.point_data()),
+            ("Cell Arrays", AttributeAssociation::Cell, ds.cell_data()),
+        ] {
+            if let Some(fd) = fd_opt
+                && !fd.is_empty()
+            {
+                section_card(ui, self.theme, &format!("{title} ({})", fd.len()), |ui| {
+                    for arr in fd.arrays() {
+                        let (mn, mx) = arr.range(None);
+                        ui.horizontal(|ui| {
+                            ui.strong(&arr.name);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "({}, {}c)",
+                                    arr.data.scalar_type().vtk_name(),
+                                    arr.num_components
+                                ))
+                                .size(11.0)
+                                .color(pal.muted),
+                            );
+                        });
+                        ui.monospace(format!("  Range: [{mn:.4}, {mx:.4}]"));
+                        let key = (sel_id, arr.name.clone(), assoc);
+                        if let Some(stats) = self.info_stats_cache.get(&key) {
+                            ui.monospace(format!(
+                                "  Mean: {:.4} | StdDev: {:.4}",
+                                stats.mean, stats.std_dev
+                            ));
+                        } else if ui.small_button("Compute Mean / StdDev").clicked()
+                            && let Ok(res) = compute_histogram(&ds, &arr.name, assoc, None, 16)
+                        {
+                            self.info_stats_cache.insert(key, res);
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
             }
         }
-        if let Some(cd) = ds.cell_data() {
-            ui.separator();
-            ui.strong(format!("Cell Arrays ({})", cd.len()));
-            for arr in cd.arrays() {
-                let (mn, mx) = arr.range(None);
-                ui.monospace(format!(
-                    "{} ({}, {}c) [{:.4}, {:.4}]",
-                    arr.name,
-                    arr.data.scalar_type().vtk_name(),
-                    arr.num_components,
-                    mn,
-                    mx
-                ));
+    }
+
+    fn draw_scene_tab(&mut self, ui: &mut egui::Ui) {
+        section_card(ui, self.theme, "Viewport Background", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for &preset in ViewportBgPreset::ALL {
+                    let (top, bot) = preset.colors();
+                    let active = (self.session.settings.bg_top[0] - top[0]).abs() < 0.01
+                        && (self.session.settings.bg_bottom[0] - bot[0]).abs() < 0.01;
+                    if ui.selectable_label(active, preset.name()).clicked() {
+                        self.session.settings.bg_top = top;
+                        self.session.settings.bg_bottom = bot;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Top:");
+                ui.color_edit_button_rgb(&mut self.session.settings.bg_top);
+                ui.label("Bottom:");
+                ui.color_edit_button_rgb(&mut self.session.settings.bg_bottom);
+            });
+        });
+
+        section_card(ui, self.theme, "Camera & Navigation", |ui| {
+            ui.checkbox(&mut self.session.camera.orthographic, "Orthographic Projection");
+            if !self.session.camera.orthographic {
+                ui.add(
+                    egui::Slider::new(&mut self.session.camera.fov_y_deg, 15.0..=110.0)
+                        .text("FOV (deg)"),
+                );
+            } else {
+                ui.add(
+                    egui::DragValue::new(&mut self.session.camera.ortho_scale)
+                        .speed(0.05)
+                        .range(0.01..=1000.0)
+                        .prefix("Ortho Scale: "),
+                );
             }
-        }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.turntable_enabled, "Turntable");
+                ui.add_enabled(
+                    self.turntable_enabled,
+                    egui::Slider::new(&mut self.turntable_speed, 0.05..=2.5).text("Speed"),
+                );
+            });
+            ui.label("Position:");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.session.camera.position.x).speed(0.1).prefix("X:"));
+                ui.add(egui::DragValue::new(&mut self.session.camera.position.y).speed(0.1).prefix("Y:"));
+                ui.add(egui::DragValue::new(&mut self.session.camera.position.z).speed(0.1).prefix("Z:"));
+            });
+            ui.label("Target:");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.session.camera.target.x).speed(0.1).prefix("X:"));
+                ui.add(egui::DragValue::new(&mut self.session.camera.target.y).speed(0.1).prefix("Y:"));
+                ui.add(egui::DragValue::new(&mut self.session.camera.target.z).speed(0.1).prefix("Z:"));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Reset Camera (R)").clicked() {
+                    let _ = self.session.reset_camera();
+                }
+                if ui.button("Focus Selected (F)").clicked() {
+                    self.focus_selected_node();
+                }
+                if ui.button("Bookmark View").clicked() {
+                    let idx = self.camera_bookmarks.len() + 1;
+                    self.camera_bookmarks.push(CameraBookmark {
+                        name: format!("View {idx}"),
+                        camera: self.session.camera.clone(),
+                    });
+                }
+            });
+            if !self.camera_bookmarks.is_empty() {
+                ui.add_space(3.0);
+                let mut remove_bm: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (idx, bm) in self.camera_bookmarks.iter().enumerate() {
+                        if ui.small_button(&bm.name).clicked() {
+                            self.session.camera = bm.camera.clone();
+                        }
+                        if ui.small_button("×").on_hover_text("Delete bookmark").clicked() {
+                            remove_bm = Some(idx);
+                        }
+                    }
+                });
+                if let Some(idx) = remove_bm {
+                    self.camera_bookmarks.remove(idx);
+                }
+            }
+        });
+
+        section_card(ui, self.theme, "Render Quality & Overlays", |ui| {
+            let mut msaa_4x = self.session.settings.msaa_samples >= 4;
+            if ui.checkbox(&mut msaa_4x, "4x MSAA Anti-Aliasing").changed() {
+                self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+            }
+            ui.checkbox(&mut self.session.settings.edl_enabled, "Eye-Dome Lighting (EDL)");
+            if self.session.settings.edl_enabled {
+                ui.add(
+                    egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
+                        .text("EDL Strength"),
+                );
+            }
+            ui.checkbox(&mut self.session.settings.show_axes_gizmo, "3D Axes Gizmo");
+            ui.checkbox(&mut self.session.settings.show_bounding_box, "Scene Bounding Box");
+            ui.checkbox(&mut self.show_widgets, "3D Filter Widgets");
+            ui.checkbox(&mut self.show_scalar_bar, "Scalar Color Bar");
+        });
     }
 
     fn draw_drawer(&mut self, ui: &mut egui::Ui) {
@@ -1476,6 +2306,11 @@ impl ParaVizApp {
                     SpreadsheetTarget::Cells,
                     "Cell Data",
                 );
+                ui.selectable_value(
+                    &mut self.spreadsheet_target,
+                    SpreadsheetTarget::Field,
+                    "Field Data",
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Close").clicked() {
@@ -1487,7 +2322,29 @@ impl ParaVizApp {
 
         match self.drawer_tab {
             DrawerTab::Spreadsheet => self.draw_spreadsheet(ui),
-            DrawerTab::Chart => self.draw_chart_tab(ui),
+            DrawerTab::Chart => {
+                let Some(sel_id) = self.selected_node else {
+                    ui.weak("Select a node to view XY plots or scalar histograms.");
+                    return;
+                };
+                let _ = self.session.evaluate(sel_id);
+                let Ok(node) = self.session.node(sel_id) else {
+                    return;
+                };
+                let Some(ds) = node.dataset().cloned() else {
+                    ui.weak("Dataset not evaluated.");
+                    return;
+                };
+                if let Some(res) = draw_chart_tab(ui, &ds, &mut self.chart_state, self.theme) {
+                    match res {
+                        Ok(msg) => {
+                            self.error_message = None;
+                            self.status_message = msg;
+                        }
+                        Err(err) => self.error_message = Some(err),
+                    }
+                }
+            }
             DrawerTab::RustTrace => {
                 let mut trace = self.session.to_rust_trace();
                 ui.horizontal(|ui| {
@@ -1495,6 +2352,18 @@ impl ParaVizApp {
                         ui.ctx().copy_text(trace.clone());
                         self.status_message = "Copied Rust trace to clipboard".into();
                     }
+                    if ui.button("Save trace.rs").clicked() {
+                        match std::fs::write("paraviz_trace.rs", &trace) {
+                            Ok(()) => {
+                                self.error_message = None;
+                                self.status_message = "Saved Rust trace -> paraviz_trace.rs".into();
+                            }
+                            Err(e) => {
+                                self.error_message = Some(format!("Failed to write trace: {e}"));
+                            }
+                        }
+                    }
+                    ui.weak(format!("{} lines", trace.lines().count()));
                 });
                 egui::ScrollArea::vertical()
                     .id_salt("rust_trace_scroll")
@@ -1509,195 +2378,6 @@ impl ParaVizApp {
         }
     }
 
-    fn draw_chart_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(sel_id) = self.selected_node else {
-            ui.weak("Select a node to view XY plots or scalar histograms.");
-            return;
-        };
-        let _ = self.session.evaluate(sel_id);
-        let Ok(node) = self.session.node(sel_id) else {
-            return;
-        };
-        let Some(ds) = node.dataset().cloned() else {
-            ui.weak("Dataset not evaluated.");
-            return;
-        };
-
-        let has_arc_length = ds
-            .as_poly_data()
-            .and_then(|pd| pd.point_data.get("ArcLength"))
-            .is_some();
-
-        if !has_arc_length && self.chart_mode == ChartMode::XYPlot {
-            self.chart_mode = ChartMode::Histogram;
-        }
-
-        ui.horizontal(|ui| {
-            if has_arc_length {
-                ui.selectable_value(
-                    &mut self.chart_mode,
-                    ChartMode::XYPlot,
-                    "XY Plot (ArcLength)",
-                );
-                ui.selectable_value(
-                    &mut self.chart_mode,
-                    ChartMode::Histogram,
-                    "Scalar Histogram",
-                );
-                ui.separator();
-            }
-
-            if self.chart_mode == ChartMode::Histogram {
-                // Collect available point and cell arrays
-                let mut candidates: Vec<(AttributeAssociation, String, usize)> = Vec::new();
-                if let Some(pd) = ds.point_data() {
-                    for arr in pd.arrays() {
-                        candidates.push((
-                            AttributeAssociation::Point,
-                            arr.name.clone(),
-                            arr.num_components,
-                        ));
-                    }
-                }
-                if let Some(cd) = ds.cell_data() {
-                    for arr in cd.arrays() {
-                        candidates.push((
-                            AttributeAssociation::Cell,
-                            arr.name.clone(),
-                            arr.num_components,
-                        ));
-                    }
-                }
-
-                if candidates.is_empty() {
-                    ui.weak("Dataset has no point or cell scalar arrays.");
-                    return;
-                }
-
-                let current_valid = candidates.iter().any(|(a, n, _)| {
-                    *a == self.hist_association && *n == self.hist_array_name
-                });
-                if !current_valid {
-                    if let Some(active) = ds
-                        .point_data()
-                        .and_then(|p| p.active_scalars_array())
-                    {
-                        self.hist_association = AttributeAssociation::Point;
-                        self.hist_array_name = active.name.clone();
-                    } else if let Some(active) = ds
-                        .cell_data()
-                        .and_then(|c| c.active_scalars_array())
-                    {
-                        self.hist_association = AttributeAssociation::Cell;
-                        self.hist_array_name = active.name.clone();
-                    } else {
-                        self.hist_association = candidates[0].0;
-                        self.hist_array_name = candidates[0].1.clone();
-                    }
-                    self.hist_component = None;
-                }
-
-                let selected_comps = candidates
-                    .iter()
-                    .find(|(a, n, _)| {
-                        *a == self.hist_association && *n == self.hist_array_name
-                    })
-                    .map(|(_, _, c)| *c)
-                    .unwrap_or(1);
-
-                let sel_label = format!(
-                    "{}: {}",
-                    match self.hist_association {
-                        AttributeAssociation::Point => "Point",
-                        AttributeAssociation::Cell => "Cell",
-                        AttributeAssociation::Field => "Field",
-                    },
-                    self.hist_array_name
-                );
-                egui::ComboBox::from_id_salt("hist_array_combo")
-                    .selected_text(sel_label)
-                    .show_ui(ui, |ui| {
-                        for (assoc, name, _) in &candidates {
-                            let prefix = match assoc {
-                                AttributeAssociation::Point => "Point",
-                                AttributeAssociation::Cell => "Cell",
-                                AttributeAssociation::Field => "Field",
-                            };
-                            let active = *assoc == self.hist_association
-                                && *name == self.hist_array_name;
-                            if ui
-                                .selectable_label(active, format!("{prefix}: {name}"))
-                                .clicked()
-                            {
-                                self.hist_association = *assoc;
-                                self.hist_array_name = name.clone();
-                                self.hist_component = None;
-                            }
-                        }
-                    });
-
-                if selected_comps > 1 {
-                    let comp_text = match self.hist_component {
-                        None => "Magnitude".to_string(),
-                        Some(c) => format!("Comp {c}"),
-                    };
-                    egui::ComboBox::from_id_salt("hist_comp_combo")
-                        .selected_text(comp_text)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.hist_component, None, "Magnitude");
-                            for c in 0..selected_comps {
-                                ui.selectable_value(
-                                    &mut self.hist_component,
-                                    Some(c),
-                                    format!("Comp {c}"),
-                                );
-                            }
-                        });
-                }
-
-                ui.add(egui::Slider::new(&mut self.hist_bins, 4..=64).text("Bins"));
-            }
-        });
-
-        match self.chart_mode {
-            ChartMode::XYPlot if has_arc_length => {
-                if let Some(pd) = ds.as_poly_data() {
-                    paint_xy_arclength_plot(ui, pd);
-                }
-            }
-            _ => {
-                if self.hist_array_name.is_empty() {
-                    ui.weak("No scalar array selected for histogram.");
-                    return;
-                }
-                match compute_histogram(
-                    &ds,
-                    &self.hist_array_name,
-                    self.hist_association,
-                    self.hist_component,
-                    self.hist_bins,
-                ) {
-                    Ok(hist) => {
-                        ui.horizontal(|ui| {
-                            let total: usize = hist.counts.iter().sum();
-                            ui.monospace(format!(
-                                "min={:.4}  max={:.4}  mean={:.4}  std_dev={:.4}  N={}",
-                                hist.min, hist.max, hist.mean, hist.std_dev, total
-                            ));
-                        });
-                        paint_histogram_chart(ui, &hist);
-                    }
-                    Err(e) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 130, 130),
-                            format!("Histogram unavailable: {e}"),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     fn draw_spreadsheet(&mut self, ui: &mut egui::Ui) {
         let Some(sel_id) = self.selected_node else {
             ui.weak("Select a node to inspect data values.");
@@ -1706,82 +2386,196 @@ impl ParaVizApp {
         let Ok(node) = self.session.node(sel_id) else {
             return;
         };
-        let Some(ds) = node.dataset() else {
+        let Some(ds) = node.dataset().cloned() else {
             ui.weak("Dataset not evaluated.");
             return;
         };
 
-        let pts = extract_dataset_points(ds);
-        let max_rows = 200usize;
+        let total_rows = match self.spreadsheet_target {
+            SpreadsheetTarget::Points => ds.num_points(),
+            SpreadsheetTarget::Cells => ds.num_cells(),
+            SpreadsheetTarget::Field => ds
+                .field_data()
+                .and_then(|f| f.arrays().first())
+                .map(|a| a.num_tuples())
+                .unwrap_or(0),
+        };
+        let page = self.spreadsheet_page_size.max(1);
+        let max_offset = total_rows.saturating_sub(1);
+        if self.spreadsheet_offset > max_offset {
+            self.spreadsheet_offset = 0;
+        }
+        let end_row = (self.spreadsheet_offset + page).min(total_rows);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "Rows {}..{} of {}",
+                if total_rows == 0 { 0 } else { self.spreadsheet_offset },
+                end_row,
+                total_rows
+            ));
+            if ui
+                .add_enabled(self.spreadsheet_offset > 0, egui::Button::new("|<").small())
+                .clicked()
+            {
+                self.spreadsheet_offset = 0;
+            }
+            if ui
+                .add_enabled(self.spreadsheet_offset > 0, egui::Button::new("Prev").small())
+                .clicked()
+            {
+                self.spreadsheet_offset = self.spreadsheet_offset.saturating_sub(page);
+            }
+            if ui
+                .add_enabled(end_row < total_rows, egui::Button::new("Next").small())
+                .clicked()
+            {
+                self.spreadsheet_offset = end_row;
+            }
+            egui::ComboBox::from_id_salt("spreadsheet_page_size")
+                .selected_text(format!("{page}/page"))
+                .show_ui(ui, |ui| {
+                    for sz in [100usize, 200, 500] {
+                        ui.selectable_value(&mut self.spreadsheet_page_size, sz, format!("{sz}/page"));
+                    }
+                });
+            ui.separator();
+            ui.label("Col Filter:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.spreadsheet_filter)
+                    .desired_width(120.0)
+                    .hint_text("array name..."),
+            );
+            if ui.small_button("Export CSV").clicked() {
+                match export_spreadsheet_csv(&ds, Path::new("spreadsheet_export.csv")) {
+                    Ok(msg) => {
+                        self.error_message = None;
+                        self.status_message = msg;
+                    }
+                    Err(err) => self.error_message = Some(err),
+                }
+            }
+        });
+        ui.separator();
+
+        let col_needle = self.spreadsheet_filter.trim().to_ascii_lowercase();
+        let matches_col = |name: &str| -> bool {
+            col_needle.is_empty() || name.to_ascii_lowercase().contains(&col_needle)
+        };
 
         egui::ScrollArea::both()
             .id_salt("spreadsheet_scroll")
-            .show(ui, |ui| {
-                match self.spreadsheet_target {
-                    SpreadsheetTarget::Points => {
-                        let arrays = ds.point_data().map(|p| p.arrays()).unwrap_or(&[]);
-                        let count = ds.num_points().min(max_rows);
-                        egui::Grid::new("spreadsheet_points_grid")
-                            .striped(true)
-                            .min_col_width(80.0)
-                            .show(ui, |ui| {
-                                ui.strong("Point ID");
-                                ui.strong("X");
-                                ui.strong("Y");
-                                ui.strong("Z");
-                                for arr in arrays {
-                                    ui.strong(&arr.name);
-                                }
-                                ui.end_row();
+            .show(ui, |ui| match self.spreadsheet_target {
+                SpreadsheetTarget::Points => {
+                    let arrays: Vec<&DataArray> = ds
+                        .point_data()
+                        .map(|p| {
+                            p.arrays()
+                                .iter()
+                                .filter(|a| matches_col(&a.name))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    egui::Grid::new("spreadsheet_points_grid")
+                        .striped(true)
+                        .min_col_width(80.0)
+                        .show(ui, |ui| {
+                            ui.strong("Point ID");
+                            ui.strong("X");
+                            ui.strong("Y");
+                            ui.strong("Z");
+                            for arr in &arrays {
+                                ui.strong(&arr.name);
+                            }
+                            ui.end_row();
 
-                                for row in 0..count {
-                                    ui.monospace(format!("{row}"));
-                                    if let Some(p) = pts.get(row) {
-                                        ui.monospace(format!("{:.4}", p[0]));
-                                        ui.monospace(format!("{:.4}", p[1]));
-                                        ui.monospace(format!("{:.4}", p[2]));
-                                    } else {
-                                        ui.monospace("-");
-                                        ui.monospace("-");
-                                        ui.monospace("-");
-                                    }
-                                    for arr in arrays {
-                                        ui.monospace(format_tuple(arr, row));
-                                    }
-                                    ui.end_row();
+                            for row in self.spreadsheet_offset..end_row {
+                                ui.monospace(format!("{row}"));
+                                if let Some(p) = dataset_point_at(&ds, row) {
+                                    ui.monospace(format!("{:.4}", p[0]));
+                                    ui.monospace(format!("{:.4}", p[1]));
+                                    ui.monospace(format!("{:.4}", p[2]));
+                                } else {
+                                    ui.monospace("-");
+                                    ui.monospace("-");
+                                    ui.monospace("-");
                                 }
-                            });
-                    }
-                    SpreadsheetTarget::Cells => {
-                        let arrays = ds.cell_data().map(|c| c.arrays()).unwrap_or(&[]);
-                        let count = ds.num_cells().min(max_rows);
-                        if arrays.is_empty() {
-                            ui.weak("Selected dataset has no CellData arrays.");
-                            return;
-                        }
-                        egui::Grid::new("spreadsheet_cells_grid")
-                            .striped(true)
-                            .min_col_width(80.0)
-                            .show(ui, |ui| {
-                                ui.strong("Cell ID");
-                                for arr in arrays {
-                                    ui.strong(&arr.name);
+                                for arr in &arrays {
+                                    ui.monospace(format_tuple(arr, row));
                                 }
                                 ui.end_row();
-                                for row in 0..count {
-                                    ui.monospace(format!("{row}"));
-                                    for arr in arrays {
-                                        ui.monospace(format_tuple(arr, row));
-                                    }
-                                    ui.end_row();
-                                }
-                            });
+                            }
+                        });
+                }
+                SpreadsheetTarget::Cells => {
+                    let arrays: Vec<&DataArray> = ds
+                        .cell_data()
+                        .map(|c| {
+                            c.arrays()
+                                .iter()
+                                .filter(|a| matches_col(&a.name))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if arrays.is_empty() {
+                        ui.weak("Selected dataset has no matching CellData arrays.");
+                        return;
                     }
+                    egui::Grid::new("spreadsheet_cells_grid")
+                        .striped(true)
+                        .min_col_width(80.0)
+                        .show(ui, |ui| {
+                            ui.strong("Cell ID");
+                            for arr in &arrays {
+                                ui.strong(&arr.name);
+                            }
+                            ui.end_row();
+                            for row in self.spreadsheet_offset..end_row {
+                                ui.monospace(format!("{row}"));
+                                for arr in &arrays {
+                                    ui.monospace(format_tuple(arr, row));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                }
+                SpreadsheetTarget::Field => {
+                    let arrays: Vec<&DataArray> = ds
+                        .field_data()
+                        .map(|f| {
+                            f.arrays()
+                                .iter()
+                                .filter(|a| matches_col(&a.name))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if arrays.is_empty() {
+                        ui.weak("Selected dataset has no FieldData arrays.");
+                        return;
+                    }
+                    egui::Grid::new("spreadsheet_field_grid")
+                        .striped(true)
+                        .min_col_width(80.0)
+                        .show(ui, |ui| {
+                            ui.strong("Tuple");
+                            for arr in &arrays {
+                                ui.strong(&arr.name);
+                            }
+                            ui.end_row();
+                            for row in self.spreadsheet_offset..end_row {
+                                ui.monospace(format!("{row}"));
+                                for arr in &arrays {
+                                    ui.monospace(format_tuple(arr, row));
+                                }
+                                ui.end_row();
+                            }
+                        });
                 }
             });
     }
 
     fn draw_viewport(&mut self, ui: &mut egui::Ui) {
+        let pal = palette(self.theme);
         let avail = ui.available_size();
         let ppp = ui.ctx().pixels_per_point();
         let w = (avail.x * ppp).round().max(1.0) as u32;
@@ -1907,14 +2701,62 @@ impl ParaVizApp {
             });
         }
 
-        // HUD Overlay (top-left of viewport)
+        let painter = ui.painter_at(rect);
+
+        // Screen-space 3D projected Pick reticle & Ruler endpoint pins
+        let aspect = rect.width().max(1.0) / rect.height().max(1.0);
+        let vp = self.session.camera.view_proj_matrix(aspect);
+        if let Some(pick) = &self.last_pick
+            && let Some(sp) = project_world_to_screen(vp, rect, pick.world_pos)
+        {
+            painter.circle_stroke(sp, 8.0, egui::Stroke::new(1.8, pal.accent));
+            painter.circle_filled(sp, 2.5, egui::Color32::WHITE);
+        }
+        for (idx, pt) in self.ruler_points.iter().enumerate() {
+            if let Some(sp) = project_world_to_screen(vp, rect, *pt) {
+                painter.circle_filled(sp, 5.0, pal.warning);
+                painter.circle_stroke(sp, 7.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                painter.text(
+                    sp + egui::vec2(10.0, -10.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("P{}", idx + 1),
+                    egui::FontId::monospace(11.0),
+                    pal.warning,
+                );
+            }
+        }
+        if self.ruler_points.len() == 2 {
+            let p1 = glam::Vec3::from_array(self.ruler_points[0]);
+            let p2 = glam::Vec3::from_array(self.ruler_points[1]);
+            let mid = ((p1 + p2) * 0.5).to_array();
+            let dist = (p2 - p1).length();
+            if let Some(sp) = project_world_to_screen(vp, rect, mid) {
+                let badge = format!("{dist:.4}");
+                let g = painter.layout_no_wrap(
+                    badge,
+                    egui::FontId::monospace(11.5),
+                    pal.warning,
+                );
+                let bg = egui::Rect::from_center_size(sp, g.size() + egui::vec2(10.0, 6.0));
+                painter.rect_filled(bg, 4.0, pal.hud_bg);
+                painter.rect_stroke(
+                    bg,
+                    4.0,
+                    egui::Stroke::new(1.0, pal.warning),
+                    egui::StrokeKind::Inside,
+                );
+                painter.galley(bg.left_top() + egui::vec2(5.0, 3.0), g, pal.warning);
+            }
+        }
+
+        // Top-left frosted HUD pill
         let proj_mode = if self.session.camera.orthographic {
             "Ortho"
         } else {
             "Persp"
         };
-        let msaa_label = if self.session.settings.edl_enabled {
-            "EDL".to_string()
+        let quality_label = if self.session.settings.edl_enabled {
+            format!("EDL {:.1}", self.session.settings.edl_strength)
         } else if self.session.settings.msaa_samples >= 4 {
             "MSAA 4x".to_string()
         } else {
@@ -1926,13 +2768,13 @@ impl ParaVizApp {
             ViewportMode::Ruler => "Ruler",
         };
         let mut hud_lines = vec![format!(
-            "WebGPU | {:.1} FPS ({:.2} ms) | {} pts | {} cells | {} | {} | Mode: {}",
+            "WebGPU  {:.0} FPS ({:.1} ms)  |  {} pts  {} cells  |  {}  |  {}  |  Mode: {}",
             self.fps_smoothed,
             self.last_render_ms,
             total_points,
             total_cells,
             proj_mode,
-            msaa_label,
+            quality_label,
             mode_label
         )];
         if let Some(pick) = &self.last_pick {
@@ -1942,7 +2784,7 @@ impl ParaVizApp {
                 .scalar_value
                 .map_or_else(|| "-".into(), |v| format!("{v:.4}"));
             hud_lines.push(format!(
-                "Pick: Actor {} | Pos ({:.3}, {:.3}, {:.3}) | Pt {} | Cell {} | Scalar {}",
+                "Pick: {}  Pos ({:.3}, {:.3}, {:.3})  Pt {}  Cell {}  Scalar {}",
                 pick.actor_name,
                 pick.world_pos[0],
                 pick.world_pos[1],
@@ -1963,44 +2805,82 @@ impl ParaVizApp {
             let p2 = glam::Vec3::from_array(self.ruler_points[1]);
             let dist = (p2 - p1).length();
             hud_lines.push(format!(
-                "Ruler: Distance = {:.4} | ({:.3}, {:.3}, {:.3}) -> ({:.3}, {:.3}, {:.3})",
+                "Ruler: Distance = {:.4}  |  ({:.3}, {:.3}, {:.3}) -> ({:.3}, {:.3}, {:.3})",
                 dist, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z
             ));
         }
-        let hud_text = hud_lines.join("\n");
 
-        let painter = ui.painter_at(rect);
-        let hud_pos = rect.left_top() + egui::vec2(12.0, 10.0);
+        let hud_pos = rect.left_top() + egui::vec2(12.0, 12.0);
         let galley = painter.layout(
-            hud_text,
+            hud_lines.join("\n"),
             egui::FontId::monospace(11.5),
-            egui::Color32::from_rgb(230, 236, 245),
+            egui::Color32::from_rgb(232, 238, 248),
             f32::INFINITY,
         );
         let hud_bg = egui::Rect::from_min_size(
-            hud_pos - egui::vec2(6.0, 4.0),
-            galley.size() + egui::vec2(12.0, 8.0),
+            hud_pos - egui::vec2(8.0, 6.0),
+            galley.size() + egui::vec2(16.0, 12.0),
         );
-        painter.rect_filled(hud_bg, 4.0, egui::Color32::from_rgba_unmultiplied(15, 18, 26, 175));
+        painter.rect_filled(hud_bg, 6.0, pal.hud_bg);
+        painter.rect_stroke(
+            hud_bg,
+            6.0,
+            egui::Stroke::new(1.0, pal.hud_border),
+            egui::StrokeKind::Inside,
+        );
         painter.galley(hud_pos, galley, egui::Color32::WHITE);
+
+        // Empty-state welcome launcher
+        if self.session.nodes().is_empty() && self.modal.is_none() {
+            let card_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(380.0, 160.0));
+            if rect.contains(card_rect.min) && rect.contains(card_rect.max) {
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(card_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                egui::Frame::new()
+                    .fill(pal.hud_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.hud_border))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(16))
+                    .show(&mut child, |ui| {
+                        ui.heading("Welcome to ParaViz");
+                        ui.label(
+                            egui::RichText::new("Load a scientific dataset or launch a 3D demo")
+                                .color(pal.muted),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open Demo Gallery").clicked() {
+                                self.modal = Some(AppModal::DemoGallery);
+                            }
+                            if ui.button("Browse Files").clicked() {
+                                self.modal = Some(AppModal::FileBrowser(FileBrowserState::new()));
+                            }
+                        });
+                    });
+            }
+        }
 
         // Scalar Color Bar Overlay (bottom-right of viewport)
         if self.show_scalar_bar
-            && let Some((title, cmap, range)) = self.active_scalar_bar_info() {
-                paint_scalar_bar_overlay(&painter, rect, &title, &cmap, range);
-            }
+            && let Some((title, cmap, range)) = self.active_scalar_bar_info()
+        {
+            paint_scalar_bar_overlay(&painter, rect, &title, &cmap, range, self.theme);
+        }
 
         // Drop target indicator
         if ui.input(|i| !i.raw.hovered_files.is_empty()) {
             painter.rect_filled(
                 rect,
                 0.0,
-                egui::Color32::from_rgba_unmultiplied(30, 110, 220, 45),
+                egui::Color32::from_rgba_unmultiplied(56, 189, 248, 40),
             );
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop scientific file or .json state to open",
+                "Drop scientific file, .raw volume, or .json state to open",
                 egui::FontId::proportional(20.0),
                 egui::Color32::WHITE,
             );
@@ -2024,7 +2904,12 @@ impl ParaVizApp {
             ColorBy::PointScalar { array, component }
             | ColorBy::CellScalar { array, component } => {
                 let comp_suffix = component.map(|c| format!("[{c}]")).unwrap_or_default();
-                let title = format!("{array}{comp_suffix}");
+                let log_suffix = if pick_node.style.colormap.log_scale {
+                    " (log)"
+                } else {
+                    ""
+                };
+                let title = format!("{array}{comp_suffix}{log_suffix}");
                 let range = if pick_node.style.auto_range {
                     pick_node
                         .dataset()
@@ -2045,291 +2930,98 @@ impl ParaVizApp {
         Some((title, pick_node.style.colormap.clone(), range))
     }
 
-    fn draw_modal(&mut self, ctx: &egui::Context) {
-        let Some(mut modal) = self.modal.take() else {
-            return;
-        };
-        let title = match &modal {
-            PathModal::OpenFile(_) => "Open Scientific File",
-            PathModal::FileBrowser(_) => "File Browser",
-            PathModal::SaveState(_) => "Save Pipeline State (JSON)",
-            PathModal::LoadState(_) => "Load Pipeline State (JSON)",
-            PathModal::ExportDataset(_) => "Export Active Dataset",
-            PathModal::SaveScreenshot(_) => "Save Screenshot (PNG)",
-        };
-        let mut keep_open = true;
-        let mut confirm = false;
-        let mut switch_to_browser = false;
-        let mut picked_file: Option<PathBuf> = None;
-
-        if let PathModal::FileBrowser(ref mut fb) = modal {
-            egui::Window::new(title)
-                .collapsible(false)
-                .resizable(true)
-                .default_size([560.0, 420.0])
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button(".. Up").clicked()
-                            && let Some(parent) = fb.current_dir.parent()
-                        {
-                            fb.current_dir = parent.to_path_buf();
-                            fb.path_input = fb.current_dir.display().to_string();
-                        }
-                        if ui.button("CWD").clicked() {
-                            fb.current_dir =
-                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                            fb.path_input = fb.current_dir.display().to_string();
-                        }
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut fb.path_input)
-                                .desired_width(340.0),
-                        );
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let p = PathBuf::from(fb.path_input.trim());
-                            if p.is_dir() {
-                                fb.current_dir = p;
-                            } else if p.is_file() {
-                                picked_file = Some(p);
-                            }
-                        }
-                        if ui.button("Go").clicked() {
-                            let p = PathBuf::from(fb.path_input.trim());
-                            if p.is_dir() {
-                                fb.current_dir = p;
-                            } else if p.is_file() {
-                                picked_file = Some(p);
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Filter:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut fb.filter_text)
-                                .desired_width(220.0)
-                                .hint_text("substring filter"),
-                        );
-                        ui.weak("Supported: .vtk .vtp .vti .vtu .pvtp .pvtu .stl .obj .ply .csv .json");
-                    });
-                    ui.separator();
-
-                    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-                    let mut files: Vec<(String, PathBuf)> = Vec::new();
-                    let mut read_err: Option<String> = None;
-
-                    match std::fs::read_dir(&fb.current_dir) {
-                        Ok(entries) => {
-                            let needle = fb.filter_text.trim().to_ascii_lowercase();
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if !needle.is_empty()
-                                    && !name.to_ascii_lowercase().contains(&needle)
-                                {
-                                    continue;
-                                }
-                                if path.is_dir() {
-                                    dirs.push((name, path));
-                                } else if is_supported_open_file(&path) {
-                                    files.push((name, path));
-                                }
-                            }
-                            dirs.sort_by(|a, b| {
-                                a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
-                            });
-                            files.sort_by(|a, b| {
-                                a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
-                            });
-                        }
-                        Err(e) => {
-                            read_err = Some(format!("Cannot read directory: {e}"));
-                        }
+    fn handle_modals(&mut self, ctx: &egui::Context) {
+        let action = draw_modal(
+            ctx,
+            &mut self.modal,
+            &mut self.export_glb_colors,
+            self.viewport_tex_size,
+            self.theme,
+        );
+        match action {
+            ModalAction::None => {}
+            ModalAction::OpenFile(p) | ModalAction::LoadState(p) => self.load_path(&p),
+            ModalAction::ImportRawVolume(rv) => self.import_raw_volume(rv),
+            ModalAction::RunGpuContour {
+                node_id,
+                field_name,
+                iso_value,
+            } => self.run_gpu_contour(node_id, &field_name, iso_value),
+            ModalAction::LoadDemo(preset) => self.load_demo(preset),
+            ModalAction::SaveState(p) => match self.session.save_state_json() {
+                Ok(json) => match std::fs::write(&p, json) {
+                    Ok(()) => {
+                        self.error_message = None;
+                        self.status_message = format!("Saved state -> {}", p.display());
                     }
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("file_browser_scroll")
-                        .max_height(280.0)
-                        .show(ui, |ui| {
-                            if let Some(err) = read_err {
-                                ui.colored_label(egui::Color32::from_rgb(255, 130, 130), err);
-                            } else if dirs.is_empty() && files.is_empty() {
-                                ui.weak("No subdirectories or supported scientific files here.");
-                            }
-                            for (name, path) in dirs {
-                                if ui.selectable_label(false, format!("[DIR] {name}")).clicked() {
-                                    fb.current_dir = path;
-                                    fb.path_input = fb.current_dir.display().to_string();
-                                }
-                            }
-                            for (name, path) in files {
-                                if ui.selectable_label(false, format!("      {name}")).clicked() {
-                                    picked_file = Some(path);
-                                }
-                            }
-                        });
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Close").clicked() {
-                            keep_open = false;
-                        }
-                    });
-                });
-
-            if let Some(path) = picked_file {
-                self.load_path(&path);
-            } else if keep_open {
-                self.modal = Some(modal);
-            }
-            return;
-        }
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                let is_open = matches!(modal, PathModal::OpenFile(_));
-                let is_export = matches!(modal, PathModal::ExportDataset(_));
-                let path_str = match &mut modal {
-                    PathModal::OpenFile(s)
-                    | PathModal::SaveState(s)
-                    | PathModal::LoadState(s)
-                    | PathModal::ExportDataset(s)
-                    | PathModal::SaveScreenshot(s) => s,
-                    PathModal::FileBrowser(_) => unreachable!(),
-                };
-                ui.label("File path:");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(path_str)
-                        .desired_width(360.0)
-                        .hint_text("path/to/file"),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    confirm = true;
-                }
-                if is_export {
-                    ui.horizontal(|ui| {
-                        ui.label("Format:");
-                        for ext in ["vtp", "vtu", "vti", "vtk", "stl", "obj", "ply", "csv", "glb"]
-                        {
-                            if ui.small_button(format!(".{ext}")).clicked() {
-                                let p = Path::new(path_str.trim());
-                                let stem = p
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or("export");
-                                let next = match p.parent() {
-                                    Some(par) if !par.as_os_str().is_empty() => {
-                                        par.join(format!("{stem}.{ext}"))
-                                    }
-                                    _ => PathBuf::from(format!("{stem}.{ext}")),
-                                };
-                                *path_str = next.display().to_string();
-                            }
-                        }
-                    });
-                    if path_str.trim().to_ascii_lowercase().ends_with(".glb") {
-                        ui.checkbox(
-                            &mut self.export_glb_colors,
-                            "Include scalar vertex colors (COLOR_0)",
-                        );
-                    }
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        confirm = true;
-                    }
-                    if is_open && ui.button("Browse...").clicked() {
-                        switch_to_browser = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        keep_open = false;
-                    }
-                });
-            });
-
-        if switch_to_browser {
-            self.modal = Some(PathModal::FileBrowser(FileBrowserState::new()));
-            return;
-        }
-
-        if confirm {
-            match modal {
-                PathModal::OpenFile(p) => {
-                    let trimmed = p.trim();
-                    if !trimmed.is_empty() {
-                        self.load_path(Path::new(trimmed));
-                    }
-                }
-                PathModal::FileBrowser(_) => {}
-                PathModal::LoadState(p) => {
-                    let trimmed = p.trim();
-                    if !trimmed.is_empty() {
-                        self.load_path(Path::new(trimmed));
-                    }
-                }
-                PathModal::SaveState(p) => match self.session.save_state_json() {
-                    Ok(json) => match std::fs::write(p.trim(), json) {
-                        Ok(()) => {
-                            self.error_message = None;
-                            self.status_message = format!("Saved state -> {}", p.trim());
-                        }
-                        Err(e) => self.error_message = Some(format!("Write failed: {e}")),
-                    },
-                    Err(e) => self.error_message = Some(format!("Serialize failed: {e}")),
+                    Err(e) => self.error_message = Some(format!("Write failed: {e}")),
                 },
-                PathModal::ExportDataset(p) => {
-                    if let Some(id) = self.selected_node {
-                        let trimmed = p.trim();
-                        let res = if trimmed.to_ascii_lowercase().ends_with(".glb") {
-                            self.session
-                                .export_glb(id, trimmed, self.export_glb_colors)
-                        } else {
-                            self.session.export_dataset(id, trimmed)
-                        };
-                        match res {
-                            Ok(()) => {
-                                self.error_message = None;
-                                self.status_message = format!("Exported dataset -> {trimmed}");
-                            }
-                            Err(e) => self.error_message = Some(format!("Export failed: {e}")),
-                        }
-                    }
-                }
-                PathModal::SaveScreenshot(p) => {
-                    let (w, h) = self.viewport_tex_size;
-                    let w = w.max(640);
-                    let h = h.max(480);
-                    match self.session.build_scene().and_then(|scene| {
-                        self.renderer
-                            .render_to_png(&scene, w, h, p.trim())
-                            .map_err(SessionError::from)
-                    }) {
+                Err(e) => self.error_message = Some(format!("Serialize failed: {e}")),
+            },
+            ModalAction::ExportDataset(p) => {
+                if let Some(id) = self.selected_node {
+                    let is_glb = p
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("glb"));
+                    let res = if is_glb {
+                        self.session.export_glb(id, &p, self.export_glb_colors)
+                    } else {
+                        self.session.export_dataset(id, &p)
+                    };
+                    match res {
                         Ok(()) => {
                             self.error_message = None;
-                            self.status_message =
-                                format!("Saved screenshot ({w}x{h}) -> {}", p.trim());
+                            self.status_message = format!("Exported dataset -> {}", p.display());
                         }
-                        Err(e) => self.error_message = Some(format!("Screenshot failed: {e}")),
+                        Err(e) => self.error_message = Some(format!("Export failed: {e}")),
                     }
                 }
             }
-        } else if keep_open {
-            self.modal = Some(modal);
+            ModalAction::SaveScreenshot {
+                path,
+                width,
+                height,
+            } => {
+                match self.session.build_scene().and_then(|scene| {
+                    self.renderer
+                        .render_to_png(&scene, width, height, &path)
+                        .map_err(SessionError::from)
+                }) {
+                    Ok(()) => {
+                        self.error_message = None;
+                        self.status_message = format!(
+                            "Saved screenshot ({width}x{height}) -> {}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => self.error_message = Some(format!("Screenshot failed: {e}")),
+                }
+            }
         }
     }
 }
 
 impl eframe::App for ParaVizApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.theme_applied {
+            apply_theme(ui.ctx(), self.theme);
+            self.theme_applied = true;
+        }
+
         let now = Instant::now();
         let dt = (now - self.last_frame_time).as_secs_f64();
         self.last_frame_time = now;
         if dt > 1e-5 {
             let inst_fps = (1.0 / dt) as f32;
             self.fps_smoothed = self.fps_smoothed * 0.9 + inst_fps * 0.1;
+        }
+
+        if self.turntable_enabled {
+            self.session
+                .camera
+                .orbit((dt as f32) * self.turntable_speed, 0.0);
+            ui.ctx().request_repaint();
         }
 
         if self.playing {
@@ -2351,35 +3043,72 @@ impl eframe::App for ParaVizApp {
 
         egui::Panel::top("paraviz_top_bar").show(ui, |ui| {
             self.draw_menu_bar(ui);
-            ui.separator();
-            self.draw_toolbar(ui);
+            if !self.zen_mode {
+                ui.add_space(2.0);
+                self.draw_toolbar(ui);
+            }
         });
 
-        egui::Panel::left("paraviz_left_dock")
-            .default_size(310.0)
-            .min_size(240.0)
-            .show(ui, |ui| {
-                self.draw_left_dock(ui);
-            });
+        if !self.zen_mode && self.show_left_dock {
+            egui::Panel::left("paraviz_left_dock")
+                .default_size(325.0)
+                .min_size(250.0)
+                .show(ui, |ui| {
+                    self.draw_left_dock(ui);
+                });
+        }
 
+        let pal = palette(self.theme);
         egui::Panel::bottom("paraviz_status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some(err) = &self.error_message {
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+                    pill_badge(
+                        ui,
+                        "ERR",
+                        pal.danger.gamma_multiply(0.25),
+                        pal.danger,
+                    );
+                    ui.colored_label(pal.danger, err);
                     if ui.small_button("Dismiss").clicked() {
                         self.error_message = None;
                     }
                 } else {
+                    pill_badge(
+                        ui,
+                        "OK",
+                        pal.success.gamma_multiply(0.22),
+                        pal.success,
+                    );
                     ui.label(&self.status_message);
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let total_mem: usize = self
+                        .session
+                        .nodes()
+                        .iter()
+                        .filter_map(|n| n.dataset().map(|d| d.memory_bytes()))
+                        .sum();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Nodes: {}  |  Mem: {}  |  Dist: {:.2}  |  F1: Help",
+                            self.session.nodes().len(),
+                            format_memory_bytes(total_mem),
+                            self.session.camera.distance()
+                        ))
+                        .size(11.0)
+                        .monospace()
+                        .color(pal.muted),
+                    );
+                });
             });
         });
 
-        if self.show_drawer {
+        if !self.zen_mode && self.show_drawer {
             egui::Panel::bottom("paraviz_inspector_drawer")
                 .resizable(true)
-                .default_size(220.0)
-                .min_size(120.0)
+                .default_size(240.0)
+                .min_size(130.0)
                 .show(ui, |ui| {
                     self.draw_drawer(ui);
                 });
@@ -2389,8 +3118,104 @@ impl eframe::App for ParaVizApp {
             self.draw_viewport(ui);
         });
 
-        self.draw_modal(ui.ctx());
+        self.handle_modals(ui.ctx());
     }
+}
+
+fn project_world_to_screen(
+    vp: glam::Mat4,
+    rect: egui::Rect,
+    world: [f32; 3],
+) -> Option<egui::Pos2> {
+    let clip = vp * glam::Vec4::new(world[0], world[1], world[2], 1.0);
+    if clip.w <= 1e-6 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if !(0.0..=1.0).contains(&ndc.z) {
+        return None;
+    }
+    let sx = rect.left() + (ndc.x * 0.5 + 0.5) * rect.width();
+    let sy = rect.top() + (0.5 - ndc.y * 0.5) * rect.height();
+    let p = egui::pos2(sx, sy);
+    rect.contains(p).then_some(p)
+}
+
+fn polydata_surface_area(pd: &PolyData) -> f64 {
+    let mut area = 0.0f64;
+    let pts = &pd.points;
+    for poly in &pd.polys {
+        if poly.len() < 3 {
+            continue;
+        }
+        let Some(&p0) = pts.get(poly[0] as usize) else {
+            continue;
+        };
+        let v0 = glam::Vec3::from_array(p0);
+        for k in 1..(poly.len() - 1) {
+            if let (Some(&p1), Some(&p2)) =
+                (pts.get(poly[k] as usize), pts.get(poly[k + 1] as usize))
+            {
+                let e1 = glam::Vec3::from_array(p1) - v0;
+                let e2 = glam::Vec3::from_array(p2) - v0;
+                area += 0.5 * e1.cross(e2).length() as f64;
+            }
+        }
+    }
+    for strip in &pd.strips {
+        for k in 0..strip.len().saturating_sub(2) {
+            if let (Some(&p0), Some(&p1), Some(&p2)) = (
+                pts.get(strip[k] as usize),
+                pts.get(strip[k + 1] as usize),
+                pts.get(strip[k + 2] as usize),
+            ) {
+                let v0 = glam::Vec3::from_array(p0);
+                let e1 = glam::Vec3::from_array(p1) - v0;
+                let e2 = glam::Vec3::from_array(p2) - v0;
+                area += 0.5 * e1.cross(e2).length() as f64;
+            }
+        }
+    }
+    area
+}
+
+fn export_spreadsheet_csv(ds: &DataSet, path: &Path) -> Result<String, String> {
+    let arrays = ds.point_data().map(|p| p.arrays()).unwrap_or(&[]);
+    let n = ds.num_points();
+    let mut csv = String::from("PointID,X,Y,Z");
+    for arr in arrays {
+        if arr.num_components == 1 {
+            csv.push(',');
+            csv.push_str(&arr.name);
+        } else {
+            for c in 0..arr.num_components {
+                csv.push_str(&format!(",{}_{}", arr.name, c));
+            }
+        }
+    }
+    csv.push('\n');
+
+    for row in 0..n {
+        if let Some(p) = dataset_point_at(ds, row) {
+            csv.push_str(&format!("{row},{},{},{}", p[0], p[1], p[2]));
+        } else {
+            csv.push_str(&format!("{row},0,0,0"));
+        }
+        for arr in arrays {
+            if row < arr.num_tuples() {
+                for v in arr.get_tuple(row) {
+                    csv.push_str(&format!(",{v}"));
+                }
+            } else {
+                for _ in 0..arr.num_components {
+                    csv.push_str(",0");
+                }
+            }
+        }
+        csv.push('\n');
+    }
+    std::fs::write(path, csv).map_err(|e| format!("Failed to export CSV: {e}"))?;
+    Ok(format!("Exported {n} rows -> {}", path.display()))
 }
 
 fn drag_vec3(ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f32) -> bool {
@@ -2440,6 +3265,51 @@ fn drag_dims3(ui: &mut egui::Ui, label: &str, dims: &mut [usize; 3], min_val: us
                         .prefix(prefix),
                 )
                 .changed();
+        }
+    });
+    changed
+}
+
+fn array_picker_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    label: &str,
+    value: &mut String,
+    parent_ds: Option<&DataSet>,
+    association: AttributeAssociation,
+    vectors_only: bool,
+) -> bool {
+    let mut changed = false;
+    let names: Vec<(String, (f64, f64))> = parent_ds
+        .and_then(|ds| match association {
+            AttributeAssociation::Point => ds.point_data(),
+            AttributeAssociation::Cell => ds.cell_data(),
+            AttributeAssociation::Field => ds.field_data(),
+        })
+        .map(|fd| {
+            fd.arrays()
+                .iter()
+                .filter(|a| !vectors_only || a.num_components >= 3)
+                .map(|a| (a.name.clone(), a.range(None)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if !names.is_empty() {
+            egui::ComboBox::from_id_salt(id_salt)
+                .selected_text(if value.is_empty() { "<select>" } else { value.as_str() })
+                .show_ui(ui, |ui| {
+                    for (name, _) in &names {
+                        if ui.selectable_label(value == name, name).clicked() {
+                            *value = name.clone();
+                            changed = true;
+                        }
+                    }
+                });
+        } else {
+            changed |= ui.text_edit_singleline(value).changed();
         }
     });
     changed
@@ -2725,7 +3595,46 @@ fn edit_source_config(ui: &mut egui::Ui, cfg: &mut SourceConfig) -> bool {
     changed
 }
 
-fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
+fn edit_plane_snap_buttons(
+    ui: &mut egui::Ui,
+    origin: &mut [f32; 3],
+    normal: &mut [f32; 3],
+    parent_ds: Option<&DataSet>,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button("X Normal").clicked() {
+            *normal = [1.0, 0.0, 0.0];
+            changed = true;
+        }
+        if ui.small_button("Y Normal").clicked() {
+            *normal = [0.0, 1.0, 0.0];
+            changed = true;
+        }
+        if ui.small_button("Z Normal").clicked() {
+            *normal = [0.0, 0.0, 1.0];
+            changed = true;
+        }
+        if ui.small_button("Flip").clicked() {
+            *normal = [-normal[0], -normal[1], -normal[2]];
+            changed = true;
+        }
+        if let Some(ds) = parent_ds {
+            let bb = ds.bounds();
+            if bb.is_valid() && ui.small_button("Center").clicked() {
+                *origin = bb.center().to_array();
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+fn edit_filter_config(
+    ui: &mut egui::Ui,
+    cfg: &mut FilterConfig,
+    parent_ds: Option<&DataSet>,
+) -> bool {
     let mut changed = false;
     match cfg {
         FilterConfig::ExtractSurface(f) => {
@@ -2734,10 +3643,15 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .changed();
         }
         FilterConfig::Contour(f) => {
-            ui.horizontal(|ui| {
-                ui.label("Scalar Field:");
-                changed |= ui.text_edit_singleline(&mut f.field_name).changed();
-            });
+            changed |= array_picker_combo(
+                ui,
+                "contour_field",
+                "Scalar Field:",
+                &mut f.field_name,
+                parent_ds,
+                AttributeAssociation::Point,
+                false,
+            );
             changed |= ui
                 .checkbox(&mut f.compute_normals, "Compute Normals")
                 .changed();
@@ -2751,25 +3665,42 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                     changed |= ui
                         .add(egui::DragValue::new(val).speed(0.5))
                         .changed();
-                    if ui.small_button("✕").clicked() {
+                    if ui.small_button("×").clicked() {
                         remove_idx = Some(idx);
                     }
                 });
             }
             if let Some(idx) = remove_idx
-                && f.iso_values.len() > 1 {
-                    f.iso_values.remove(idx);
-                    changed = true;
-                }
-            if ui.button("+ Add Iso Value").clicked() {
-                let next = f.iso_values.last().copied().unwrap_or(0.0) + 10.0;
-                f.iso_values.push(next);
+                && f.iso_values.len() > 1
+            {
+                f.iso_values.remove(idx);
                 changed = true;
             }
+            ui.horizontal(|ui| {
+                if ui.button("+ Add Iso Value").clicked() {
+                    let next = f.iso_values.last().copied().unwrap_or(0.0) + 10.0;
+                    f.iso_values.push(next);
+                    changed = true;
+                }
+                if let Some((mn, mx)) = parent_ds
+                    .and_then(|d| d.point_data())
+                    .and_then(|p| p.get(&f.field_name))
+                    .map(|a| a.range(None))
+                    && ui.small_button("3-Level").clicked()
+                {
+                    f.iso_values = vec![
+                        mn + (mx - mn) * 0.25,
+                        mn + (mx - mn) * 0.50,
+                        mn + (mx - mn) * 0.75,
+                    ];
+                    changed = true;
+                }
+            });
         }
         FilterConfig::Slice(f) => {
             changed |= drag_vec3(ui, "Origin", &mut f.origin, 0.05);
             changed |= drag_vec3(ui, "Normal", &mut f.normal, 0.05);
+            changed |= edit_plane_snap_buttons(ui, &mut f.origin, &mut f.normal, parent_ds);
             changed |= ui.checkbox(&mut f.crinkle, "Crinkle Cut").changed();
         }
         FilterConfig::Clip(f) => {
@@ -2822,6 +3753,7 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 ImplicitFunction::Plane { origin, normal } => {
                     changed |= drag_vec3(ui, "Origin", origin, 0.05);
                     changed |= drag_vec3(ui, "Normal", normal, 0.05);
+                    changed |= edit_plane_snap_buttons(ui, origin, normal, parent_ds);
                 }
                 ImplicitFunction::Sphere { center, radius } => {
                     changed |= drag_vec3(ui, "Center", center, 0.05);
@@ -2837,16 +3769,29 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 ImplicitFunction::Box { min, max } => {
                     changed |= drag_vec3(ui, "Min", min, 0.05);
                     changed |= drag_vec3(ui, "Max", max, 0.05);
+                    if let Some(ds) = parent_ds {
+                        let bb = ds.bounds();
+                        if bb.is_valid() && ui.small_button("Fit Parent Bounds").clicked() {
+                            *min = bb.min.to_array();
+                            *max = bb.max.to_array();
+                            changed = true;
+                        }
+                    }
                 }
             }
             changed |= ui.checkbox(&mut f.invert, "Invert").changed();
             changed |= ui.checkbox(&mut f.crinkle, "Crinkle").changed();
         }
         FilterConfig::Threshold(f) => {
-            ui.horizontal(|ui| {
-                ui.label("Field:");
-                changed |= ui.text_edit_singleline(&mut f.field_name).changed();
-            });
+            changed |= array_picker_combo(
+                ui,
+                "threshold_field",
+                "Field:",
+                &mut f.field_name,
+                parent_ds,
+                f.association,
+                false,
+            );
             egui::ComboBox::from_label("Association")
                 .selected_text(format!("{:?}", f.association))
                 .show_ui(ui, |ui| {
@@ -2865,14 +3810,33 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
             changed |= ui
                 .add(egui::DragValue::new(&mut f.max).speed(0.5).prefix("Max: "))
                 .changed();
+            if let Some((mn, mx)) = parent_ds
+                .and_then(|d| match f.association {
+                    AttributeAssociation::Point => d.point_data(),
+                    AttributeAssociation::Cell => d.cell_data(),
+                    AttributeAssociation::Field => d.field_data(),
+                })
+                .and_then(|fd| fd.get(&f.field_name))
+                .map(|a| a.range(None))
+                && ui.small_button("Fit Data Range").clicked()
+            {
+                f.min = mn;
+                f.max = mx;
+                changed = true;
+            }
             changed |= ui.checkbox(&mut f.invert, "Invert").changed();
             changed |= ui.checkbox(&mut f.all_scalars, "All Scalars").changed();
         }
         FilterConfig::StreamTracer(f) => {
-            ui.horizontal(|ui| {
-                ui.label("Vector Field:");
-                changed |= ui.text_edit_singleline(&mut f.vector_field).changed();
-            });
+            changed |= array_picker_combo(
+                ui,
+                "stream_vec_field",
+                "Vector Field:",
+                &mut f.vector_field,
+                parent_ds,
+                AttributeAssociation::Point,
+                true,
+            );
             egui::ComboBox::from_label("Integrator")
                 .selected_text(format!("{:?}", f.integrator))
                 .show_ui(ui, |ui| {
@@ -3000,17 +3964,22 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .changed();
             changed |= ui.checkbox(&mut f.capping, "Capping").changed();
             let mut vary = f.vary_radius_by_scalar.clone().unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label("Vary By Scalar:");
-                if ui.text_edit_singleline(&mut vary).changed() {
-                    f.vary_radius_by_scalar = if vary.trim().is_empty() {
-                        None
-                    } else {
-                        Some(vary)
-                    };
-                    changed = true;
-                }
-            });
+            if array_picker_combo(
+                ui,
+                "tube_vary_scalar",
+                "Vary By Scalar:",
+                &mut vary,
+                parent_ds,
+                AttributeAssociation::Point,
+                false,
+            ) {
+                f.vary_radius_by_scalar = if vary.trim().is_empty() {
+                    None
+                } else {
+                    Some(vary)
+                };
+                changed = true;
+            }
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut f.radius_factor)
@@ -3055,21 +4024,31 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                     }
                 });
             let mut vf = f.vector_field.clone().unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label("Vector Field:");
-                if ui.text_edit_singleline(&mut vf).changed() {
-                    f.vector_field = if vf.trim().is_empty() { None } else { Some(vf) };
-                    changed = true;
-                }
-            });
+            if array_picker_combo(
+                ui,
+                "glyph_vec",
+                "Vector Field:",
+                &mut vf,
+                parent_ds,
+                AttributeAssociation::Point,
+                true,
+            ) {
+                f.vector_field = if vf.trim().is_empty() { None } else { Some(vf) };
+                changed = true;
+            }
             let mut sf = f.scalar_field.clone().unwrap_or_default();
-            ui.horizontal(|ui| {
-                ui.label("Scalar Field:");
-                if ui.text_edit_singleline(&mut sf).changed() {
-                    f.scalar_field = if sf.trim().is_empty() { None } else { Some(sf) };
-                    changed = true;
-                }
-            });
+            if array_picker_combo(
+                ui,
+                "glyph_scalar",
+                "Scalar Field:",
+                &mut sf,
+                parent_ds,
+                AttributeAssociation::Point,
+                false,
+            ) {
+                f.scalar_field = if sf.trim().is_empty() { None } else { Some(sf) };
+                changed = true;
+            }
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut f.scale_factor)
@@ -3083,10 +4062,15 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .changed();
         }
         FilterConfig::WarpByVector(f) => {
-            ui.horizontal(|ui| {
-                ui.label("Vector Field:");
-                changed |= ui.text_edit_singleline(&mut f.vector_field).changed();
-            });
+            changed |= array_picker_combo(
+                ui,
+                "warp_vec",
+                "Vector Field:",
+                &mut f.vector_field,
+                parent_ds,
+                AttributeAssociation::Point,
+                true,
+            );
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut f.scale_factor)
@@ -3096,10 +4080,15 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .changed();
         }
         FilterConfig::WarpByScalar(f) => {
-            ui.horizontal(|ui| {
-                ui.label("Scalar Field:");
-                changed |= ui.text_edit_singleline(&mut f.scalar_field).changed();
-            });
+            changed |= array_picker_combo(
+                ui,
+                "warp_scalar",
+                "Scalar Field:",
+                &mut f.scalar_field,
+                parent_ds,
+                AttributeAssociation::Point,
+                false,
+            );
             changed |= ui.checkbox(&mut f.use_normal, "Use Normal").changed();
             changed |= drag_vec3(ui, "Normal", &mut f.normal, 0.05);
             changed |= ui
@@ -3111,10 +4100,15 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .changed();
         }
         FilterConfig::Gradient(f) => {
-            ui.horizontal(|ui| {
-                ui.label("Field:");
-                changed |= ui.text_edit_singleline(&mut f.field_name).changed();
-            });
+            changed |= array_picker_combo(
+                ui,
+                "grad_field",
+                "Field:",
+                &mut f.field_name,
+                parent_ds,
+                AttributeAssociation::Point,
+                false,
+            );
             changed |= ui
                 .checkbox(&mut f.compute_gradient, "Compute Gradient")
                 .changed();
@@ -3131,6 +4125,27 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
         FilterConfig::Calculator(f) => {
             ui.label("Expression:");
             changed |= ui.text_edit_singleline(&mut f.expression).changed();
+            if let Some(ds) = parent_ds
+                && let Some(fd) = match f.association {
+                    AttributeAssociation::Point => ds.point_data(),
+                    AttributeAssociation::Cell => ds.cell_data(),
+                    AttributeAssociation::Field => ds.field_data(),
+                }
+                && !fd.is_empty()
+            {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Insert:");
+                    for arr in fd.arrays() {
+                        if ui.small_button(&arr.name).clicked() {
+                            if !f.expression.is_empty() && !f.expression.ends_with(' ') {
+                                f.expression.push(' ');
+                            }
+                            f.expression.push_str(&arr.name);
+                            changed = true;
+                        }
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Result Name:");
                 changed |= ui.text_edit_singleline(&mut f.result_name).changed();
@@ -3192,6 +4207,34 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
         FilterConfig::ProbeOverLine(f) => {
             changed |= drag_vec3(ui, "Point 1", &mut f.point1, 0.05);
             changed |= drag_vec3(ui, "Point 2", &mut f.point2, 0.05);
+            if let Some(ds) = parent_ds {
+                let bb = ds.bounds();
+                if bb.is_valid() {
+                    let c = bb.center().to_array();
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Along X").clicked() {
+                            f.point1 = [bb.min.x, c[1], c[2]];
+                            f.point2 = [bb.max.x, c[1], c[2]];
+                            changed = true;
+                        }
+                        if ui.small_button("Along Y").clicked() {
+                            f.point1 = [c[0], bb.min.y, c[2]];
+                            f.point2 = [c[0], bb.max.y, c[2]];
+                            changed = true;
+                        }
+                        if ui.small_button("Along Z").clicked() {
+                            f.point1 = [c[0], c[1], bb.min.z];
+                            f.point2 = [c[0], c[1], bb.max.z];
+                            changed = true;
+                        }
+                        if ui.small_button("Diag").clicked() {
+                            f.point1 = bb.min.to_array();
+                            f.point2 = bb.max.to_array();
+                            changed = true;
+                        }
+                    });
+                }
+            }
             changed |= ui
                 .add(egui::Slider::new(&mut f.resolution, 2..=1000).text("Resolution"))
                 .changed();
@@ -3212,6 +4255,9 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                         .text("Feature Angle (deg)"),
                 )
                 .changed();
+        }
+        FilterConfig::ExtractEdges(_) => {
+            ui.weak("Extracts all unique topological cell edges as wireframe lines.");
         }
         FilterConfig::Connectivity(f) => {
             changed |= ui
@@ -3268,6 +4314,22 @@ fn edit_filter_config(ui: &mut egui::Ui, cfg: &mut FilterConfig) -> bool {
                 .checkbox(&mut f.consistency, "Enforce Consistency")
                 .changed();
         }
+        FilterConfig::Triangulate(f) => {
+            changed |= ui
+                .checkbox(&mut f.pass_verts_and_lines, "Pass Verts & Lines")
+                .changed();
+        }
+        FilterConfig::CleanPolyData(f) => {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut f.tolerance)
+                        .speed(1e-5)
+                        .range(0.0..=10.0)
+                        .max_decimals(6)
+                        .prefix("Merge Tolerance: "),
+                )
+                .changed();
+        }
         FilterConfig::Elevation(f) => {
             changed |= drag_vec3(ui, "Low Point", &mut f.low_point, 0.05);
             changed |= drag_vec3(ui, "High Point", &mut f.high_point, 0.05);
@@ -3304,7 +4366,7 @@ fn paint_colormap_preview(ui: &mut egui::Ui, cmap: &ColorMap, height: f32) {
     }
     painter.rect_stroke(
         rect,
-        2.0,
+        3.0,
         egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
         egui::StrokeKind::Inside,
     );
@@ -3316,12 +4378,14 @@ fn paint_scalar_bar_overlay(
     title: &str,
     cmap: &ColorMap,
     range: (f64, f64),
+    theme: UiTheme,
 ) {
+    let pal = palette(theme);
     let bar_w = 18.0;
-    let bar_h = (viewport_rect.height() * 0.34).clamp(110.0, 220.0);
+    let bar_h = (viewport_rect.height() * 0.34).clamp(115.0, 225.0);
     let pad = 14.0;
-    let box_w = 132.0;
-    let box_h = bar_h + 42.0;
+    let box_w = 142.0;
+    let box_h = bar_h + 44.0;
 
     if viewport_rect.width() < box_w + 40.0 || viewport_rect.height() < box_h + 40.0 {
         return;
@@ -3334,24 +4398,24 @@ fn paint_scalar_bar_overlay(
         ),
         egui::vec2(box_w, box_h),
     );
-    painter.rect_filled(
-        box_rect,
-        6.0,
-        egui::Color32::from_rgba_unmultiplied(15, 18, 26, 185),
-    );
+    painter.rect_filled(box_rect, 7.0, pal.hud_bg);
     painter.rect_stroke(
         box_rect,
-        6.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(140, 155, 180, 90)),
+        7.0,
+        egui::Stroke::new(1.0, pal.hud_border),
         egui::StrokeKind::Inside,
     );
 
+    let title_col = match theme {
+        UiTheme::DarkStudio => egui::Color32::from_rgb(235, 240, 248),
+        UiTheme::LightStudio => egui::Color32::from_rgb(25, 32, 48),
+    };
     painter.text(
         egui::pos2(box_rect.left() + 10.0, box_rect.top() + 8.0),
         egui::Align2::LEFT_TOP,
         title,
         egui::FontId::proportional(12.0),
-        egui::Color32::from_rgb(235, 240, 248),
+        title_col,
     );
 
     let bar_rect = egui::Rect::from_min_size(
@@ -3383,74 +4447,68 @@ fn paint_scalar_bar_overlay(
     }
     painter.rect_stroke(
         bar_rect,
-        0.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 215, 225)),
+        1.0,
+        egui::Stroke::new(1.0, pal.hud_border),
         egui::StrokeKind::Inside,
     );
 
     let mid = 0.5 * (range.0 + range.1);
-    let label_x = bar_rect.right() + 8.0;
+    let label_x = bar_rect.right() + 9.0;
     let font = egui::FontId::monospace(10.5);
-    let text_color = egui::Color32::from_rgb(225, 230, 240);
     painter.text(
         egui::pos2(label_x, bar_rect.top()),
         egui::Align2::LEFT_TOP,
         format!("{:.4}", range.1),
         font.clone(),
-        text_color,
+        title_col,
     );
     painter.text(
         egui::pos2(label_x, bar_rect.center().y),
         egui::Align2::LEFT_CENTER,
         format!("{mid:.4}"),
         font.clone(),
-        text_color,
+        title_col,
     );
     painter.text(
         egui::pos2(label_x, bar_rect.bottom()),
         egui::Align2::LEFT_BOTTOM,
         format!("{:.4}", range.0),
         font,
-        text_color,
+        title_col,
     );
 }
 
-fn extract_dataset_points(ds: &DataSet) -> Vec<[f32; 3]> {
+fn dataset_point_at(ds: &DataSet, row: usize) -> Option<[f32; 3]> {
     match ds {
-        DataSet::PolyData(p) => p.points.clone(),
+        DataSet::PolyData(p) => p.points.get(row).copied(),
         DataSet::ImageData(i) => {
-            let max_pts = i.num_points().min(200);
+            if row >= i.num_points() {
+                return None;
+            }
             let [nx, ny, _] = i.dimensions;
-            (0..max_pts)
-                .map(|idx| {
-                    let k = idx / (nx * ny).max(1);
-                    let rem = idx % (nx * ny).max(1);
-                    let j = rem / nx.max(1);
-                    let ii = rem % nx.max(1);
-                    i.point_coords(ii, j, k)
-                })
-                .collect()
+            let k = row / (nx * ny).max(1);
+            let rem = row % (nx * ny).max(1);
+            let j = rem / nx.max(1);
+            let ii = rem % nx.max(1);
+            Some(i.point_coords(ii, j, k))
         }
         DataSet::RectilinearGrid(r) => {
-            let max_pts = r.num_points().min(200);
+            if row >= r.num_points() {
+                return None;
+            }
             let [nx, ny, _] = r.dimensions();
-            (0..max_pts)
-                .map(|idx| {
-                    let k = idx / (nx * ny).max(1);
-                    let rem = idx % (nx * ny).max(1);
-                    let j = rem / nx.max(1);
-                    let ii = rem % nx.max(1);
-                    r.point_coords(ii, j, k)
-                })
-                .collect()
+            let k = row / (nx * ny).max(1);
+            let rem = row % (nx * ny).max(1);
+            let j = rem / nx.max(1);
+            let ii = rem % nx.max(1);
+            Some(r.point_coords(ii, j, k))
         }
-        DataSet::StructuredGrid(s) => s.points.clone(),
-        DataSet::UnstructuredGrid(u) => u.points.clone(),
+        DataSet::StructuredGrid(s) => s.points.get(row).copied(),
+        DataSet::UnstructuredGrid(u) => u.points.get(row).copied(),
         DataSet::MultiBlock(mb) => mb
             .blocks
             .first()
-            .map(|(_, b)| extract_dataset_points(b))
-            .unwrap_or_default(),
+            .and_then(|(_, b)| dataset_point_at(b, row)),
     }
 }
 
@@ -3464,429 +4522,5 @@ fn format_tuple(arr: &DataArray, row: usize) -> String {
     } else {
         let parts: Vec<String> = vals.iter().map(|v| format!("{v:.3}")).collect();
         format!("({})", parts.join(", "))
-    }
-}
-
-fn is_supported_open_file(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "vtk"
-            | "vtp"
-            | "vti"
-            | "vtu"
-            | "vtr"
-            | "vts"
-            | "vtm"
-            | "pvd"
-            | "pvtp"
-            | "pvti"
-            | "pvtu"
-            | "stl"
-            | "obj"
-            | "ply"
-            | "csv"
-            | "tsv"
-            | "json"
-    )
-}
-
-const CHART_PALETTE: [egui::Color32; 6] = [
-    egui::Color32::from_rgb(78, 195, 255),
-    egui::Color32::from_rgb(255, 166, 77),
-    egui::Color32::from_rgb(122, 232, 138),
-    egui::Color32::from_rgb(245, 114, 152),
-    egui::Color32::from_rgb(198, 148, 255),
-    egui::Color32::from_rgb(255, 224, 92),
-];
-
-fn paint_xy_arclength_plot(ui: &mut egui::Ui, pd: &PolyData) {
-    let Some(arc_arr) = pd.point_data.get("ArcLength") else {
-        ui.weak("No ArcLength array found.");
-        return;
-    };
-    let n = arc_arr.num_tuples();
-    if n < 2 {
-        ui.weak("At least 2 points are required for XY line plotting.");
-        return;
-    }
-
-    let x_vals: Vec<f64> = (0..n).map(|i| arc_arr.get_magnitude(i)).collect();
-    let series: Vec<(&str, Vec<f64>, egui::Color32)> = pd
-        .point_data
-        .arrays()
-        .iter()
-        .filter(|a| {
-            a.name != "ArcLength"
-                && a.name != "vtkValidPointMask"
-                && a.num_tuples() == n
-        })
-        .take(CHART_PALETTE.len())
-        .enumerate()
-        .map(|(idx, arr)| {
-            let ys: Vec<f64> = (0..n).map(|i| arr.get_magnitude(i)).collect();
-            (arr.name.as_str(), ys, CHART_PALETTE[idx % CHART_PALETTE.len()])
-        })
-        .collect();
-
-    if series.is_empty() {
-        ui.weak("No scalar arrays to plot against ArcLength.");
-        return;
-    }
-
-    let x_min = x_vals.iter().copied().fold(f64::INFINITY, f64::min);
-    let x_max = x_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let (x_min, x_max) = if (x_max - x_min).abs() < 1e-12 {
-        (x_min - 0.5, x_max + 0.5)
-    } else {
-        (x_min, x_max)
-    };
-
-    let mut y_min = f64::INFINITY;
-    let mut y_max = f64::NEG_INFINITY;
-    for (_, ys, _) in &series {
-        for &y in ys {
-            if y.is_finite() {
-                y_min = y_min.min(y);
-                y_max = y_max.max(y);
-            }
-        }
-    }
-    if !y_min.is_finite() || !y_max.is_finite() {
-        ui.weak("Plotted arrays contain no finite values.");
-        return;
-    }
-    if (y_max - y_min).abs() < 1e-12 {
-        y_min -= 0.5;
-        y_max += 0.5;
-    } else {
-        let pad = (y_max - y_min) * 0.05;
-        y_min -= pad;
-        y_max += pad;
-    }
-
-    let avail = ui.available_size();
-    let plot_h = avail.y.max(110.0);
-    let plot_w = avail.x.max(200.0);
-    let (outer_rect, resp) =
-        ui.allocate_exact_size(egui::vec2(plot_w, plot_h), egui::Sense::hover());
-    let painter = ui.painter_at(outer_rect);
-
-    let left_pad = 64.0;
-    let right_pad = if outer_rect.width() > 360.0 { 148.0 } else { 14.0 };
-    let top_pad = 10.0;
-    let bottom_pad = 24.0;
-    let plot_rect = egui::Rect::from_min_max(
-        egui::pos2(outer_rect.left() + left_pad, outer_rect.top() + top_pad),
-        egui::pos2(
-            (outer_rect.right() - right_pad).max(outer_rect.left() + left_pad + 40.0),
-            (outer_rect.bottom() - bottom_pad).max(outer_rect.top() + top_pad + 40.0),
-        ),
-    );
-
-    painter.rect_filled(plot_rect, 2.0, egui::Color32::from_rgb(18, 22, 30));
-
-    // Gridlines
-    let grid_color = egui::Color32::from_rgba_unmultiplied(120, 135, 160, 45);
-    for g in 0..=4 {
-        let frac = g as f32 / 4.0;
-        let gx = egui::lerp(plot_rect.left()..=plot_rect.right(), frac);
-        let gy = egui::lerp(plot_rect.bottom()..=plot_rect.top(), frac);
-        painter.line_segment(
-            [
-                egui::pos2(gx, plot_rect.top()),
-                egui::pos2(gx, plot_rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, grid_color),
-        );
-        painter.line_segment(
-            [
-                egui::pos2(plot_rect.left(), gy),
-                egui::pos2(plot_rect.right(), gy),
-            ],
-            egui::Stroke::new(1.0, grid_color),
-        );
-    }
-
-    painter.rect_stroke(
-        plot_rect,
-        2.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 95, 120)),
-        egui::StrokeKind::Inside,
-    );
-
-    // Axis labels
-    let label_font = egui::FontId::monospace(10.0);
-    let label_col = egui::Color32::from_rgb(200, 210, 225);
-    painter.text(
-        egui::pos2(plot_rect.left() - 6.0, plot_rect.top()),
-        egui::Align2::RIGHT_TOP,
-        format!("{y_max:.3}"),
-        label_font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.left() - 6.0, plot_rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        format!("{:.3}", 0.5 * (y_min + y_max)),
-        label_font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.left() - 6.0, plot_rect.bottom()),
-        egui::Align2::RIGHT_BOTTOM,
-        format!("{y_min:.3}"),
-        label_font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.left(), plot_rect.bottom() + 4.0),
-        egui::Align2::LEFT_TOP,
-        format!("{x_min:.3}"),
-        label_font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.center().x, plot_rect.bottom() + 4.0),
-        egui::Align2::CENTER_TOP,
-        "ArcLength",
-        label_font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.right(), plot_rect.bottom() + 4.0),
-        egui::Align2::RIGHT_TOP,
-        format!("{x_max:.3}"),
-        label_font.clone(),
-        label_col,
-    );
-
-    let to_screen = |x: f64, y: f64| -> egui::Pos2 {
-        let tx = ((x - x_min) / (x_max - x_min)).clamp(0.0, 1.0) as f32;
-        let ty = ((y - y_min) / (y_max - y_min)).clamp(0.0, 1.0) as f32;
-        egui::pos2(
-            egui::lerp(plot_rect.left()..=plot_rect.right(), tx),
-            egui::lerp(plot_rect.bottom()..=plot_rect.top(), ty),
-        )
-    };
-
-    for (_, ys, color) in &series {
-        let pts: Vec<egui::Pos2> = x_vals
-            .iter()
-            .zip(ys.iter())
-            .filter(|(x, y)| x.is_finite() && y.is_finite())
-            .map(|(&x, &y)| to_screen(x, y))
-            .collect();
-        if pts.len() >= 2 {
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.8, *color)));
-        }
-    }
-
-    // Color legend
-    if outer_rect.width() > 360.0 {
-        let lx = plot_rect.right() + 10.0;
-        let mut ly = plot_rect.top() + 4.0;
-        for (name, _, color) in &series {
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(lx, ly + 3.0), egui::vec2(10.0, 8.0)),
-                2.0,
-                *color,
-            );
-            painter.text(
-                egui::pos2(lx + 15.0, ly),
-                egui::Align2::LEFT_TOP,
-                *name,
-                egui::FontId::proportional(11.5),
-                egui::Color32::from_rgb(225, 232, 242),
-            );
-            ly += 17.0;
-        }
-    }
-
-    // Interactive hover crosshair
-    if resp.hovered()
-        && let Some(pointer) = resp.hover_pos()
-        && plot_rect.contains(pointer)
-    {
-        let frac = ((pointer.x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
-        let target_x = x_min + (x_max - x_min) * frac as f64;
-        let nearest = x_vals
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| (*a - target_x).abs().total_cmp(&(*b - target_x).abs()))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        let sx = to_screen(x_vals[nearest], y_min).x;
-        painter.line_segment(
-            [
-                egui::pos2(sx, plot_rect.top()),
-                egui::pos2(sx, plot_rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(235, 240, 250, 150)),
-        );
-
-        let mut tip_lines = vec![format!("ArcLength: {:.4}", x_vals[nearest])];
-        for (name, ys, color) in &series {
-            let yv = ys[nearest];
-            if yv.is_finite() {
-                let pt = to_screen(x_vals[nearest], yv);
-                painter.circle_filled(pt, 3.5, *color);
-                tip_lines.push(format!("{name}: {yv:.4}"));
-            }
-        }
-
-        let tip_galley = painter.layout(
-            tip_lines.join("\n"),
-            label_font,
-            egui::Color32::WHITE,
-            f32::INFINITY,
-        );
-        let tip_pos = egui::pos2(
-            (sx + 10.0).min(plot_rect.right() - tip_galley.size().x - 10.0),
-            (pointer.y - tip_galley.size().y * 0.5)
-                .clamp(plot_rect.top() + 4.0, (plot_rect.bottom() - tip_galley.size().y - 8.0).max(plot_rect.top() + 4.0)),
-        );
-        let tip_bg = egui::Rect::from_min_size(
-            tip_pos - egui::vec2(5.0, 3.0),
-            tip_galley.size() + egui::vec2(10.0, 6.0),
-        );
-        painter.rect_filled(
-            tip_bg,
-            3.0,
-            egui::Color32::from_rgba_unmultiplied(12, 16, 24, 215),
-        );
-        painter.galley(tip_pos, tip_galley, egui::Color32::WHITE);
-    }
-}
-
-fn paint_histogram_chart(ui: &mut egui::Ui, hist: &HistogramResult) {
-    let bins = hist.counts.len();
-    if bins == 0 || hist.bin_edges.len() < 2 {
-        ui.weak("Empty histogram.");
-        return;
-    }
-
-    let max_count = hist.counts.iter().copied().max().unwrap_or(1).max(1);
-    let avail = ui.available_size();
-    let plot_h = avail.y.max(100.0);
-    let plot_w = avail.x.max(200.0);
-    let (outer_rect, resp) =
-        ui.allocate_exact_size(egui::vec2(plot_w, plot_h), egui::Sense::hover());
-    let painter = ui.painter_at(outer_rect);
-
-    let left_pad = 54.0;
-    let right_pad = 14.0;
-    let top_pad = 10.0;
-    let bottom_pad = 24.0;
-    let plot_rect = egui::Rect::from_min_max(
-        egui::pos2(outer_rect.left() + left_pad, outer_rect.top() + top_pad),
-        egui::pos2(
-            (outer_rect.right() - right_pad).max(outer_rect.left() + left_pad + 40.0),
-            (outer_rect.bottom() - bottom_pad).max(outer_rect.top() + top_pad + 40.0),
-        ),
-    );
-
-    painter.rect_filled(plot_rect, 2.0, egui::Color32::from_rgb(18, 22, 30));
-
-    let grid_color = egui::Color32::from_rgba_unmultiplied(120, 135, 160, 45);
-    for g in 0..=4 {
-        let frac = g as f32 / 4.0;
-        let gy = egui::lerp(plot_rect.bottom()..=plot_rect.top(), frac);
-        painter.line_segment(
-            [
-                egui::pos2(plot_rect.left(), gy),
-                egui::pos2(plot_rect.right(), gy),
-            ],
-            egui::Stroke::new(1.0, grid_color),
-        );
-    }
-
-    let hovered_bin = resp
-        .hover_pos()
-        .filter(|p| plot_rect.contains(*p))
-        .map(|p| {
-            let frac = ((p.x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 0.9999);
-            ((frac * bins as f32).floor() as usize).min(bins - 1)
-        });
-
-    let bin_w = plot_rect.width() / bins as f32;
-    for (i, &cnt) in hist.counts.iter().enumerate() {
-        let x0 = plot_rect.left() + i as f32 * bin_w + 1.0;
-        let x1 = (plot_rect.left() + (i + 1) as f32 * bin_w - 1.0).max(x0 + 1.0);
-        let h_frac = cnt as f32 / max_count as f32;
-        let y0 = egui::lerp(plot_rect.bottom()..=plot_rect.top(), h_frac);
-        let bar_rect =
-            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, plot_rect.bottom()));
-        let col = if hovered_bin == Some(i) {
-            egui::Color32::from_rgb(255, 195, 77)
-        } else {
-            egui::Color32::from_rgb(76, 175, 240)
-        };
-        painter.rect_filled(bar_rect, 1.0, col);
-    }
-
-    painter.rect_stroke(
-        plot_rect,
-        2.0,
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 95, 120)),
-        egui::StrokeKind::Inside,
-    );
-
-    let font = egui::FontId::monospace(10.0);
-    let label_col = egui::Color32::from_rgb(200, 210, 225);
-    painter.text(
-        egui::pos2(plot_rect.left() - 6.0, plot_rect.top()),
-        egui::Align2::RIGHT_TOP,
-        format!("{max_count}"),
-        font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.left() - 6.0, plot_rect.bottom()),
-        egui::Align2::RIGHT_BOTTOM,
-        "0",
-        font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.left(), plot_rect.bottom() + 4.0),
-        egui::Align2::LEFT_TOP,
-        format!("{:.3}", hist.bin_edges[0]),
-        font.clone(),
-        label_col,
-    );
-    painter.text(
-        egui::pos2(plot_rect.right(), plot_rect.bottom() + 4.0),
-        egui::Align2::RIGHT_TOP,
-        format!("{:.3}", hist.bin_edges[bins]),
-        font.clone(),
-        label_col,
-    );
-
-    if let Some(bi) = hovered_bin
-        && let Some(pointer) = resp.hover_pos()
-    {
-        let lo = hist.bin_edges[bi];
-        let hi = hist.bin_edges[bi + 1];
-        let cnt = hist.counts[bi];
-        let tip = format!("[{lo:.4}, {hi:.4}]: {cnt}");
-        let galley = painter.layout_no_wrap(tip, font, egui::Color32::WHITE);
-        let tip_pos = egui::pos2(
-            (pointer.x + 10.0).min(plot_rect.right() - galley.size().x - 10.0),
-            (plot_rect.top() + 6.0).max(pointer.y - 24.0),
-        );
-        let tip_bg = egui::Rect::from_min_size(
-            tip_pos - egui::vec2(5.0, 3.0),
-            galley.size() + egui::vec2(10.0, 6.0),
-        );
-        painter.rect_filled(
-            tip_bg,
-            3.0,
-            egui::Color32::from_rgba_unmultiplied(12, 16, 24, 215),
-        );
-        painter.galley(tip_pos, galley, egui::Color32::WHITE);
     }
 }
