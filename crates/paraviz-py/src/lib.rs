@@ -1,6 +1,6 @@
 //! Python bindings for ParaViz (`import paraviz`), mirroring `paraview.simple`.
 
-use paraviz::prelude::*;
+use ::paraviz::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
