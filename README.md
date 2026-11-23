@@ -12,11 +12,11 @@
 | --- | --- | --- |
 | [`paraviz-core`](crates/paraviz-core) | `vtkCommonDataModel`, `vtkCommonExecutionModel` | Typed multi-component `DataArray`, `FieldData`, `CellType`, `PolyData`, `ImageData`, `RectilinearGrid`, `StructuredGrid`, `UnstructuredGrid`, `MultiBlockDataSet`, `ColorMap` (11 presets + log scale + NaN color), `TransferFunction`, demand-driven `PipelineGraph` with dirty propagation & caching |
 | [`paraviz-sources`](crates/paraviz-sources) | `vtkFiltersSources` | `SphereSource`, `CubeSource`, `ConeSource`, `CylinderSource`, `PlaneSource`, `LineSource`, `ArrowSource`, `DiskSource`, `TorusSource`, `WaveletSource`, `VectorFieldSource`, `SuperquadricSource`, `GyroidSource`, `PointCloudSource` |
-| [`paraviz-filters`](crates/paraviz-filters) | `vtkFiltersCore` / `vtkFiltersGeneral` / `vtkFiltersFlowPaths` | Parallel (`rayon`) `ExtractSurface`, `ContourFilter` (256-case Marching Cubes + Marching Tetrahedra with edge-hashed vertex welding), `SliceFilter`, `ClipFilter`, `ThresholdFilter`, `StreamTracerFilter` (RK4 / RK45), `TubeFilter` (parallel-transport Bishop frames), `GlyphFilter`, `WarpByVectorFilter`, `WarpByScalarFilter`, `GradientFilter` (Gradient / Divergence / Vorticity / Q-Criterion), `CalculatorFilter`, `SmoothFilter` (Laplacian / Taubin), `TransformFilter`, `CellDataToPointDataFilter`, `PointDataToCellDataFilter`, `ProbeOverLineFilter` |
-| [`paraviz-io`](crates/paraviz-io) | `vtkIOXML`, `vtkIOLegacy`, `vtkIOGeometry` | Legacy `.vtk` (ASCII & big-endian binary), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd` — ASCII, base64 binary, appended, and `vtkZLibDataCompressor`), `.stl` (ASCII & binary), `.obj`, `.ply` (ASCII & binary LE/BE), `.csv`/`.tsv`, plus `VtkFileSource` & `PvdSeriesSource` |
-| [`paraviz-render`](crates/paraviz-render) | `vtkRenderingOpenGL2`, `vtkRenderingVolume` | WebGPU (`wgpu`) rendering engine: `Surface`, single-pass barycentric `SurfaceWithEdges`, `Wireframe`, sphere-impostor `Points`, 3D `Volume` raymarching (`R32Float` + IGN ray jittering + central-difference gradient shading), `Outline`, 3D Orientation Axes Gizmo, cached GPU buffers, headless RGBA/PNG export |
-| [`paraviz`](src/lib.rs) | `paraview.simple` | Ergonomic high-level Rust API (`ParaViz`, `DisplayHandle`, `SourceConfig`, `FilterConfig`, `DemoPreset`), JSON state save/load, Rust Trace export |
-| [`paraviz-app`](crates/paraviz-app) | ParaView Desktop & `pvbatch` | Interactive WebGPU GUI (`eframe`/`egui` + `egui-wgpu`) with Pipeline Browser, Properties (with Auto-Apply!), Display/Color Map Editor, Information panel, SpreadSheet view, Live Rust Trace, and headless CLI (`demo`, `render`, `info`, `convert`) |
+| [`paraviz-filters`](crates/paraviz-filters) | `vtkFiltersCore` / `vtkFiltersGeneral` / `vtkFiltersFlowPaths` | Parallel (`rayon`) `ExtractSurface`, `ContourFilter` (256-case Marching Cubes + Marching Tetrahedra with edge-hashed vertex welding), `SliceFilter`, `ClipFilter`, `ThresholdFilter`, `StreamTracerFilter` (RK4 / RK45), `TubeFilter` (parallel-transport Bishop frames), `GlyphFilter`, `WarpByVectorFilter`, `WarpByScalarFilter`, `GradientFilter` (Gradient / Divergence / Vorticity / Q-Criterion), `CalculatorFilter`, `SmoothFilter` (Laplacian / Taubin), `TransformFilter`, `CellDataToPointDataFilter`, `PointDataToCellDataFilter`, `ProbeOverLineFilter`, `FeatureEdgesFilter`, `ConnectivityFilter`, `ShrinkFilter`, `CellCentersFilter`, `ReflectFilter`, `GenerateNormalsFilter`, `ElevationFilter`, `append_datasets`, `compute_histogram` |
+| [`paraviz-io`](crates/paraviz-io) | `vtkIOXML`, `vtkIOLegacy`, `vtkIOGeometry` | Legacy `.vtk` (ASCII & big-endian binary), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd` — ASCII, base64 binary, appended, and `vtkZLibDataCompressor` read/write), partitioned parallel XML readers (`.pvtp`, `.pvti`, `.pvtu`), raw binary 3D volume reader (`read_raw_volume`), `.stl` (ASCII & binary), `.obj`, `.ply` (ASCII & binary LE/BE), `.csv`/`.tsv`, binary glTF 2.0 export (`.glb` with optional scalar `COLOR_0`), plus `VtkFileSource` & `PvdSeriesSource` |
+| [`paraviz-render`](crates/paraviz-render) | `vtkRenderingOpenGL2`, `vtkRenderingVolume` | WebGPU (`wgpu`) rendering engine: 3-point Light Kit, `Surface`, single-pass barycentric `SurfaceWithEdges`, `Wireframe`, sphere-impostor `Points`, 3D `Volume` raymarching (`R32Float` + IGN ray jittering + central-difference gradient shading), `Outline`, 4x MSAA, Eye-Dome Lighting (`EDL`) depth-contrast pass, 3D raycast picking (`pick_scene`), interactive 3D `ViewportWidget` overlays (`Plane`, `Line`, `Box`, `Sphere`), WebGPU Compute Marching Cubes (`GpuContourEngine`), 3D Orientation Axes Gizmo, cached GPU buffers, headless RGBA/PNG export |
+| [`paraviz`](src/lib.rs) | `paraview.simple` | Ergonomic high-level Rust API (`ParaViz`, `DisplayHandle`, `SourceConfig`, `FilterConfig` with 24 filter variants, `DemoPreset`), `gpu_contour`, `pick`, `widgets`, `open_raw_volume`, `export_glb`, JSON state save/load, Rust Trace export |
+| [`paraviz-app`](crates/paraviz-app) | ParaView Desktop & `pvbatch` | Interactive WebGPU GUI (`eframe`/`egui` + `egui-wgpu`) with Pipeline Browser, Properties (with Auto-Apply!), Display/Color Map Editor, MSAA 4x & EDL Strength controls, 3D Picking & 2-Point Distance Ruler, 3D Viewport Widgets, Information panel, SpreadSheet view, interactive XY Chart (`ArcLength`) & Scalar Histogram tab, In-App File Browser, Live Rust Trace, and headless CLI (`demo`, `render` with `--edl`/`--msaa`, `info`, `convert` incl. `.glb`) |
 
 ---
 
@@ -64,7 +64,14 @@ Run the included examples:
 cargo run --example wavelet_contour
 cargo run --example streamlines_and_tubes
 cargo run --example volume_raymarch
+cargo run --release --example benchmark_pipeline
 ```
+
+Sample release benchmark output (`benchmark_pipeline`, 128³ `WaveletSource`, Apple Metal WebGPU):
+- `WaveletSource` 128³ (2,097,152 pts, 2,048,383 cells): `24.01 ms`
+- CPU Parallel Rayon Marching Cubes (138,079 pts, 272,506 tris): `93.34 ms`
+- WebGPU Compute Marching Cubes (`GpuContourEngine`, 138,079 pts, 272,506 tris): `96.69 ms`
+- WebGPU Cached Render (1280x720, 4x MSAA + EDL + SurfaceWithEdges): `6.05 ms`
 
 ---
 
@@ -80,14 +87,14 @@ Headless CLI commands:
 # Render a built-in demo scene headlessly with WebGPU
 cargo run -p paraviz-app -- demo wavelet -o wavelet.png --width 1280 --height 720
 
-# Render any VTK / VTP / VTI / VTU / STL / OBJ / PLY / CSV file headlessly
-cargo run -p paraviz-app -- render mesh.vtu -o out.png --repr edges --cmap viridis --camera iso
+# Render any VTK / VTP / VTI / PVTP / PVTU / VTU / STL / OBJ / PLY / CSV file headlessly
+cargo run -p paraviz-app -- render mesh.vtu -o out.png --repr edges --cmap viridis --camera iso --edl --msaa 4
 
 # Inspect dataset statistics, bounds, and field arrays
 cargo run -p paraviz-app -- info mesh.vtu
 
-# Convert between scientific file formats
-cargo run -p paraviz-app -- convert input.vtk output.vtp
+# Convert between scientific and 3D formats (including binary glTF .glb)
+cargo run -p paraviz-app -- convert input.vtk output.glb
 ```
 
 ---
