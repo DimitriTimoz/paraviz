@@ -1,4 +1,50 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#4f46e5"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">P</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <linearGradient id="topFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="leftFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+    <linearGradient id="rightFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#0369a1"/>
+    </linearGradient>
+    <linearGradient id="sliceGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="55%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#f43f5e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded studio badge -->
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bg)" stroke="#334155" stroke-width="2"/>
+
+  <!-- Isometric scientific cube -->
+  <!-- Top face -->
+  <polygon points="64,22 100,43 64,64 28,43" fill="url(#topFace)" stroke="#e0f2fe" stroke-width="2" stroke-linejoin="round"/>
+  <!-- Left face -->
+  <polygon points="28,43 64,64 64,106 28,85" fill="url(#leftFace)" stroke="#c7d2fe" stroke-width="2" stroke-linejoin="round"/>
+  <!-- Right face -->
+  <polygon points="100,43 100,85 64,106 64,64" fill="url(#rightFace)" stroke="#bae6fd" stroke-width="2" stroke-linejoin="round"/>
+
+  <!-- Diagonal scientific scalar slice plane -->
+  <polygon points="40,36 88,64 88,82 40,54" fill="url(#sliceGrad)" fill-opacity="0.92" stroke="#fffbeb" stroke-width="1.75" stroke-linejoin="round"/>
+
+  <!-- Subtle mesh/contour grid lines on top face -->
+  <line x1="46" y1="32.5" x2="82" y2="53.5" stroke="#ffffff" stroke-opacity="0.4" stroke-width="1.2"/>
+  <line x1="82" y1="32.5" x2="46" y2="53.5" stroke="#ffffff" stroke-opacity="0.4" stroke-width="1.2"/>
+
+  <!-- Vertex nodes -->
+  <circle cx="64" cy="22" r="3" fill="#ffffff"/>
+  <circle cx="100" cy="43" r="3" fill="#e0f2fe"/>
+  <circle cx="28" cy="43" r="3" fill="#e0f2fe"/>
+  <circle cx="64" cy="64" r="3.4" fill="#fef08a"/>
+  <circle cx="64" cy="106" r="3" fill="#bae6fd"/>
 </svg>

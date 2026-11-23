@@ -1,8 +1,18 @@
-<img src="assets/icon.svg" width="64" height="64" alt="ParaViz logo">
+<p align="center">
+  <img src="assets/icon.svg" width="88" height="88" alt="ParaViz logo">
+</p>
 
-# ParaViz
+<h1 align="center">ParaViz</h1>
 
-**A fast, modern scientific visualization studio and headless renderer inspired by Kitware ParaView — built with Rust and WebGPU.**
+<p align="center">
+  <strong>A fast, modern scientific visualization studio and headless renderer inspired by Kitware ParaView — built with Rust and WebGPU.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/DimitriTimoz/paraviz/actions/workflows/ci.yml"><img src="https://github.com/DimitriTimoz/paraviz/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/DimitriTimoz/paraviz/releases"><img src="https://img.shields.io/github/v/release/DimitriTimoz/paraviz?include_prereleases" alt="Release"></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+</p>
 
 Explore 3D meshes, CFD flows, finite-element grids, and medical/volumetric scans in an interactive desktop app, automate batch renders from the command line, or embed pipelines directly in Rust and Python.
 
@@ -161,3 +171,11 @@ cargo doc --workspace --exclude paraviz-app --no-deps --open
 cargo build --release -p paraviz-app
 ./packaging/linux/build-appimage.sh target/release/paraviz x86_64 ParaViz-x86_64.AppImage
 ```
+
+---
+
+## Contributing & License
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
