@@ -423,6 +423,7 @@ pub fn draw_modal(
                                 .desired_width(305.0)
                                 .hint_text("path/to/volume.raw"),
                         );
+                        #[cfg(not(target_arch = "wasm32"))]
                         if ui.button("Browse...").clicked()
                             && let Some(p) = rfd::FileDialog::new()
                                 .set_title("Select Raw 3D Volume")
@@ -1092,6 +1093,7 @@ fn apply_dir_to_modal(modal: &mut AppModal, dir: &Path) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn native_pick_scientific_file(start_dir: Option<&Path>) -> Option<PathBuf> {
     let mut dlg = rfd::FileDialog::new()
         .set_title("Open Scientific Dataset")
@@ -1110,6 +1112,12 @@ pub fn native_pick_scientific_file(start_dir: Option<&Path>) -> Option<PathBuf> 
     dlg.pick_file()
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn native_pick_scientific_file(_start_dir: Option<&Path>) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn native_pick_state_file(start_dir: Option<&Path>) -> Option<PathBuf> {
     let mut dlg = rfd::FileDialog::new()
         .set_title("Load Pipeline State")
@@ -1121,6 +1129,12 @@ pub fn native_pick_state_file(start_dir: Option<&Path>) -> Option<PathBuf> {
     dlg.pick_file()
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn native_pick_state_file(_start_dir: Option<&Path>) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn native_save_file(
     title: &str,
     current_path: &str,
@@ -1139,6 +1153,70 @@ pub fn native_save_file(
     }
     dlg = dlg.add_filter("All Files", &["*"]);
     dlg.save_file()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn native_save_file(
+    _title: &str,
+    _current_path: &str,
+    _filters: &[(&str, &[&str])],
+) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_wasm_open_dialog(
+    queue: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+    json_only: bool,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut dlg = rfd::AsyncFileDialog::new();
+        if json_only {
+            dlg = dlg
+                .set_title("Load Pipeline State")
+                .add_filter("ParaViz State JSON", &["json"]);
+        } else {
+            dlg = dlg.set_title("Open File").add_filter(
+                "ParaViz Files",
+                &[
+                    "json", "vtp", "vtu", "vti", "vtk", "stl", "obj", "ply", "csv",
+                ],
+            );
+        }
+        if let Some(file) = dlg.pick_file().await {
+            let name = file.file_name();
+            let bytes = file.read().await;
+            if let Ok(mut q) = queue.lock() {
+                q.push((name, bytes));
+            }
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn wasm_download_bytes(filename: &str, bytes: &[u8], mime: &str) {
+    use wasm_bindgen::JsCast as _;
+    let Ok(uint8) = js_sys::Uint8Array::from(bytes).dyn_into::<wasm_bindgen::JsValue>() else {
+        return;
+    };
+    let parts = js_sys::Array::of1(&uint8);
+    let bag = web_sys::BlobPropertyBag::new();
+    bag.set_type(mime);
+    let Ok(blob) = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &bag) else {
+        return;
+    };
+    let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+        return;
+    };
+    if let Some(doc) = web_sys::window().and_then(|w| w.document())
+        && let Ok(el) = doc.create_element("a")
+        && let Ok(anchor) = el.dyn_into::<web_sys::HtmlAnchorElement>()
+    {
+        anchor.set_href(&url);
+        anchor.set_download(filename);
+        anchor.click();
+    }
+    let _ = web_sys::Url::revoke_object_url(&url);
 }
 
 fn draw_save_destination_picker(

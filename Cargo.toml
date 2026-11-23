@@ -46,6 +46,7 @@ eframe = { version = "0.37", default-features = false, features = ["default_font
 egui = "0.37"
 egui-wgpu = "0.37"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+web-time = "1.1"
 
 [package]
 name = "paraviz"

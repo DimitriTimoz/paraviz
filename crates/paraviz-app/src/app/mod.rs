@@ -1,10 +1,13 @@
 pub(crate) use crate::charts::{draw_chart_tab, draw_opacity_tf_editor, ChartMode, ChartState};
 pub(crate) use crate::cli::format_memory_bytes;
 pub(crate) use crate::modals::{
-    draw_modal, is_raw_volume_ext, native_pick_scientific_file, native_pick_state_file,
-    native_save_file, AppModal, GifModalState, GpuContourModalState, ModalAction,
-    RawVolumeModalState, ScreenshotModalState,
+    draw_modal, is_raw_volume_ext, native_save_file, AppModal, GifModalState, GpuContourModalState,
+    ModalAction, RawVolumeModalState, ScreenshotModalState,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use crate::modals::{native_pick_scientific_file, native_pick_state_file};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use crate::modals::{spawn_wasm_open_dialog, wasm_download_bytes};
 pub(crate) use crate::theme::{
     apply_theme, node_badge_style, paint_logo_badge, palette, pill_badge, section_card,
     visibility_eye_button, UiTheme, ViewportBgPreset,
@@ -13,7 +16,7 @@ use paraviz::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 mod drawer;
 mod editors;
@@ -149,6 +152,7 @@ pub struct ParaVizApp {
 
     recent_files: Vec<PathBuf>,
     last_export_dir: Option<PathBuf>,
+    pending_file_loads: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
     camera_bookmarks: Vec<CameraBookmark>,
     info_stats_cache: HashMap<(NodeId, String, AttributeAssociation), HistogramResult>,
     volume_tf_hist_cache: HashMap<(NodeId, String, AttributeAssociation, Option<usize>), HistogramResult>,
@@ -227,6 +231,7 @@ impl ParaVizApp {
             last_render_ms: 0.0,
             recent_files: Vec::new(),
             last_export_dir: None,
+            pending_file_loads: Arc::new(std::sync::Mutex::new(Vec::new())),
             camera_bookmarks: Vec::new(),
             info_stats_cache: HashMap::new(),
             volume_tf_hist_cache: HashMap::new(),
@@ -374,6 +379,41 @@ impl ParaVizApp {
             Err(e) => {
                 self.error_message = Some(format!("Failed to load demo: {e}"));
             }
+        }
+    }
+
+    pub(super) fn load_bytes_from_web(&mut self, name: &str, bytes: &[u8]) {
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".json") {
+            match std::str::from_utf8(bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|s| ParaViz::load_state_json(s).map_err(|e| e.to_string()))
+            {
+                Ok(mut pv) => {
+                    let _ = pv.update_visible();
+                    self.selected_node = pv.nodes().last().map(|n| n.id);
+                    self.session = pv;
+                    self.pending_source = None;
+                    self.pending_filter = None;
+                    self.renaming_node = None;
+                    self.last_pick = None;
+                    self.picked_highlight = None;
+                    self.highlight_flash_until = None;
+                    self.ruler_points.clear();
+                    self.clear_stats_caches();
+                    self.playing = false;
+                    self.error_message = None;
+                    self.invalidate_viewport();
+                    self.status_message = format!("Loaded state: {name}");
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Failed to load state {name}: {e}"));
+                }
+            }
+        } else {
+            self.error_message = Some(format!(
+                "Browser build currently loads .json state files and built-in Demos/Sources; use the native desktop app for '{name}'."
+            ));
         }
     }
 
@@ -1091,6 +1131,15 @@ impl ParaVizApp {
     }
 
     fn handle_shortcuts_and_drops(&mut self, ctx: &egui::Context) {
+        let pending: Vec<(String, Vec<u8>)> = self
+            .pending_file_loads
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
+        for (name, bytes) in pending {
+            self.load_bytes_from_web(&name, &bytes);
+        }
+
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files

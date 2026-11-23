@@ -4,9 +4,12 @@ mod cli;
 mod modals;
 mod theme;
 
+#[cfg(not(target_arch = "wasm32"))]
 use cli::{parse_args, run_headless_command, CliCommand};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_app_icon() -> egui::IconData {
     let icon_bytes: &[u8] = include_bytes!("../../../assets/icon.png");
     let decoder = png::Decoder::new(std::io::Cursor::new(icon_bytes));
@@ -21,6 +24,7 @@ fn build_app_icon() -> egui::IconData {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     env_logger::init();
 
@@ -67,4 +71,45 @@ fn main() {
             }
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use wasm_bindgen::JsCast as _;
+
+    console_error_panic_hook::set_once();
+    eframe::WebLogger::init(log::LevelFilter::Info).ok();
+
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("No window")
+            .document()
+            .expect("No document");
+        let canvas = document
+            .get_element_by_id("paraviz_canvas")
+            .expect("Failed to find #paraviz_canvas")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("#paraviz_canvas was not an HtmlCanvasElement");
+
+        let start_result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(app::ParaVizApp::new(cc, None)))),
+            )
+            .await;
+
+        if let Some(loading_text) = document.get_element_by_id("loading_text") {
+            match start_result {
+                Ok(_) => loading_text.remove(),
+                Err(e) => {
+                    loading_text.set_inner_html(&format!(
+                        "<p>ParaViz failed to start (WebGPU/WebGL2 required):</p><pre>{e:?}</pre>"
+                    ));
+                }
+            }
+        }
+    });
 }

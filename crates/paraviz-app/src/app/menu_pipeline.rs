@@ -17,9 +17,12 @@ impl ParaVizApp {
             ui.menu_button("File", |ui| {
                 if ui.button("Open File...").clicked() {
                     ui.close();
+                    #[cfg(not(target_arch = "wasm32"))]
                     if let Some(p) = native_pick_scientific_file(self.last_export_dir.as_deref()) {
                         self.open_picked_scientific_file(p);
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    spawn_wasm_open_dialog(self.pending_file_loads.clone(), false);
                 }
                 if ui.button("Open File by Path...").clicked() {
                     self.modal = Some(AppModal::OpenFile(String::new()));
@@ -50,21 +53,33 @@ impl ParaVizApp {
                 }
                 ui.separator();
                 if ui.button("Save State JSON...").clicked() {
-                    let path = self.default_export_path("paraviz_state.json");
+                    let _path = self.default_export_path("paraviz_state.json");
                     ui.close();
+                    #[cfg(not(target_arch = "wasm32"))]
                     if let Some(p) = native_save_file(
                         "Save Pipeline State",
-                        &path,
+                        &_path,
                         &[("ParaViz State JSON", &["json"])],
                     ) {
                         self.execute_modal_action(ModalAction::SaveState(p));
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    match self.session.save_state_json() {
+                        Ok(json) => {
+                            wasm_download_bytes("paraviz_state.json", json.as_bytes(), "application/json");
+                            self.status_message = "Downloaded paraviz_state.json".into();
+                        }
+                        Err(e) => self.error_message = Some(format!("Serialize failed: {e}")),
+                    }
                 }
                 if ui.button("Load State JSON...").clicked() {
                     ui.close();
+                    #[cfg(not(target_arch = "wasm32"))]
                     if let Some(p) = native_pick_state_file(self.last_export_dir.as_deref()) {
                         self.load_path(&p);
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    spawn_wasm_open_dialog(self.pending_file_loads.clone(), true);
                 }
                 ui.separator();
                 let has_sel = self.selected_node.is_some();
@@ -454,10 +469,13 @@ impl ParaVizApp {
                 }
                 ui.toggle_value(&mut self.zen_mode, "Zen")
                     .on_hover_text("Hide side & bottom panels");
-                if ui.small_button("Open...").on_hover_text("Open File (Native Explorer)").clicked()
-                    && let Some(p) = native_pick_scientific_file(self.last_export_dir.as_deref())
-                {
-                    self.open_picked_scientific_file(p);
+                if ui.small_button("Open...").on_hover_text("Open File (Native Explorer)").clicked() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(p) = native_pick_scientific_file(self.last_export_dir.as_deref()) {
+                        self.open_picked_scientific_file(p);
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    spawn_wasm_open_dialog(self.pending_file_loads.clone(), false);
                 }
             });
         });
