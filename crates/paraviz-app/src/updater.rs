@@ -365,7 +365,10 @@ fn extract_binary_from_zip(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| format!("Invalid zip entry name: {e}"))?
+            .into_owned();
         let file_name = Path::new(&name).file_name().and_then(|s| s.to_str());
         if file_name == Some(bin_name) {
             let mut buf = Vec::new();
