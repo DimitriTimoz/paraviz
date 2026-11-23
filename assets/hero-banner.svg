@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 250" width="960" height="250" role="img" aria-label="ParaViz — Scientific Visualization Studio in Rust and WebGPU">
+  <defs>
+    <linearGradient id="studioBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090e1a"/>
+      <stop offset="55%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#17153b"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="22%" cy="50%" r="48%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.22"/>
+      <stop offset="60%" stop-color="#6366f1" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#090e1a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="warmGlow" cx="84%" cy="30%" r="36%">
+      <stop offset="0%" stop-color="#fb923c" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#090e1a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="topFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="leftFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+    <linearGradient id="rightFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#0369a1"/>
+    </linearGradient>
+    <linearGradient id="sliceGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="55%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#f43f5e"/>
+    </linearGradient>
+    <linearGradient id="streamGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.05"/>
+      <stop offset="50%" stop-color="#22d3ee" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#f43f5e" stop-opacity="0.45"/>
+    </linearGradient>
+    <pattern id="gridPattern" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#94a3b8" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- Outer studio frame (safe on both light and dark themes) -->
+  <rect x="2" y="2" width="956" height="246" rx="22" fill="url(#studioBg)" stroke="#334155" stroke-width="1.5"/>
+  <rect x="2" y="2" width="956" height="246" rx="22" fill="url(#gridPattern)"/>
+  <rect x="2" y="2" width="956" height="246" rx="22" fill="url(#cyanGlow)"/>
+  <rect x="2" y="2" width="956" height="246" rx="22" fill="url(#warmGlow)"/>
+
+  <!-- Subtle scientific streamlines / iso-contours in background -->
+  <path d="M 270 212 C 420 198, 520 226, 700 184 C 810 158, 885 126, 946 102" fill="none" stroke="url(#streamGrad)" stroke-width="1.5"/>
+  <path d="M 255 224 C 440 212, 545 236, 735 196 C 835 174, 900 144, 946 122" fill="none" stroke="#38bdf8" stroke-opacity="0.2" stroke-width="1"/>
+  <path d="M 650 18 C 745 58, 842 46, 946 72" fill="none" stroke="#818cf8" stroke-opacity="0.22" stroke-width="1.2"/>
+
+  <!-- Left: Icon badge + isometric scalar slice motif -->
+  <g transform="translate(56, 45)">
+    <rect x="0" y="0" width="160" height="160" rx="34" fill="#0b1222" stroke="#334155" stroke-width="1.8"/>
+    <g transform="translate(16, 16) scale(1)">
+      <!-- Isometric scientific cube -->
+      <polygon points="64,18 104,41 64,64 24,41" fill="url(#topFace)" stroke="#e0f2fe" stroke-width="2" stroke-linejoin="round"/>
+      <polygon points="24,41 64,64 64,110 24,87" fill="url(#leftFace)" stroke="#c7d2fe" stroke-width="2" stroke-linejoin="round"/>
+      <polygon points="104,41 104,87 64,110 64,64" fill="url(#rightFace)" stroke="#bae6fd" stroke-width="2" stroke-linejoin="round"/>
+      <!-- Diagonal scientific scalar slice plane -->
+      <polygon points="37,33 91,64 91,84 37,53" fill="url(#sliceGrad)" fill-opacity="0.93" stroke="#fffbeb" stroke-width="1.75" stroke-linejoin="round"/>
+      <!-- Barycentric mesh crosshairs -->
+      <line x1="44" y1="29.5" x2="84" y2="52.5" stroke="#ffffff" stroke-opacity="0.45" stroke-width="1.2"/>
+      <line x1="84" y1="29.5" x2="44" y2="52.5" stroke="#ffffff" stroke-opacity="0.45" stroke-width="1.2"/>
+      <!-- Vertex nodes -->
+      <circle cx="64" cy="18" r="3.2" fill="#ffffff"/>
+      <circle cx="104" cy="41" r="3" fill="#e0f2fe"/>
+      <circle cx="24" cy="41" r="3" fill="#e0f2fe"/>
+      <circle cx="64" cy="64" r="3.6" fill="#fef08a"/>
+      <circle cx="64" cy="110" r="3" fill="#bae6fd"/>
+    </g>
+  </g>
+
+  <!-- Center/Right: Wordmark, tagline, and capability pills -->
+  <g transform="translate(256, 68)">
+    <text x="0" y="34" fill="#f8fafc" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="52" font-weight="800" letter-spacing="-0.03em">ParaViz</text>
+    <text x="206" y="34" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="16" font-weight="600">v0.2</text>
+
+    <text x="2" y="68" fill="#cbd5e1" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="18.5" font-weight="500">
+      Scientific visualization studio &amp; headless renderer inspired by ParaView
+    </text>
+    <text x="2" y="94" fill="#94a3b8" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="400">
+      Pure Rust · WebGPU (wgpu) · Desktop, Browser, Headless CLI, Rust &amp; Python APIs
+    </text>
+
+    <!-- Feature pills -->
+    <g transform="translate(0, 118)" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600">
+      <rect x="0" y="0" width="128" height="28" rx="14" fill="#0f2942" stroke="#38bdf8" stroke-opacity="0.45" stroke-width="1"/>
+      <text x="64" y="18.5" text-anchor="middle" fill="#7dd3fc">37+ Parallel Filters</text>
+
+      <rect x="138" y="0" width="144" height="28" rx="14" fill="#1e1b4b" stroke="#818cf8" stroke-opacity="0.45" stroke-width="1"/>
+      <text x="210" y="18.5" text-anchor="middle" fill="#c7d2fe">R32Float Raymarching</text>
+
+      <rect x="292" y="0" width="140" height="28" rx="14" fill="#132a35" stroke="#22d3ee" stroke-opacity="0.45" stroke-width="1"/>
+      <text x="362" y="18.5" text-anchor="middle" fill="#67e8f9">16+ Scientific Formats</text>
+
+      <rect x="442" y="0" width="146" height="28" rx="14" fill="#2c1824" stroke="#fb923c" stroke-opacity="0.45" stroke-width="1"/>
+      <text x="515" y="18.5" text-anchor="middle" fill="#fdba74">PNG · GIF · GLB · HTML</text>
+    </g>
+  </g>
+</svg>
