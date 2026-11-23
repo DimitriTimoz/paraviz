@@ -120,7 +120,7 @@ jobs:
 
   build-macos:
     name: macOS Universal (.app, .dmg & .tar.gz)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
