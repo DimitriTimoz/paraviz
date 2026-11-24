@@ -65,18 +65,18 @@ pub fn palette(theme: UiTheme) -> ThemePalette {
     match theme {
         UiTheme::DarkStudio => ThemePalette {
             accent: egui::Color32::from_rgb(56, 189, 248),
-            accent_dim: egui::Color32::from_rgba_unmultiplied(56, 189, 248, 38),
-            card_bg: egui::Color32::from_rgb(24, 29, 40),
-            card_border: egui::Color32::from_rgb(44, 53, 72),
-            hud_bg: egui::Color32::from_rgba_unmultiplied(13, 17, 25, 205),
-            hud_border: egui::Color32::from_rgba_unmultiplied(92, 118, 160, 100),
+            accent_dim: egui::Color32::from_rgba_unmultiplied(56, 189, 248, 36),
+            card_bg: egui::Color32::from_rgb(27, 30, 37),
+            card_border: egui::Color32::from_rgb(46, 51, 62),
+            hud_bg: egui::Color32::from_rgba_unmultiplied(16, 18, 23, 212),
+            hud_border: egui::Color32::from_rgba_unmultiplied(88, 98, 120, 100),
             success: egui::Color32::from_rgb(74, 222, 128),
             warning: egui::Color32::from_rgb(251, 191, 36),
             danger: egui::Color32::from_rgb(248, 113, 113),
-            muted: egui::Color32::from_rgb(142, 155, 178),
-            plot_bg: egui::Color32::from_rgb(16, 20, 28),
-            plot_grid: egui::Color32::from_rgba_unmultiplied(120, 138, 168, 42),
-            plot_axis: egui::Color32::from_rgb(198, 210, 228),
+            muted: egui::Color32::from_rgb(142, 149, 165),
+            plot_bg: egui::Color32::from_rgb(18, 20, 26),
+            plot_grid: egui::Color32::from_rgba_unmultiplied(120, 130, 150, 38),
+            plot_axis: egui::Color32::from_rgb(198, 205, 218),
         },
         UiTheme::LightStudio => ThemePalette {
             accent: egui::Color32::from_rgb(14, 116, 196),
@@ -99,12 +99,12 @@ pub fn palette(theme: UiTheme) -> ThemePalette {
 /// Applies the ParaViz Studio visual theme and spacing to `ctx`.
 pub fn apply_theme(ctx: &egui::Context, theme: UiTheme) {
     let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(7.0, 5.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.window_margin = egui::Margin::same(12);
-    style.spacing.menu_margin = egui::Margin::same(8);
-    style.spacing.indent = 16.0;
-    style.spacing.slider_width = 135.0;
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    style.spacing.button_padding = egui::vec2(7.0, 3.5);
+    style.spacing.window_margin = egui::Margin::same(10);
+    style.spacing.menu_margin = egui::Margin::same(6);
+    style.spacing.indent = 15.0;
+    style.spacing.slider_width = 132.0;
 
     let mut vis = match theme {
         UiTheme::DarkStudio => egui::Visuals::dark(),
@@ -112,27 +112,27 @@ pub fn apply_theme(ctx: &egui::Context, theme: UiTheme) {
     };
 
     let pal = palette(theme);
-    vis.window_corner_radius = egui::CornerRadius::same(8);
-    vis.menu_corner_radius = egui::CornerRadius::same(6);
+    vis.window_corner_radius = egui::CornerRadius::same(7);
+    vis.menu_corner_radius = egui::CornerRadius::same(5);
     vis.slider_trailing_fill = true;
     vis.striped = true;
     vis.collapsing_header_frame = true;
 
     match theme {
         UiTheme::DarkStudio => {
-            vis.panel_fill = egui::Color32::from_rgb(17, 21, 30);
-            vis.window_fill = egui::Color32::from_rgb(21, 26, 36);
-            vis.extreme_bg_color = egui::Color32::from_rgb(12, 15, 22);
-            vis.faint_bg_color = egui::Color32::from_rgb(24, 30, 42);
-            vis.code_bg_color = egui::Color32::from_rgb(14, 18, 26);
+            vis.panel_fill = egui::Color32::from_rgb(20, 22, 27);
+            vis.window_fill = egui::Color32::from_rgb(24, 27, 33);
+            vis.extreme_bg_color = egui::Color32::from_rgb(14, 16, 20);
+            vis.faint_bg_color = egui::Color32::from_rgb(27, 30, 37);
+            vis.code_bg_color = egui::Color32::from_rgb(16, 18, 23);
             vis.window_stroke = egui::Stroke::new(1.0, pal.card_border);
             vis.hyperlink_color = pal.accent;
             vis.selection = egui::style::Selection {
-                bg_fill: egui::Color32::from_rgba_unmultiplied(56, 189, 248, 55),
+                bg_fill: egui::Color32::from_rgba_unmultiplied(56, 189, 248, 50),
                 stroke: egui::Stroke::new(1.0, pal.accent),
             };
 
-            let r = egui::CornerRadius::same(5);
+            let r = egui::CornerRadius::same(4);
             vis.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 29, 40);
             vis.widgets.noninteractive.weak_bg_fill = egui::Color32::from_rgb(20, 25, 35);
             vis.widgets.noninteractive.bg_stroke =

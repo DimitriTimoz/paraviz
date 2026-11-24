@@ -2,16 +2,9 @@ use super::*;
 
 impl ParaVizApp {
     pub(super) fn draw_menu_bar(&mut self, ui: &mut egui::Ui) {
-        let pal = palette(self.theme);
         egui::MenuBar::new().ui(ui, |ui| {
             paint_logo_badge(ui, self.theme);
             ui.label(egui::RichText::new("ParaViz").strong().size(13.5));
-            pill_badge(
-                ui,
-                "WebGPU",
-                pal.accent_dim,
-                pal.accent,
-            );
             ui.separator();
 
             ui.menu_button("File", |ui| {
@@ -505,206 +498,159 @@ impl ParaVizApp {
 
     pub(super) fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         let pal = palette(self.theme);
+        let _ = pal;
         ui.horizontal_wrapped(|ui| {
             // Undo / Redo + Command Palette + Workspace Profile
-            egui::Frame::new()
-                .fill(pal.card_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo").small())
+                .on_hover_text("Undo (Ctrl/Cmd+Z)")
+                .clicked()
+            {
+                self.undo();
+            }
+            if ui
+                .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo").small())
+                .on_hover_text("Redo (Ctrl/Cmd+Shift+Z)")
+                .clicked()
+            {
+                self.redo();
+            }
+            if ui
+                .small_button("⌘K Search")
+                .on_hover_text("Quick Command & Filter Palette (Ctrl/Cmd+K or Ctrl+Space)")
+                .clicked()
+            {
+                self.command_palette_open = true;
+                self.command_palette_query.clear();
+                self.command_palette_index = 0;
+                self.command_palette_focus_pending = true;
+            }
+            egui::ComboBox::from_id_salt("workspace_profile_combo")
+                .selected_text(format!("Profile: {}", self.workspace_profile.label()))
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    for &prof in WorkspaceProfile::ALL {
                         if ui
-                            .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo").small())
-                            .on_hover_text("Undo (Ctrl/Cmd+Z)")
+                            .selectable_value(&mut self.workspace_profile, prof, prof.label())
                             .clicked()
                         {
-                            self.undo();
+                            self.status_message = format!("Workspace profile: {}", prof.label());
                         }
-                        if ui
-                            .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo").small())
-                            .on_hover_text("Redo (Ctrl/Cmd+Shift+Z)")
-                            .clicked()
-                        {
-                            self.redo();
-                        }
-                        ui.separator();
-                        if ui
-                            .small_button("⌘K Search")
-                            .on_hover_text("Quick Command & Filter Palette (Ctrl/Cmd+K or Ctrl+Space)")
-                            .clicked()
-                        {
-                            self.command_palette_open = true;
-                            self.command_palette_query.clear();
-                            self.command_palette_index = 0;
-                            self.command_palette_focus_pending = true;
-                        }
-                        ui.separator();
-                        egui::ComboBox::from_id_salt("workspace_profile_combo")
-                            .selected_text(format!("Profile: {}", self.workspace_profile.label()))
-                            .width(96.0)
-                            .show_ui(ui, |ui| {
-                                for &prof in WorkspaceProfile::ALL {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.workspace_profile,
-                                            prof,
-                                            prof.label(),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.status_message =
-                                            format!("Workspace profile: {}", prof.label());
-                                    }
-                                }
-                            });
-                    });
+                    }
                 });
+
+            ui.separator();
 
             // Camera group
-            egui::Frame::new()
-                .fill(pal.card_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Reset").on_hover_text("Reset camera (R)").clicked() {
-                            self.reset_active_pane_camera();
-                        }
-                        if ui.small_button("Fit").on_hover_text("Focus selected node (F)").clicked() {
-                            self.focus_selected_node();
-                        }
-                        for (label, preset) in [
-                            ("+X", CameraPreset::PosX),
-                            ("-X", CameraPreset::NegX),
-                            ("+Y", CameraPreset::PosY),
-                            ("-Y", CameraPreset::NegY),
-                            ("+Z", CameraPreset::PosZ),
-                            ("-Z", CameraPreset::NegZ),
-                            ("Iso", CameraPreset::Isometric),
-                        ] {
-                            if ui.small_button(label).clicked() {
-                                self.camera_preset_active(preset);
-                            }
-                        }
-                        if ui
-                            .toggle_value(
-                                &mut self.panes[self.active_pane].camera.orthographic,
-                                "Ortho",
-                            )
-                            .changed()
-                        {
-                            self.sync_camera_from_pane(self.active_pane);
-                            self.invalidate_viewport();
-                        }
-                        ui.toggle_value(&mut self.turntable_enabled, "Spin")
-                            .on_hover_text("Turntable orbit spin (T)");
-                    });
-                });
+            if ui.small_button("Reset").on_hover_text("Reset camera (R)").clicked() {
+                self.reset_active_pane_camera();
+            }
+            if ui.small_button("Fit").on_hover_text("Focus selected node (F)").clicked() {
+                self.focus_selected_node();
+            }
+            for (label, preset) in [
+                ("+X", CameraPreset::PosX),
+                ("-X", CameraPreset::NegX),
+                ("+Y", CameraPreset::PosY),
+                ("-Y", CameraPreset::NegY),
+                ("+Z", CameraPreset::PosZ),
+                ("-Z", CameraPreset::NegZ),
+                ("Iso", CameraPreset::Isometric),
+            ] {
+                if ui.small_button(label).clicked() {
+                    self.camera_preset_active(preset);
+                }
+            }
+            if ui
+                .toggle_value(
+                    &mut self.panes[self.active_pane].camera.orthographic,
+                    "Ortho",
+                )
+                .changed()
+            {
+                self.sync_camera_from_pane(self.active_pane);
+                self.invalidate_viewport();
+            }
+            ui.toggle_value(&mut self.turntable_enabled, "Spin")
+                .on_hover_text("Turntable orbit spin (T)");
+
+            ui.separator();
 
             // Interaction mode group
-            egui::Frame::new()
-                .fill(pal.card_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.viewport_mode, ViewportMode::Orbit, "Orbit")
-                            .on_hover_text("Orbit / Pan / Zoom (1)");
-                        ui.selectable_value(&mut self.viewport_mode, ViewportMode::Pick, "Pick")
-                            .on_hover_text("3D Raycast Pick (2)");
-                        ui.selectable_value(&mut self.viewport_mode, ViewportMode::Ruler, "Ruler")
-                            .on_hover_text("2-Point Distance Ruler (3)");
-                        if !self.ruler_points.is_empty() && ui.small_button("Clear").clicked() {
-                            self.ruler_points.clear();
-                            self.invalidate_viewport();
-                        }
-                    });
-                });
+            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Orbit, "Orbit")
+                .on_hover_text("Orbit / Pan / Zoom (1)");
+            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Pick, "Pick")
+                .on_hover_text("3D Raycast Pick (2)");
+            ui.selectable_value(&mut self.viewport_mode, ViewportMode::Ruler, "Ruler")
+                .on_hover_text("2-Point Distance Ruler (3)");
+            if !self.ruler_points.is_empty() && ui.small_button("Clear").clicked() {
+                self.ruler_points.clear();
+                self.invalidate_viewport();
+            }
+
+            ui.separator();
 
             // Render & overlay toggles
-            egui::Frame::new()
-                .fill(pal.card_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes")
-                            .changed()
-                        {
-                            self.invalidate_viewport();
-                        }
-                        if ui
-                            .toggle_value(&mut self.session.settings.show_bounding_box, "Bounds")
-                            .changed()
-                        {
-                            self.invalidate_viewport();
-                        }
-                        if ui.toggle_value(&mut self.show_widgets, "Widgets").changed() {
-                            self.invalidate_viewport();
-                        }
-                        ui.toggle_value(&mut self.show_scalar_bar, "ColorBar");
-                        if ui
-                            .toggle_value(
-                                &mut self.session.settings.show_time_annotation,
-                                "Time:",
-                            )
-                            .on_hover_text("Toggle Time: annotation badge")
-                            .changed()
-                        {
-                            self.invalidate_viewport();
-                        }
-                        let mut msaa_4x = self.session.settings.msaa_samples >= 4;
-                        if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
-                            self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
-                            self.invalidate_viewport();
-                        }
-                        if ui
-                            .toggle_value(&mut self.session.settings.edl_enabled, "EDL")
-                            .changed()
-                        {
-                            self.invalidate_viewport();
-                        }
-                        if self.session.settings.edl_enabled
-                            && ui
-                                .add(
-                                    egui::Slider::new(
-                                        &mut self.session.settings.edl_strength,
-                                        0.0..=4.0,
-                                    )
-                                    .max_decimals(2)
-                                    .show_value(true),
-                                )
-                                .changed()
-                        {
-                            self.invalidate_viewport();
-                        }
-                    });
-                });
+            if ui
+                .toggle_value(&mut self.session.settings.show_axes_gizmo, "Axes")
+                .changed()
+            {
+                self.invalidate_viewport();
+            }
+            if ui
+                .toggle_value(&mut self.session.settings.show_bounding_box, "Bounds")
+                .changed()
+            {
+                self.invalidate_viewport();
+            }
+            if ui.toggle_value(&mut self.show_widgets, "Widgets").changed() {
+                self.invalidate_viewport();
+            }
+            ui.toggle_value(&mut self.show_scalar_bar, "ColorBar");
+            if ui
+                .toggle_value(
+                    &mut self.session.settings.show_time_annotation,
+                    "Time:",
+                )
+                .on_hover_text("Toggle Time: annotation badge")
+                .changed()
+            {
+                self.invalidate_viewport();
+            }
+            let mut msaa_4x = self.session.settings.msaa_samples >= 4;
+            if ui.toggle_value(&mut msaa_4x, "MSAA 4x").changed() {
+                self.session.settings.msaa_samples = if msaa_4x { 4 } else { 1 };
+                self.invalidate_viewport();
+            }
+            if ui
+                .toggle_value(&mut self.session.settings.edl_enabled, "EDL")
+                .changed()
+            {
+                self.invalidate_viewport();
+            }
+            if self.session.settings.edl_enabled
+                && ui
+                    .add(
+                        egui::Slider::new(&mut self.session.settings.edl_strength, 0.0..=4.0)
+                            .max_decimals(2)
+                            .show_value(true),
+                    )
+                    .changed()
+            {
+                self.invalidate_viewport();
+            }
+
+            ui.separator();
 
             // Panel toggles
-            egui::Frame::new()
-                .fill(pal.card_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(6, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.toggle_value(&mut self.show_left_dock, "Inspector");
-                        ui.toggle_value(&mut self.show_drawer, "Data / Chart");
-                    });
-                });
+            ui.toggle_value(&mut self.show_left_dock, "Inspector");
+            ui.toggle_value(&mut self.show_drawer, "Data / Chart");
+
+            ui.separator();
 
             // Split layout & linked camera controls
             egui::Frame::new()
-                .fill(pal.card_bg)
-                .stroke(egui::Stroke::new(1.0, pal.card_border))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(6, 3))
+                .fill(egui::Color32::TRANSPARENT)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for &layout in ViewportLayout::ALL {
