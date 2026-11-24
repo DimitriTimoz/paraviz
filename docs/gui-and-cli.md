@@ -93,7 +93,7 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 
 ## 4. Headless CLI Reference (`paraviz --help`)
 
-Supported CLI input formats include Legacy VTK (`.vtk`), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvtu`, `.pvti`), ParaView File Series (`.series`), VTKHDF (`.vtkhdf`), CGNS (`.cgns`), Exodus II (`.exo`, `.e`, `.ex2`), YALES2 HDF5 (`.h5`), XDMF (`.xdmf`, `.xmf`), EnSight Gold (`.case`), OpenFOAM (`.foam`), Gmsh (`.msh`), PLOT3D (`.xyz`, `.p3d`), Tecplot ASCII (`.dat`, `.tec`, `.plt`), Abaqus (`.inp`), NetCDF CF (`.nc`, `.cdf`), NIfTI (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), DICOM (`.dcm`), 2D Images (`.png`, `.bmp`, `.ppm`, `.pgm`, `.pbm`), STL/OBJ/PLY/OFF/glTF/GLB/X3D, LAS (`.las`), Molecular (`.xyz`, `.pdb`, `.ent`), and CSV/TSV (plus saved `.json` session state).
+Supported CLI input formats include Legacy VTK (`.vtk`), VTK XML (`.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.pvtp`, `.pvtu`, `.pvti`), ParaView File Series (`.series`), VTKHDF (`.vtkhdf`), CGNS (`.cgns`), Exodus II (`.exo`, `.e`, `.ex2`), Patch HDF5 (`.h5`), XDMF (`.xdmf`, `.xmf`), EnSight Gold (`.case`), OpenFOAM (`.foam`), Gmsh (`.msh`), PLOT3D (`.xyz`, `.p3d`), Tecplot ASCII (`.dat`, `.tec`, `.plt`), Abaqus (`.inp`), NetCDF CF (`.nc`, `.cdf`), NIfTI (`.nii`, `.nii.gz`), NRRD (`.nrrd`, `.nhdr`), MetaImage (`.mhd`, `.mha`), DICOM (`.dcm`), 2D Images (`.png`, `.bmp`, `.ppm`, `.pgm`, `.pbm`), STL/OBJ/PLY/OFF/glTF/GLB/X3D, LAS (`.las`), Molecular (`.xyz`, `.pdb`, `.ent`), and CSV/TSV (plus saved `.json` session state).
 
 ### `demo` — Render a built-in demo scene
 ```bash

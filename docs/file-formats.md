@@ -21,7 +21,7 @@
 | **VTKHDF (HDF5)** | `.vtkhdf` | Yes | — | `read_vtkhdf`, `read_vtkhdf_at_time`, `inspect_vtkhdf_time_steps`: `ImageData`, `PolyData`, `UnstructuredGrid`, `PartitionedDataSet`, `MultiBlockDataSet`, temporal `Steps` |
 | **CGNS (HDF5)** | `.cgns` | Yes | — | `read_cgns`: Multi-base/multi-zone `StructuredGrid`, `UnstructuredGrid`, or `MultiBlockDataSet` with `FlowSolution` arrays |
 | **Exodus II** | `.exo`, `.e`, `.ex2` | Yes | — | `read_exodus`, `read_exodus_at_time`, `inspect_exodus_time_steps`: Both pure-Rust NetCDF Classic (`CDF\x01`/`CDF\x02`) and HDF5 NetCDF-4 element blocks + nodal/element variables + `time_whole` |
-| **YALES2 HDF5** | `.h5`, `.hdf`, `.hdf5` | Yes | — | `read_yales2_hdf5`: Auto-detected `/Patch_*/{XYZ, ELEM2NODE}` groups + node/cell field arrays → `MultiBlockDataSet` |
+| **Patch HDF5** | `.h5`, `.hdf`, `.hdf5` | Yes | — | `read_patch_hdf5`: Auto-detected `/Patch_*/{XYZ, ELEM2NODE}` groups + node/cell field arrays → `MultiBlockDataSet` |
 | **XDMF** | `.xdmf`, `.xmf` | Yes | — | `read_xdmf`, `read_xdmf_at_time`, `inspect_xdmf_time_steps`: XML, Binary, and pure-Rust HDF5 `Format="HDF"`, `Mixed` / Structured / Rectilinear / `ImageData`, `MultiBlock`, temporal collections |
 | **EnSight Gold** | `.case` | Yes | — | `read_ensight_case`: ASCII geometry + node/element variables → `UnstructuredGrid` / `MultiBlockDataSet` |
 | **OpenFOAM** | `.foam`, `controlDict`, case dir | Yes | — | `read_openfoam`: Parses `constant/polyMesh` + latest time fields → `PolyData` / `MultiBlockDataSet` |
@@ -60,7 +60,7 @@ Pass any `DatasetReader` variant to `ParaViz::open_with_reader(path, reader)` or
 | `VtkHdf` | VTKHDF Reader (`.vtkhdf`) | HDF5-backed VTKHDF static & temporal datasets |
 | `Cgns` | CGNS Reader (`.cgns`) | HDF5-backed CFD structured/unstructured zones |
 | `Exodus` | Exodus II Reader (`.exo`, `.e`, `.ex2`) | NetCDF Classic (`CDF\x01`/`\x02`) & HDF5 NetCDF-4 |
-| `Yales2Hdf5` | YALES2 HDF5 Reader (`.h5`) | YALES2 `/Patch_*` HDF5 files |
+| `PatchHdf5` | Patch HDF5 Reader (`.h5`) | `/Patch_*` HDF5 files (`XYZ` + `ELEM2NODE`) |
 | `Xdmf` | XDMF Reader (`.xdmf`, `.xmf`) | XML + Binary/HDF5 grids and temporal collections |
 | `VtkXml` | VTK XML Reader (`.vtp`, `.vtu`, `.vti`, `.vtr`, `.vts`, `.vtm`, `.pvtp`, `.pvti`, `.pvtu`, `.pvd`) | XML VTK datasets |
 | `VtkLegacy` | VTK Legacy Reader (`.vtk`) | ASCII & Big-Endian binary `.vtk` |

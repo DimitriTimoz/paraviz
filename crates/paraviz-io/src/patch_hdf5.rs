@@ -1,4 +1,4 @@
-//! YALES2 / Patch-based HDF5 (`.h5`) reader.
+//! Patch-based CFD HDF5 (`.h5`) reader.
 //!
 //! Reads HDF5 files structured with `/Patch_*` groups containing `XYZ` (points) and
 //! `ELEM2NODE` (XDMF-style mixed element connectivity) plus node-centered (`NNODE`)
@@ -10,8 +10,8 @@ use hdf5_reader::Hdf5File;
 use paraviz_core::{CellType, DataSet, MultiBlockDataSet, UnstructuredGrid};
 use std::path::Path;
 
-/// Returns `true` if `file` has a YALES2-style `/Patch_*` group containing `XYZ` and `ELEM2NODE`.
-pub fn is_yales2_hdf5(file: &Hdf5File) -> bool {
+/// Returns `true` if `file` has a `/Patch_*` group containing `XYZ` and `ELEM2NODE`.
+pub fn is_patch_hdf5(file: &Hdf5File) -> bool {
     let Ok(root) = file.root_group() else {
         return false;
     };
@@ -26,8 +26,8 @@ pub fn is_yales2_hdf5(file: &Hdf5File) -> bool {
     false
 }
 
-/// Reads a YALES2 patch-based `.h5` file into a [`DataSet`].
-pub fn read_yales2_hdf5(path: impl AsRef<Path>) -> Result<DataSet> {
+/// Reads a patch-based `.h5` file into a [`DataSet`].
+pub fn read_patch_hdf5(path: impl AsRef<Path>) -> Result<DataSet> {
     let file = open_hdf5(path.as_ref())?;
     let root = file
         .root_group()
@@ -48,7 +48,7 @@ pub fn read_yales2_hdf5(path: impl AsRef<Path>) -> Result<DataSet> {
         let xyz = read_dataset_f32(&xyz_ds, None)?;
         if xyz.len() % 3 != 0 {
             return Err(IoError::InvalidData(format!(
-                "YALES2 group '{gname}/XYZ' length {} is not divisible by 3",
+                "Patch HDF5 group '{gname}/XYZ' length {} is not divisible by 3",
                 xyz.len()
             )));
         }
@@ -96,7 +96,7 @@ pub fn read_yales2_hdf5(path: impl AsRef<Path>) -> Result<DataSet> {
 
     if blocks.is_empty() {
         return Err(IoError::UnsupportedFormat(
-            "HDF5 file contains no YALES2 Patch groups with XYZ and ELEM2NODE".into(),
+            "HDF5 file contains no Patch groups with XYZ and ELEM2NODE".into(),
         ));
     }
     if blocks.len() == 1 {
@@ -133,13 +133,13 @@ fn decode_xdmf_mixed_into_grid(
             9 => (CellType::Hexahedron, 8usize),
             _ => {
                 return Err(IoError::UnsupportedFormat(format!(
-                    "Unsupported XDMF/YALES2 element type code {code}"
+                    "Unsupported XDMF/Patch element type code {code}"
                 )));
             }
         };
         if i + count > raw.len() {
             return Err(IoError::Parse(
-                "Truncated ELEM2NODE connectivity in YALES2 HDF5".into(),
+                "Truncated ELEM2NODE connectivity in Patch HDF5".into(),
             ));
         }
         for &v in &raw[i..i + count] {

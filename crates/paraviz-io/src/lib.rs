@@ -35,6 +35,7 @@ pub mod netcdf_cf;
 pub mod nifti;
 pub mod off;
 pub mod openfoam;
+pub mod patch_hdf5;
 pub mod plot3d;
 pub mod raw_volume;
 pub mod series;
@@ -44,7 +45,6 @@ pub mod vtk_xml;
 pub mod vtkhdf;
 pub mod x3d;
 pub mod xdmf;
-pub mod yales2_hdf5;
 
 pub use abaqus::read_abaqus;
 pub use cgns::read_cgns;
@@ -80,7 +80,7 @@ pub use vtk_xml::{read_pvd_series, write_pvd_series, VtkXmlFormat};
 pub use vtkhdf::{inspect_vtkhdf_time_steps, read_vtkhdf, read_vtkhdf_at_time};
 pub use x3d::read_x3d;
 pub use xdmf::{inspect_xdmf_time_steps, read_xdmf, read_xdmf_at_time};
-pub use yales2_hdf5::read_yales2_hdf5;
+pub use patch_hdf5::read_patch_hdf5;
 
 use paraviz_core::{DataSet, PipelineError, PipelineInfo, Source};
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ pub enum DatasetReader {
     VtkHdf,
     Cgns,
     Exodus,
-    Yales2Hdf5,
+    PatchHdf5,
     Xdmf,
     VtkXml,
     VtkLegacy,
@@ -132,7 +132,7 @@ impl DatasetReader {
         Self::VtkHdf,
         Self::Cgns,
         Self::Exodus,
-        Self::Yales2Hdf5,
+        Self::PatchHdf5,
         Self::Xdmf,
         Self::VtkXml,
         Self::VtkLegacy,
@@ -168,7 +168,7 @@ impl DatasetReader {
             Self::VtkHdf => "VTKHDF Reader (.vtkhdf)",
             Self::Cgns => "CGNS Reader (.cgns)",
             Self::Exodus => "Exodus II Reader (.exo, .e, .ex2)",
-            Self::Yales2Hdf5 => "YALES2 HDF5 Reader (.h5)",
+            Self::PatchHdf5 => "Patch HDF5 Reader (.h5)",
             Self::Xdmf => "XDMF Reader (.xdmf, .xmf)",
             Self::VtkXml => "VTK XML Reader (.vtp, .vtu, .vti, .vtr, .vts, .vtm)",
             Self::VtkLegacy => "VTK Legacy Reader (.vtk)",
@@ -205,7 +205,7 @@ impl DatasetReader {
             Self::VtkHdf => "VTKHDF Reader",
             Self::Cgns => "CGNS Reader",
             Self::Exodus => "Exodus II Reader",
-            Self::Yales2Hdf5 => "YALES2 HDF5 Reader",
+            Self::PatchHdf5 => "Patch HDF5 Reader",
             Self::Xdmf => "XDMF Reader",
             Self::VtkXml => "VTK XML Reader",
             Self::VtkLegacy => "VTK Legacy Reader",
@@ -242,7 +242,7 @@ impl DatasetReader {
             "vtkhdf" | "vtk-hdf" | "vtk_hdf" => Some(Self::VtkHdf),
             "cgns" => Some(Self::Cgns),
             "exodus" | "exodus2" | "exodusii" | "exo" | "ex2" | "e" => Some(Self::Exodus),
-            "yales2" | "yales2-hdf5" => Some(Self::Yales2Hdf5),
+            "patch" | "patch-hdf5" => Some(Self::PatchHdf5),
             "xdmf" | "xmf" => Some(Self::Xdmf),
             "vtkxml" | "vtk-xml" | "vtk_xml" | "vtp" | "vtu" | "vti" | "vtr" | "vts" | "vtm" => {
                 Some(Self::VtkXml)
@@ -399,12 +399,12 @@ fn detect_hdf5_reader(path: &Path) -> Result<DatasetReader> {
     if exodus::is_exodus_hdf5(&file) {
         return Ok(DatasetReader::Exodus);
     }
-    if yales2_hdf5::is_yales2_hdf5(&file) {
-        return Ok(DatasetReader::Yales2Hdf5);
+    if patch_hdf5::is_patch_hdf5(&file) {
+        return Ok(DatasetReader::PatchHdf5);
     }
 
     Err(IoError::UnsupportedFormat(format!(
-        "HDF5 file '{}' does not match VTKHDF, CGNS, Exodus II, or YALES2 layout",
+        "HDF5 file '{}' does not match VTKHDF, CGNS, Exodus II, or Patch HDF5 layout",
         path.display()
     )))
 }
@@ -429,7 +429,7 @@ pub fn read_dataset_with_reader(
             DatasetReader::VtkHdf => vtkhdf::read_vtkhdf(path),
             DatasetReader::Cgns => cgns::read_cgns(path),
             DatasetReader::Exodus => exodus::read_exodus(path),
-            DatasetReader::Yales2Hdf5 => yales2_hdf5::read_yales2_hdf5(path),
+            DatasetReader::PatchHdf5 => patch_hdf5::read_patch_hdf5(path),
             DatasetReader::Xdmf => xdmf::read_xdmf(path),
             DatasetReader::VtkXml => vtk_xml::read_vtk_xml(path),
             DatasetReader::VtkLegacy => vtk_legacy::read_vtk_legacy(path),

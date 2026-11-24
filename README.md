@@ -53,7 +53,7 @@ Grab a standalone binary from [**GitHub Releases**](https://github.com/DimitriTi
 
 ## Built for Your Workflow
 
-- **CFD & Aerodynamics**: Inspect OpenFOAM, CGNS, EnSight, PLOT3D, Tecplot, XDMF, and YALES2 simulations with interactive slices, clips (`Min/Max` or `Center/Size`), streamlines, vorticity/Q-criterion, and line probes.
+- **CFD & Aerodynamics**: Inspect OpenFOAM, CGNS, EnSight, PLOT3D, Tecplot, XDMF, and Patch HDF5 simulations with interactive slices, clips (`Min/Max` or `Center/Size`), streamlines, vorticity/Q-criterion, and line probes.
 - **FEA & Structural Analysis**: Load Exodus II, Abaqus (`.inp`), Gmsh (`.msh`), and VTK meshes with crisp edge rendering, displacement warping, and multi-block patch inspection.
 - **Medical & Volumetric Imaging**: Explore NIfTI, NRRD, MetaImage, DICOM, and raw 3D volumes with real-time 3D raymarching, interactive opacity curves, and live volume clip planes.
 - **3D Meshes, LiDAR & Molecules**: Open STL, OBJ, PLY, OFF, glTF/GLB, X3D, LAS point clouds, and multi-frame XYZ/PDB molecular trajectories.
@@ -90,7 +90,7 @@ ParaViz rethinks the everyday scientific visualization experience from the groun
 ## Supported Formats
 
 - **VTK & Time Series**: `.vtk`, `.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvtp`/`.pvti`/`.pvtu`/`.pvtr`/`.pvts`, `.pvd`, `.series`, `.vtkhdf`
-- **CFD / FEA / Climate**: `.cgns`, `.exo`/`.e`/`.ex2` (Exodus II), `.h5` (YALES2 / VTKHDF / CGNS / Exodus), `.xdmf`/`.xmf`, `.case` (EnSight), `.foam` / `polyMesh` (OpenFOAM), `.msh` (Gmsh), `.xyz`/`.p3d`/`.q` (PLOT3D), `.dat`/`.tec`/`.plt` (Tecplot), `.inp` (Abaqus), `.nc`/`.cdf` (NetCDF CF)
+- **CFD / FEA / Climate**: `.cgns`, `.exo`/`.e`/`.ex2` (Exodus II), `.h5` (Patch HDF5 / VTKHDF / CGNS / Exodus), `.xdmf`/`.xmf`, `.case` (EnSight), `.foam` / `polyMesh` (OpenFOAM), `.msh` (Gmsh), `.xyz`/`.p3d`/`.q` (PLOT3D), `.dat`/`.tec`/`.plt` (Tecplot), `.inp` (Abaqus), `.nc`/`.cdf` (NetCDF CF)
 - **3D Meshes & Point Clouds**: `.stl`, `.obj`, `.ply`, `.off`, `.gltf`/`.glb`, `.x3d`, `.las`, `.csv`/`.tsv`
 - **Medical, Images & Molecular**: `.nii`/`.nii.gz` (NIfTI), `.nrrd`/`.nhdr`, `.mhd`/`.mha`, `.dcm` (DICOM), `.raw`/`.bin`/`.vol`, `.png`, `.bmp`, `.ppm`/`.pgm`/`.pbm`, `.xyz`/`.pdb`/`.ent`
 

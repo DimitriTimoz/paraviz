@@ -2764,9 +2764,9 @@ fn netcdf3_cf_rectilinear_and_temporal() {
 }
 
 #[test]
-fn yales2_hdf5_patch_layout() {
+fn patch_hdf5_layout() {
     use paraviz_io::{read_dataset_with_reader, DatasetReader};
-    let dir = TestDir::new("yales2");
+    let dir = TestDir::new("patch_hdf5");
     let mut b = Hdf5Builder::new();
     let xyz = b.add_dataset(
         &Hdf5Builder::dtype_f32(),
@@ -2793,7 +2793,7 @@ fn yales2_hdf5_patch_layout() {
     let p = dir.file("pipe.solutbound.h5");
     fs::write(&p, &bytes).unwrap();
     let (ds, reader) = read_dataset_with_reader(&p, DatasetReader::Auto).unwrap();
-    assert_eq!(reader, DatasetReader::Yales2Hdf5);
+    assert_eq!(reader, DatasetReader::PatchHdf5);
     let ug = ds.as_unstructured_grid().unwrap();
     assert_eq!(ug.points.len(), 3);
     assert_eq!(ug.cell_types, vec![CellType::Triangle]);
