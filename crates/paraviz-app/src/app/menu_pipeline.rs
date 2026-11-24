@@ -648,40 +648,33 @@ impl ParaVizApp {
 
             ui.separator();
 
-            // Split layout & linked camera controls
-            egui::Frame::new()
-                .fill(egui::Color32::TRANSPARENT)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for &layout in ViewportLayout::ALL {
-                            if ui
-                                .selectable_label(self.viewport_layout == layout, layout.label())
-                                .on_hover_text(layout.menu_label())
-                                .clicked()
-                            {
-                                set_viewport_layout(
-                                    &mut self.viewport_layout,
-                                    &mut self.active_pane,
-                                    layout,
-                                );
-                                self.invalidate_viewport();
-                            }
-                        }
-                        ui.separator();
-                        if ui
-                            .toggle_value(&mut self.link_cameras, "Link Cameras")
-                            .on_hover_text("Sync camera navigation across all 3D panes")
-                            .changed()
-                            && self.link_cameras
-                        {
-                            self.sync_camera_from_pane(self.active_pane);
-                            self.invalidate_viewport();
-                        }
-                    });
-                });
+            // Split layout & linked camera controls (directly inside horizontal_wrapped so narrow viewports wrap cleanly)
+            for &layout in ViewportLayout::ALL {
+                if ui
+                    .selectable_label(self.viewport_layout == layout, layout.label())
+                    .on_hover_text(layout.menu_label())
+                    .clicked()
+                {
+                    set_viewport_layout(&mut self.viewport_layout, &mut self.active_pane, layout);
+                    self.invalidate_viewport();
+                }
+            }
+            ui.separator();
+            if ui
+                .toggle_value(&mut self.link_cameras, "Link Cameras")
+                .on_hover_text("Sync camera navigation across all 3D panes")
+                .changed()
+                && self.link_cameras
+            {
+                self.sync_camera_from_pane(self.active_pane);
+                self.invalidate_viewport();
+            }
 
             // Time steps transport
             let steps = self.session.all_time_steps();
+            if !steps.is_empty() && ui.available_width() < 360.0 {
+                ui.end_row();
+            }
             if !steps.is_empty() {
                 egui::Frame::new()
                     .fill(pal.card_bg)
