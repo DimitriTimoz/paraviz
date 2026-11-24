@@ -299,7 +299,7 @@ fn decode_typed_payload(
             }
             Ok(ArrayData::I16(
                 payload[..count * 2]
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| {
                         if little_endian {
                             i16::from_le_bytes([c[0], c[1]])
@@ -316,7 +316,7 @@ fn decode_typed_payload(
             }
             Ok(ArrayData::U16(
                 payload[..count * 2]
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| {
                         if little_endian {
                             u16::from_le_bytes([c[0], c[1]])
@@ -333,7 +333,7 @@ fn decode_typed_payload(
             }
             Ok(ArrayData::I32(
                 payload[..count * 4]
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|c| {
                         if little_endian {
                             i32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -350,7 +350,7 @@ fn decode_typed_payload(
             }
             Ok(ArrayData::F32(
                 payload[..count * 4]
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|c| {
                         if little_endian {
                             f32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -367,7 +367,7 @@ fn decode_typed_payload(
             }
             Ok(ArrayData::F64(
                 payload[..count * 8]
-                    .chunks_exact(8)
+                    .as_chunks::<8>().0.iter()
                     .map(|c| {
                         if little_endian {
                             f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])

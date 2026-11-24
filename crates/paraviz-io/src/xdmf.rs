@@ -551,7 +551,7 @@ fn parse_grid_node(
                 }
             } else {
                 // Unknown topology name: if raw_topo is present, try Triangle (3)
-                for chunk in raw_topo.chunks_exact(3) {
+                for chunk in raw_topo.as_chunks::<3>().0 {
                     validate_cell(chunk)?;
                     grid.push_cell(CellType::Triangle, chunk);
                 }
@@ -688,7 +688,7 @@ fn parse_geometry_points(
 
     if geom_type.eq_ignore_ascii_case("XY") {
         let (vals, _) = read_data_item_f64(items[0], ctx)?;
-        return Ok(vals.chunks_exact(2).map(|c| [c[0] as f32, c[1] as f32, 0.0]).collect());
+        return Ok(vals.as_chunks::<2>().0.iter().map(|c| [c[0] as f32, c[1] as f32, 0.0]).collect());
     }
 
     // Default: XYZ (or X_Y_Z if 3 DataItems were provided even without GeometryType="X_Y_Z")
@@ -702,7 +702,7 @@ fn parse_geometry_points(
 
     let (vals, _) = read_data_item_f64(items[0], ctx)?;
     Ok(vals
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
         .collect())
 }
@@ -1060,28 +1060,28 @@ fn read_data_item_u32(node: &XmlNode, ctx: &XdmfContext<'_>) -> Result<(Vec<u32>
 fn decode_binary_f64(bytes: &[u8], kind: NumKind, prec: usize, be: bool) -> Vec<f64> {
     match (kind, prec) {
         (NumKind::Float, 8) => bytes
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
                 if be { f64::from_be_bytes(a) } else { f64::from_le_bytes(a) }
             })
             .collect(),
         (NumKind::Float, _) => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3]];
                 (if be { f32::from_be_bytes(a) } else { f32::from_le_bytes(a) }) as f64
             })
             .collect(),
         (NumKind::Int, 8) => bytes
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
                 (if be { i64::from_be_bytes(a) } else { i64::from_le_bytes(a) }) as f64
             })
             .collect(),
         (NumKind::Int, 2) => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1]];
                 (if be { i16::from_be_bytes(a) } else { i16::from_le_bytes(a) }) as f64
@@ -1089,21 +1089,21 @@ fn decode_binary_f64(bytes: &[u8], kind: NumKind, prec: usize, be: bool) -> Vec<
             .collect(),
         (NumKind::Int, 1) => bytes.iter().map(|&b| (b as i8) as f64).collect(),
         (NumKind::Int, _) => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3]];
                 (if be { i32::from_be_bytes(a) } else { i32::from_le_bytes(a) }) as f64
             })
             .collect(),
         (NumKind::UInt, 8) => bytes
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
                 (if be { u64::from_be_bytes(a) } else { u64::from_le_bytes(a) }) as f64
             })
             .collect(),
         (NumKind::UInt, 2) => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1]];
                 (if be { u16::from_be_bytes(a) } else { u16::from_le_bytes(a) }) as f64
@@ -1111,7 +1111,7 @@ fn decode_binary_f64(bytes: &[u8], kind: NumKind, prec: usize, be: bool) -> Vec<
             .collect(),
         (NumKind::UInt, 1) => bytes.iter().map(|&b| b as f64).collect(),
         (NumKind::UInt, _) => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3]];
                 (if be { u32::from_be_bytes(a) } else { u32::from_le_bytes(a) }) as f64
@@ -1123,14 +1123,14 @@ fn decode_binary_f64(bytes: &[u8], kind: NumKind, prec: usize, be: bool) -> Vec<
 fn decode_binary_u32(bytes: &[u8], kind: NumKind, prec: usize, be: bool) -> Vec<u32> {
     match (kind, prec) {
         (NumKind::Int, 8) | (NumKind::UInt, 8) => bytes
-            .chunks_exact(8)
+            .as_chunks::<8>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
                 (if be { u64::from_be_bytes(a) } else { u64::from_le_bytes(a) }) as u32
             })
             .collect(),
         (NumKind::Int, 2) | (NumKind::UInt, 2) => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1]];
                 (if be { u16::from_be_bytes(a) } else { u16::from_le_bytes(a) }) as u32
@@ -1138,7 +1138,7 @@ fn decode_binary_u32(bytes: &[u8], kind: NumKind, prec: usize, be: bool) -> Vec<
             .collect(),
         (NumKind::Int, 1) | (NumKind::UInt, 1) => bytes.iter().map(|&b| b as u32).collect(),
         _ => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| {
                 let a = [c[0], c[1], c[2], c[3]];
                 if be { u32::from_be_bytes(a) } else { u32::from_le_bytes(a) }

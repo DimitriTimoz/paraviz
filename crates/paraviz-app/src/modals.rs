@@ -1074,15 +1074,14 @@ pub fn draw_modal(
                                 });
                         });
                         let trimmed = path.trim();
-                        if !trimmed.is_empty() && *reader == paraviz::io::DatasetReader::Auto {
-                            if let Ok(detected) = paraviz::io::detect_reader(trimmed) {
+                        if !trimmed.is_empty() && *reader == paraviz::io::DatasetReader::Auto
+                            && let Ok(detected) = paraviz::io::detect_reader(trimmed) {
                                 ui.label(
                                     egui::RichText::new(format!("Detected: {}", detected.short_name()))
                                         .small()
                                         .weak(),
                                 );
                             }
-                        }
                     }
                     ui.separator();
                     ui.horizontal(|ui| {

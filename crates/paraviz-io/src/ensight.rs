@@ -64,12 +64,11 @@ pub fn read_ensight_case(path: impl AsRef<Path>) -> Result<DataSet> {
         let var_path = crate::limits::resolve_safe_path(base_dir, &var_file)?;
         if let Ok(part_vals) = read_ensight_ascii_var(&var_path, 1) {
             for (idx, (_, grid)) in parts.iter_mut().enumerate() {
-                if let Some(vals) = part_vals.get(idx) {
-                    if vals.len() == grid.points.len() {
+                if let Some(vals) = part_vals.get(idx)
+                    && vals.len() == grid.points.len() {
                         grid.point_data
                             .add_array(DataArray::scalars_f32(&var_name, vals.clone()));
                     }
-                }
             }
         }
     }
@@ -96,12 +95,11 @@ pub fn read_ensight_case(path: impl AsRef<Path>) -> Result<DataSet> {
         let var_path = crate::limits::resolve_safe_path(base_dir, &var_file)?;
         if let Ok(part_vals) = read_ensight_ascii_var(&var_path, 1) {
             for (idx, (_, grid)) in parts.iter_mut().enumerate() {
-                if let Some(vals) = part_vals.get(idx) {
-                    if vals.len() == grid.num_cells() {
+                if let Some(vals) = part_vals.get(idx)
+                    && vals.len() == grid.num_cells() {
                         grid.cell_data
                             .add_array(DataArray::scalars_f32(&var_name, vals.clone()));
                     }
-                }
             }
         }
     }

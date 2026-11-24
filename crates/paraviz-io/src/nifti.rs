@@ -130,7 +130,7 @@ pub fn read_nifti_bytes(bytes: &[u8]) -> Result<ImageData> {
                 return Err(IoError::InvalidData("Truncated NIfTI int16 payload".into()));
             }
             let vals: Vec<i16> = payload[..count * 2]
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|c| {
                     if little_endian {
                         i16::from_le_bytes([c[0], c[1]])
@@ -155,7 +155,7 @@ pub fn read_nifti_bytes(bytes: &[u8]) -> Result<ImageData> {
                 return Err(IoError::InvalidData("Truncated NIfTI uint16 payload".into()));
             }
             let vals: Vec<u16> = payload[..count * 2]
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|c| {
                     if little_endian {
                         u16::from_le_bytes([c[0], c[1]])
@@ -180,7 +180,7 @@ pub fn read_nifti_bytes(bytes: &[u8]) -> Result<ImageData> {
                 return Err(IoError::InvalidData("Truncated NIfTI int32 payload".into()));
             }
             let vals: Vec<i32> = payload[..count * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|c| {
                     if little_endian {
                         i32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -197,7 +197,7 @@ pub fn read_nifti_bytes(bytes: &[u8]) -> Result<ImageData> {
                 return Err(IoError::InvalidData("Truncated NIfTI float32 payload".into()));
             }
             let vals: Vec<f32> = payload[..count * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|c| {
                     let v = if little_endian {
                         f32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -219,7 +219,7 @@ pub fn read_nifti_bytes(bytes: &[u8]) -> Result<ImageData> {
                 return Err(IoError::InvalidData("Truncated NIfTI float64 payload".into()));
             }
             let vals: Vec<f64> = payload[..count * 8]
-                .chunks_exact(8)
+                .as_chunks::<8>().0.iter()
                 .map(|c| {
                     if little_endian {
                         f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])

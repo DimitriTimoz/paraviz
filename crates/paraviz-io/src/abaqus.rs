@@ -41,9 +41,7 @@ pub fn read_abaqus_str(text: &str) -> Result<DataSet> {
         }
         if line.starts_with('*') {
             let upper = line.to_ascii_uppercase();
-            if upper.starts_with("*NODE") && !upper.starts_with("*NODE ") || upper == "*NODE" {
-                section = AbaqusSection::Node;
-            } else if upper.starts_with("*NODE,") {
+            if upper == "*NODE" || upper.starts_with("*NODE,") {
                 section = AbaqusSection::Node;
             } else if upper.starts_with("*ELEMENT") {
                 let etype = extract_param(&upper, "TYPE").unwrap_or("");
@@ -90,12 +88,11 @@ pub fn read_abaqus_str(text: &str) -> Result<DataSet> {
                 let mut conn = Vec::with_capacity(parts.len() - 1);
                 let mut ok = true;
                 for tok in &parts[1..] {
-                    if let Ok(nid) = tok.parse::<u64>() {
-                        if let Some(&idx) = node_map.get(&nid) {
+                    if let Ok(nid) = tok.parse::<u64>()
+                        && let Some(&idx) = node_map.get(&nid) {
                             conn.push(idx);
                             continue;
                         }
-                    }
                     ok = false;
                     break;
                 }
@@ -107,13 +104,11 @@ pub fn read_abaqus_str(text: &str) -> Result<DataSet> {
             }
             AbaqusSection::Elset(set_id) => {
                 for tok in line.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    if let Ok(eid) = tok.parse::<u64>() {
-                        if let Some(&cidx) = elem_map.get(&eid) {
-                            if cidx < elset_ids.len() {
+                    if let Ok(eid) = tok.parse::<u64>()
+                        && let Some(&cidx) = elem_map.get(&eid)
+                            && cidx < elset_ids.len() {
                                 elset_ids[cidx] = set_id;
                             }
-                        }
-                    }
                 }
             }
             AbaqusSection::None => {}

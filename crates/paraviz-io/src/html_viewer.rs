@@ -296,7 +296,7 @@ fn compute_vertex_normals(poly: &PolyData, indices: &[u32]) -> Vec<f32> {
     }
 
     let mut acc = vec![Vec3::ZERO; poly.num_points()];
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
         if a < poly.points.len() && b < poly.points.len() && c < poly.points.len() {
             let pa = Vec3::from_array(poly.points[a]);

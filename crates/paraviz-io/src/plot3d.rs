@@ -26,11 +26,10 @@ pub fn read_plot3d(path: impl AsRef<Path>) -> Result<DataSet> {
 
     // Look for companion `.q` solution file with same stem
     let q_path = path.with_extension("q");
-    if q_path.is_file() && q_path != path {
-        if let Ok(q_bytes) = fs::read(&q_path) {
+    if q_path.is_file() && q_path != path
+        && let Ok(q_bytes) = fs::read(&q_path) {
             let _ = attach_plot3d_q(&mut grids, &q_bytes);
         }
-    }
 
     if grids.len() == 1 {
         Ok(DataSet::StructuredGrid(grids.into_iter().next().unwrap()))
@@ -72,7 +71,7 @@ fn parse_plot3d_xyz_ascii(text: &str) -> Result<Vec<StructuredGrid>> {
     let all_rest: Vec<&str> = tokens.collect();
 
     // Heuristic: single-grid starts with `ni nj nk`, multi-grid starts with `ngrid` followed by `ni nj nk` per block
-    let (dims_list, coord_start) = if first >= 1 && first <= 1024 && all_rest.len() > first * 3 {
+    let (dims_list, coord_start) = if (1..=1024).contains(&first) && all_rest.len() > first * 3 {
         // Check if `first` is `ngrid`: `second, third, all_rest[0]` would be `ni, nj, nk` of grid 0
         let total_if_single = first * second * third;
         if all_rest.len() == total_if_single * 3 || all_rest.len() == total_if_single * 4 {

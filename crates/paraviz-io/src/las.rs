@@ -103,8 +103,8 @@ pub fn read_las_bytes(bytes: &[u8]) -> Result<DataSet> {
         };
         classification.push(cls);
 
-        if let Some(ro) = rgb_offset {
-            if ro + 6 <= rec.len() {
+        if let Some(ro) = rgb_offset
+            && ro + 6 <= rec.len() {
                 let r16 = u16::from_le_bytes(rec[ro..ro + 2].try_into().unwrap());
                 let g16 = u16::from_le_bytes(rec[ro + 2..ro + 4].try_into().unwrap());
                 let b16 = u16::from_le_bytes(rec[ro + 4..ro + 6].try_into().unwrap());
@@ -114,7 +114,6 @@ pub fn read_las_bytes(bytes: &[u8]) -> Result<DataSet> {
                 colors.push((b16 >> 8) as u8);
                 colors.push(255u8);
             }
-        }
     }
 
     let mut poly = PolyData::new();

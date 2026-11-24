@@ -149,27 +149,8 @@ fn parse_zone(
     let z_idx = find_var_idx(variables, &["Z"]);
 
     if let (Some(nodes), Some(elems)) = (n_nodes, n_elems) {
-        let mut cols = vec![vec![0.0f32; nodes]; n_vars];
         let mut pos = 0usize;
-        if is_block {
-            for v in 0..n_vars {
-                for i in 0..nodes {
-                    if pos < tokens.len() {
-                        cols[v][i] = tokens[pos].parse().unwrap_or(0.0);
-                        pos += 1;
-                    }
-                }
-            }
-        } else {
-            for i in 0..nodes {
-                for v in 0..n_vars {
-                    if pos < tokens.len() {
-                        cols[v][i] = tokens[pos].parse().unwrap_or(0.0);
-                        pos += 1;
-                    }
-                }
-            }
-        }
+        let mut cols = parse_tecplot_columns(tokens, &mut pos, n_vars, nodes, is_block);
 
         let points: Vec<[f32; 3]> = (0..nodes)
             .map(|i| {
@@ -220,27 +201,8 @@ fn parse_zone(
         let j_dim = nj.unwrap_or(1).max(1);
         let k_dim = nk.unwrap_or(1).max(1);
         let total = i_dim * j_dim * k_dim;
-        let mut cols = vec![vec![0.0f32; total]; n_vars];
         let mut pos = 0usize;
-        if is_block {
-            for v in 0..n_vars {
-                for i in 0..total {
-                    if pos < tokens.len() {
-                        cols[v][i] = tokens[pos].parse().unwrap_or(0.0);
-                        pos += 1;
-                    }
-                }
-            }
-        } else {
-            for i in 0..total {
-                for v in 0..n_vars {
-                    if pos < tokens.len() {
-                        cols[v][i] = tokens[pos].parse().unwrap_or(0.0);
-                        pos += 1;
-                    }
-                }
-            }
-        }
+        let mut cols = parse_tecplot_columns(tokens, &mut pos, n_vars, total, is_block);
         let points: Vec<[f32; 3]> = (0..total)
             .map(|i| {
                 [
@@ -267,6 +229,36 @@ fn parse_zone(
         }
         Ok((zone_name, DataSet::StructuredGrid(grid)))
     }
+}
+
+fn parse_tecplot_columns(
+    tokens: &[&str],
+    pos: &mut usize,
+    n_vars: usize,
+    n_rows: usize,
+    is_block: bool,
+) -> Vec<Vec<f32>> {
+    let mut cols = vec![vec![0.0f32; n_rows]; n_vars];
+    if is_block {
+        for col in &mut cols {
+            for cell in col.iter_mut() {
+                if *pos < tokens.len() {
+                    *cell = tokens[*pos].parse().unwrap_or(0.0);
+                    *pos += 1;
+                }
+            }
+        }
+    } else {
+        for i in 0..n_rows {
+            for col in &mut cols {
+                if *pos < tokens.len() {
+                    col[i] = tokens[*pos].parse().unwrap_or(0.0);
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    cols
 }
 
 fn strip_comment(line: &str) -> &str {

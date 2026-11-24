@@ -494,15 +494,14 @@ pub fn read_gltf_str(
         let mut root_nodes: Vec<usize> = Vec::new();
         if let Some(scenes) = root.get("scenes").and_then(|v| v.as_array()) {
             let scene_idx = root.get("scene").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            if let Some(scene) = scenes.get(scene_idx) {
-                if let Some(ns) = scene.get("nodes").and_then(|v| v.as_array()) {
+            if let Some(scene) = scenes.get(scene_idx)
+                && let Some(ns) = scene.get("nodes").and_then(|v| v.as_array()) {
                     for n in ns {
                         if let Some(id) = n.as_u64() {
                             root_nodes.push(id as usize);
                         }
                     }
                 }
-            }
         }
         if root_nodes.is_empty() {
             // Fallback: treat nodes not referenced as children as roots
@@ -510,11 +509,10 @@ pub fn read_gltf_str(
             for n in nodes {
                 if let Some(children) = n.get("children").and_then(|v| v.as_array()) {
                     for c in children {
-                        if let Some(cid) = c.as_u64() {
-                            if (cid as usize) < is_child.len() {
+                        if let Some(cid) = c.as_u64()
+                            && (cid as usize) < is_child.len() {
                                 is_child[cid as usize] = true;
                             }
-                        }
                     }
                 }
             }
@@ -805,7 +803,7 @@ fn parse_gltf_primitive(
 
     let mut poly = PolyData::new();
     poly.points = pos_raw
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|c| world.transform_point3(Vec3::new(c[0], c[1], c[2])).to_array())
         .collect();
 
@@ -814,7 +812,7 @@ fn parse_gltf_primitive(
             gltf_read_accessor_f32(norm_idx as usize, accessors, buffer_views, buffers)?;
         if count == n_pts && nc == 3 {
             let flat: Vec<f32> = norm_raw
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .flat_map(|c| {
                     let n = world
                         .transform_vector3(Vec3::new(c[0], c[1], c[2]))
@@ -874,7 +872,7 @@ fn parse_gltf_primitive(
     match mode {
         0 => poly.verts = indices,
         1 => {
-            for pair in indices.chunks_exact(2) {
+            for pair in indices.as_chunks::<2>().0 {
                 poly.lines.push(vec![pair[0], pair[1]]);
             }
         }
@@ -891,7 +889,7 @@ fn parse_gltf_primitive(
             }
         }
         4 => {
-            for tri in indices.chunks_exact(3) {
+            for tri in indices.as_chunks::<3>().0 {
                 poly.polys.push(vec![tri[0], tri[1], tri[2]]);
             }
         }

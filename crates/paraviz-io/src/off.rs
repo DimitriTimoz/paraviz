@@ -29,8 +29,7 @@ pub fn read_off_str(text: &str) -> Result<PolyData> {
 
     let mut header = first;
     // Optional ST / C / N prefixes before OFF, e.g. OFF, COFF, NOFF, CNOFF, STOFF
-    let (v_count, f_count) = if header.ends_with("OFF") {
-        let prefix = &header[..header.len() - 3];
+    let (v_count, f_count) = if let Some(prefix) = header.strip_suffix("OFF") {
         if prefix.contains('C') {
             has_color = true;
         }
@@ -178,13 +177,7 @@ pub fn write_off(path: impl AsRef<Path>, poly: &PolyData) -> Result<()> {
     let file = fs::File::create(path)?;
     let mut w = BufWriter::new(file);
 
-    let colors = poly.point_data.get("Colors").and_then(|arr| {
-        if arr.num_components == 4 && arr.num_tuples() == poly.points.len() {
-            Some(arr)
-        } else {
-            None
-        }
-    });
+    let colors = poly.point_data.get("Colors").filter(|&arr| arr.num_components == 4 && arr.num_tuples() == poly.points.len());
 
     if colors.is_some() {
         writeln!(w, "COFF")?;

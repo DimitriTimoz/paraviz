@@ -90,19 +90,17 @@ pub fn read_gmsh_bytes(bytes: &[u8]) -> Result<DataSet> {
                 skip_until_end_tag(bytes, &mut cursor, "$EndElements")?;
             }
             "$NodeData" => {
-                if !is_binary {
-                    if let Some(arr) = parse_field_data_ascii(bytes, &mut cursor, points.len(), Some(&node_map))? {
+                if !is_binary
+                    && let Some(arr) = parse_field_data_ascii(bytes, &mut cursor, points.len(), Some(&node_map))? {
                         grid.point_data.add_array(arr);
                     }
-                }
                 skip_until_end_tag(bytes, &mut cursor, "$EndNodeData")?;
             }
             "$ElementData" => {
-                if !is_binary {
-                    if let Some(arr) = parse_field_data_ascii(bytes, &mut cursor, cells.len(), None)? {
+                if !is_binary
+                    && let Some(arr) = parse_field_data_ascii(bytes, &mut cursor, cells.len(), None)? {
                         grid.cell_data.add_array(arr);
                     }
-                }
                 skip_until_end_tag(bytes, &mut cursor, "$EndElementData")?;
             }
             _ if sec.starts_with('$') => {
@@ -322,13 +320,12 @@ fn parse_elements_v2(
                         ok = false;
                     }
                 }
-                if ok {
-                    if let Some((ct, _)) = mapped {
+                if ok
+                    && let Some((ct, _)) = mapped {
                         cells.push((ct, conn));
                         physical_tags.push(phys);
                         entity_tags.push(ent);
                     }
-                }
                 read_so_far += 1;
             }
         }
@@ -363,12 +360,11 @@ fn parse_elements_v2(
             let mut conn = Vec::with_capacity(n_nodes);
             let mut ok = true;
             for tok in &p[node_start..node_start + n_nodes] {
-                if let Ok(nid) = tok.parse::<u64>() {
-                    if let Some(&idx) = node_map.get(&nid) {
+                if let Ok(nid) = tok.parse::<u64>()
+                    && let Some(&idx) = node_map.get(&nid) {
                         conn.push(idx);
                         continue;
                     }
-                }
                 ok = false;
                 break;
             }
@@ -454,12 +450,11 @@ fn parse_elements_v4(
                 let mut conn = Vec::with_capacity(n_nodes);
                 let mut ok = true;
                 for tok in &ep[1..1 + n_nodes] {
-                    if let Ok(nid) = tok.parse::<u64>() {
-                        if let Some(&idx) = node_map.get(&nid) {
+                    if let Ok(nid) = tok.parse::<u64>()
+                        && let Some(&idx) = node_map.get(&nid) {
                             conn.push(idx);
                             continue;
                         }
-                    }
                     ok = false;
                     break;
                 }
@@ -529,13 +524,12 @@ fn parse_field_data_ascii(
         } else {
             None
         };
-        if let Some(ti) = target_idx {
-            if ti < expected_len {
+        if let Some(ti) = target_idx
+            && ti < expected_len {
                 for c in 0..n_comp {
                     data[ti * n_comp + c] = p[1 + c].parse().unwrap_or(0.0);
                 }
             }
-        }
     }
     Ok(Some(DataArray::new(name, n_comp, ArrayData::F32(data))))
 }

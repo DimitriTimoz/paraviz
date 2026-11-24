@@ -55,7 +55,7 @@ pub fn encode_animated_gif_bytes(
     let palette = build_global_palette();
     let has_transparency = frames_rgba
         .iter()
-        .any(|f| f.chunks_exact(4).any(|px| px[3] < 128));
+        .any(|f| f.as_chunks::<4>().0.iter().any(|px| px[3] < 128));
 
     let mut out = Vec::with_capacity(frames_rgba.len() * (width as usize * height as usize / 4));
     // Header
@@ -141,7 +141,7 @@ fn build_global_palette() -> [[u8; 3]; 256] {
 #[inline]
 fn quantize_frame(rgba: &[u8]) -> Vec<u8> {
     let mut indices = Vec::with_capacity(rgba.len() / 4);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         if px[3] < 128 {
             indices.push(TRANSPARENT_IDX);
             continue;

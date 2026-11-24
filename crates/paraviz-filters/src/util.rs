@@ -1169,8 +1169,8 @@ impl<'a> SpatialSampler<'a> {
             let mut tuple = vec![0.0f64; nc];
             for &(idx, w) in &weights {
                 let base = idx * nc;
-                for c in 0..nc {
-                    tuple[c] += arr.data.get_f64(base + c) * w;
+                for (c, slot) in tuple.iter_mut().enumerate().take(nc) {
+                    *slot += arr.data.get_f64(base + c) * w;
                 }
             }
             out.push(tuple);

@@ -2388,8 +2388,8 @@ fn paraview_series_temporal_source() {
     p1.point_data
         .add_array(DataArray::scalars_f32("t", vec![2.5; 4]));
 
-    write_dataset(&dir.file("step_0.vtp"), &DataSet::PolyData(p0)).unwrap();
-    write_dataset(&dir.file("step_1.vtp"), &DataSet::PolyData(p1)).unwrap();
+    write_dataset(dir.file("step_0.vtp"), &DataSet::PolyData(p0)).unwrap();
+    write_dataset(dir.file("step_1.vtp"), &DataSet::PolyData(p1)).unwrap();
 
     let series_json = r#"{
   "file-series-version": "1.0",
@@ -2667,7 +2667,7 @@ fn netcdf3_cf_rectilinear_and_temporal() {
     use paraviz_io::{detect_reader, DatasetReader};
     let dir = TestDir::new("netcdf_cf");
     fn pad4(buf: &mut Vec<u8>) {
-        while buf.len() % 4 != 0 {
+        while !buf.len().is_multiple_of(4) {
             buf.push(0);
         }
     }

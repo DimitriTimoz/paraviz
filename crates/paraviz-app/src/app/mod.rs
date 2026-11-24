@@ -322,6 +322,8 @@ struct CameraBookmark {
     camera: Camera,
 }
 
+type PendingFileLoads = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
 pub struct ParaVizApp {
     session: ParaViz,
     renderer: WebGpuRenderer,
@@ -391,7 +393,7 @@ pub struct ParaVizApp {
 
     recent_files: Vec<PathBuf>,
     last_export_dir: Option<PathBuf>,
-    pending_file_loads: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+    pending_file_loads: PendingFileLoads,
     camera_bookmarks: Vec<CameraBookmark>,
     info_stats_cache: HashMap<(NodeId, String, AttributeAssociation), HistogramResult>,
     volume_tf_hist_cache: HashMap<(NodeId, String, AttributeAssociation, Option<usize>), HistogramResult>,
@@ -2244,11 +2246,10 @@ impl ParaVizApp {
 
     pub(super) fn push_undo_snapshot_throttled(&mut self) {
         let now = Instant::now();
-        if let Some(prev) = self.last_undo_snapshot_at {
-            if now.duration_since(prev) < Duration::from_millis(450) {
+        if let Some(prev) = self.last_undo_snapshot_at
+            && now.duration_since(prev) < Duration::from_millis(450) {
                 return;
             }
-        }
         self.push_undo_snapshot();
     }
 

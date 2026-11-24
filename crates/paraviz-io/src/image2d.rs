@@ -36,7 +36,7 @@ pub fn read_png(path: impl AsRef<Path>) -> Result<DataSet> {
     // Convert 16-bit PNGs to U16 and 8-bit to U8; compute luminance scalar as well
     if info.bit_depth == png::BitDepth::Sixteen {
         let vals: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         let name = if n_comp == 1 { "Scalars" } else { "PNGImage" };

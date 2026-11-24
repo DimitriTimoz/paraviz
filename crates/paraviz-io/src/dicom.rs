@@ -138,12 +138,11 @@ pub fn read_dicom_bytes(bytes: &[u8]) -> Result<DataSet> {
             (0x0028, 0x0030) => {
                 let s = String::from_utf8_lossy(val);
                 let mut parts = s.trim_matches(['\0', ' ']).split('\\');
-                if let (Some(sy), Some(sx)) = (parts.next(), parts.next()) {
-                    if let (Ok(vy), Ok(vx)) = (sy.trim().parse::<f64>(), sx.trim().parse::<f64>()) {
+                if let (Some(sy), Some(sx)) = (parts.next(), parts.next())
+                    && let (Ok(vy), Ok(vx)) = (sy.trim().parse::<f64>(), sx.trim().parse::<f64>()) {
                         spacing[0] = vx;
                         spacing[1] = vy;
                     }
-                }
             }
             (0x0028, 0x0100) if val.len() >= 2 => {
                 bits_allocated = u16::from_le_bytes([val[0], val[1]]);
@@ -198,7 +197,7 @@ pub fn read_dicom_bytes(bytes: &[u8]) -> Result<DataSet> {
             }
             if rescale_slope != 1.0 || rescale_intercept != 0.0 {
                 let mut out = Vec::with_capacity(safe_prealloc_capacity(n_vox, 4, MAX_ALLOC_BYTES)?);
-                for chunk in raw_pixels[..n_vox * 2].chunks_exact(2) {
+                for chunk in raw_pixels[..n_vox * 2].as_chunks::<2>().0 {
                     let raw = if pixel_rep == 1 {
                         i16::from_le_bytes([chunk[0], chunk[1]]) as f32
                     } else {
@@ -209,13 +208,13 @@ pub fn read_dicom_bytes(bytes: &[u8]) -> Result<DataSet> {
                 ArrayData::F32(out)
             } else if pixel_rep == 1 {
                 let out: Vec<i16> = raw_pixels[..n_vox * 2]
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 ArrayData::I16(out)
             } else {
                 let out: Vec<u16> = raw_pixels[..n_vox * 2]
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 ArrayData::U16(out)

@@ -47,28 +47,25 @@ pub fn read_x3d_str(xml: &str) -> Result<DataSet> {
                         current_geom = Some(X3dGeomBuilder::new(&name, &attrs));
                     }
                     "Coordinate" => {
-                        if let Some(geom) = current_geom.as_mut() {
-                            if let Some(pts) = attrs.iter().find(|(k, _)| k == "point").map(|(_, v)| v)
+                        if let Some(geom) = current_geom.as_mut()
+                            && let Some(pts) = attrs.iter().find(|(k, _)| k == "point").map(|(_, v)| v)
                             {
                                 geom.points = parse_vec3_list(pts)?;
                             }
-                        }
                     }
                     "Normal" => {
-                        if let Some(geom) = current_geom.as_mut() {
-                            if let Some(ns) = attrs.iter().find(|(k, _)| k == "vector").map(|(_, v)| v)
+                        if let Some(geom) = current_geom.as_mut()
+                            && let Some(ns) = attrs.iter().find(|(k, _)| k == "vector").map(|(_, v)| v)
                             {
                                 geom.normals = parse_vec3_list(ns)?;
                             }
-                        }
                     }
                     "Color" => {
-                        if let Some(geom) = current_geom.as_mut() {
-                            if let Some(cs) = attrs.iter().find(|(k, _)| k == "color").map(|(_, v)| v)
+                        if let Some(geom) = current_geom.as_mut()
+                            && let Some(cs) = attrs.iter().find(|(k, _)| k == "color").map(|(_, v)| v)
                             {
                                 geom.colors = parse_vec3_list(cs)?;
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -78,28 +75,25 @@ pub fn read_x3d_str(xml: &str) -> Result<DataSet> {
                 let attrs = collect_attrs(&e);
                 match name.as_str() {
                     "Coordinate" => {
-                        if let Some(geom) = current_geom.as_mut() {
-                            if let Some(pts) = attrs.iter().find(|(k, _)| k == "point").map(|(_, v)| v)
+                        if let Some(geom) = current_geom.as_mut()
+                            && let Some(pts) = attrs.iter().find(|(k, _)| k == "point").map(|(_, v)| v)
                             {
                                 geom.points = parse_vec3_list(pts)?;
                             }
-                        }
                     }
                     "Normal" => {
-                        if let Some(geom) = current_geom.as_mut() {
-                            if let Some(ns) = attrs.iter().find(|(k, _)| k == "vector").map(|(_, v)| v)
+                        if let Some(geom) = current_geom.as_mut()
+                            && let Some(ns) = attrs.iter().find(|(k, _)| k == "vector").map(|(_, v)| v)
                             {
                                 geom.normals = parse_vec3_list(ns)?;
                             }
-                        }
                     }
                     "Color" => {
-                        if let Some(geom) = current_geom.as_mut() {
-                            if let Some(cs) = attrs.iter().find(|(k, _)| k == "color").map(|(_, v)| v)
+                        if let Some(geom) = current_geom.as_mut()
+                            && let Some(cs) = attrs.iter().find(|(k, _)| k == "color").map(|(_, v)| v)
                             {
                                 geom.colors = parse_vec3_list(cs)?;
                             }
-                        }
                     }
                     "IndexedFaceSet" | "IndexedLineSet" | "PointSet" => {
                         let mat = *transform_stack.last().unwrap_or(&Mat4::IDENTITY);
@@ -275,14 +269,14 @@ fn parse_vec3_list(s: &str) -> Result<Vec<Vec3>> {
                 .map_err(|_| IoError::Parse(format!("Invalid X3D float '{tok}'")))
         })
         .collect::<Result<_>>()?;
-    if nums.len() % 3 != 0 {
+    if !nums.len().is_multiple_of(3) {
         return Err(IoError::Parse(format!(
             "X3D vector list length {} is not divisible by 3",
             nums.len()
         )));
     }
     Ok(nums
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|c| Vec3::new(c[0], c[1], c[2]))
         .collect())
 }

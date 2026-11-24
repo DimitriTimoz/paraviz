@@ -136,8 +136,8 @@ impl TemporalStatisticsFilter {
             let mut max_v = vec![f64::NEG_INFINITY; len];
 
             for step in steps {
-                if let Some(a) = step.point_data().and_then(|pd| pd.get(&arr.name)) {
-                    if a.data.len() == len {
+                if let Some(a) = step.point_data().and_then(|pd| pd.get(&arr.name))
+                    && a.data.len() == len {
                         for i in 0..len {
                             let v = a.data.get_f64(i);
                             sum[i] += v;
@@ -150,7 +150,6 @@ impl TemporalStatisticsFilter {
                             }
                         }
                     }
-                }
             }
 
             if self.compute_average {
@@ -230,8 +229,8 @@ pub fn interpolate_datasets(a: &DataSet, b: &DataSet, t: f64) -> Result<DataSet,
 
     if let (Some(out_pd), Some(b_pd)) = (out.point_data_mut(), b.point_data()) {
         for arr in out_pd.arrays_mut() {
-            if let Some(other) = b_pd.get(&arr.name) {
-                if other.data.len() == arr.data.len() {
+            if let Some(other) = b_pd.get(&arr.name)
+                && other.data.len() == arr.data.len() {
                     let vals: Vec<f32> = (0..arr.data.len())
                         .map(|i| {
                             let va = arr.data.get_f64(i);
@@ -241,7 +240,6 @@ pub fn interpolate_datasets(a: &DataSet, b: &DataSet, t: f64) -> Result<DataSet,
                         .collect();
                     arr.data = ArrayData::F32(vals);
                 }
-            }
         }
     }
 

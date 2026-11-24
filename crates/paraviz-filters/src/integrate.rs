@@ -12,18 +12,12 @@ use serde::{Deserialize, Serialize};
 
 /// Integrates all point and cell attributes over the geometry (length, area, or volume).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct IntegrateVariablesFilter {
     /// When `true`, divides integrated values by total length/area/volume to produce spatial averages.
     pub divide_cell_data_by_volume: bool,
 }
 
-impl Default for IntegrateVariablesFilter {
-    fn default() -> Self {
-        Self {
-            divide_cell_data_by_volume: false,
-        }
-    }
-}
 
 impl IntegrateVariablesFilter {
     pub fn new() -> Self {
@@ -108,12 +102,12 @@ fn accumulate_field_weighted(
             acc.push((arr.name.clone(), nc, vec![0.0; nc]));
             &mut acc.last_mut().unwrap().2
         };
-        for c in 0..nc {
+        for (c, slot) in entry.iter_mut().enumerate().take(nc) {
             let mut avg = 0.0;
             for &ti in tuple_indices {
                 avg += arr.data.get_f64(ti * nc + c);
             }
-            entry[c] += avg * inv_k * weight;
+            *slot += avg * inv_k * weight;
         }
     }
 }

@@ -231,11 +231,10 @@ fn bowyer_watson_3d(points: &[[f32; 3]], alpha: f64) -> Vec<[u32; 4]> {
         let p = pts[i];
         let mut bad = Vec::new();
         for (ti, &[a, b, c, d]) in tets.iter().enumerate() {
-            if let Some((center, rad_sq)) = circumsphere_3d(pts[a], pts[b], pts[c], pts[d]) {
-                if p.distance_squared(center) < rad_sq + 1e-10 {
+            if let Some((center, rad_sq)) = circumsphere_3d(pts[a], pts[b], pts[c], pts[d])
+                && p.distance_squared(center) < rad_sq + 1e-10 {
                     bad.push(ti);
                 }
-            }
         }
         let mut boundary_faces: Vec<[usize; 3]> = Vec::new();
         for &ti in &bad {

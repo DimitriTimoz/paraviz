@@ -54,7 +54,7 @@ pub fn read_yales2_hdf5(path: impl AsRef<Path>) -> Result<DataSet> {
         }
         let n_pts = xyz.len() / 3;
         let points: Vec<[f32; 3]> = xyz
-            .chunks_exact(3)
+            .as_chunks::<3>().0.iter()
             .map(|c| [c[0], c[1], c[2]])
             .collect();
 
@@ -84,11 +84,10 @@ pub fn read_yales2_hdf5(path: impl AsRef<Path>) -> Result<DataSet> {
                     if let Ok(arr) = read_dataset_as_data_array(&ds, dname, n_comp, None) {
                         grid.point_data.add_array(arr);
                     }
-                } else if n_rows == n_cells && n_cells > 0 {
-                    if let Ok(arr) = read_dataset_as_data_array(&ds, dname, n_comp, None) {
+                } else if n_rows == n_cells && n_cells > 0
+                    && let Ok(arr) = read_dataset_as_data_array(&ds, dname, n_comp, None) {
                         grid.cell_data.add_array(arr);
                     }
-                }
             }
         }
 

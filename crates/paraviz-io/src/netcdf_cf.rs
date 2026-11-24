@@ -23,11 +23,10 @@ pub fn inspect_netcdf_time_steps(path: impl AsRef<Path>) -> Result<Vec<f64>> {
             .root_group()
             .map_err(|e| IoError::Parse(format!("HDF5 root error: {e}")))?;
         for name in ["time", "TIME", "t", "T"] {
-            if let Ok(ds) = root.dataset(name) {
-                if ds.shape().len() == 1 {
+            if let Ok(ds) = root.dataset(name)
+                && ds.shape().len() == 1 {
                     return read_dataset_f64(&ds, None);
                 }
-            }
         }
         Ok(Vec::new())
     } else if bytes.starts_with(b"CDF\x01") || bytes.starts_with(b"CDF\x02") {
@@ -115,10 +114,10 @@ fn read_nc4_hdf5(path: &Path, target_time: f64) -> Result<DataSet> {
         let has_time = shape.len() == 4 || (!time_vals.is_empty() && shape[0] as usize == time_vals.len());
         let (spatial_shape, slice) = if has_time && shape.len() >= 3 {
             let ti = time_idx.min((shape[0] as usize).saturating_sub(1)) as u64;
-            let s = slice_axis0(&shape, ti, ti + 1)?;
+            let s = slice_axis0(shape, ti, ti + 1)?;
             (&shape[1..], Some(s))
         } else {
-            (&shape[..], None)
+            (shape, None)
         };
 
         let cur_zyx = match spatial_shape.len() {
@@ -153,15 +152,12 @@ fn read_nc4_hdf5(path: &Path, target_time: f64) -> Result<DataSet> {
 
 fn find_hdf5_axis(root: &hdf5_reader::group::Group, names: &[&str]) -> Option<Vec<f64>> {
     for &n in names {
-        if let Ok(ds) = root.dataset(n) {
-            if ds.shape().len() == 1 {
-                if let Ok(v) = read_dataset_f64(&ds, None) {
-                    if !v.is_empty() {
+        if let Ok(ds) = root.dataset(n)
+            && ds.shape().len() == 1
+                && let Ok(v) = read_dataset_f64(&ds, None)
+                    && !v.is_empty() {
                         return Some(v);
                     }
-                }
-            }
-        }
     }
     None
 }
@@ -266,13 +262,11 @@ fn read_nc3_cf(bytes: &[u8], target_time: f64) -> Result<DataSet> {
 
 fn find_nc3_axis(bytes: &[u8], nc: &Nc3Meta, names: &[&str]) -> Option<Vec<f64>> {
     for &n in names {
-        if let Some(var) = nc.vars.iter().find(|v| v.name == n && v.dim_ids.len() == 1) {
-            if let Ok(v) = nc3_read_var_f64(bytes, nc, var, None) {
-                if !v.is_empty() {
+        if let Some(var) = nc.vars.iter().find(|v| v.name == n && v.dim_ids.len() == 1)
+            && let Ok(v) = nc3_read_var_f64(bytes, nc, var, None)
+                && !v.is_empty() {
                     return Some(v);
                 }
-            }
-        }
     }
     None
 }
