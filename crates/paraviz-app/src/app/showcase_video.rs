@@ -1,5 +1,7 @@
 use super::*;
-use paraviz::core::{CellType, DataArray, DataSet, ImageData, UnstructuredGrid};
+use paraviz::core::{
+    CellType, ColorMap, ColorMapPreset, DataArray, DataSet, ImageData, UnstructuredGrid,
+};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
@@ -653,6 +655,9 @@ impl HeadlessStudio {
         self.app.redo_stack.clear();
         self.app.error_message = None;
         self.app.session = ParaViz::new();
+        self.app.session.settings.show_bounding_box = false;
+        self.app.session.settings.edl_enabled = false;
+        self.app.session.settings.show_time_annotation = false;
         self.app.selected_node = None;
         self.app.clear_stats_caches();
         self.app.load_path(path);
@@ -768,7 +773,7 @@ fn paint_demo_overlays(
         let card_h = 74.0;
         let card = if co.above_drawer {
             egui::Rect::from_min_size(
-                egui::pos2(LOGICAL_W - card_w - 18.0, 148.0),
+                egui::pos2(LOGICAL_W - card_w - 18.0, 188.0),
                 egui::vec2(card_w, card_h),
             )
         } else {
@@ -956,11 +961,11 @@ fn apply_smooth_zoom(
 // ---------------------------------------------------------------------------
 
 fn generate_cfd_mixing_duct_vti(path: &Path) {
-    let [nx, ny, nz] = [42usize, 34, 34];
+    let [nx, ny, nz] = [56usize, 40, 40];
     let mut img = ImageData::new(
         [nx, ny, nz],
-        [-2.0, -1.0, -1.0],
-        [4.0 / (nx - 1) as f64, 2.0 / (ny - 1) as f64, 2.0 / (nz - 1) as f64],
+        [-2.2, -1.05, -1.05],
+        [4.4 / (nx - 1) as f64, 2.1 / (ny - 1) as f64, 2.1 / (nz - 1) as f64],
     );
     let n = nx * ny * nz;
     let mut vel = Vec::with_capacity(n);
@@ -968,25 +973,27 @@ fn generate_cfd_mixing_duct_vti(path: &Path) {
     let mut vort = Vec::with_capacity(n);
 
     for k in 0..nz {
-        let z = -1.0 + 2.0 * k as f32 / (nz - 1) as f32;
+        let z = -1.05 + 2.1 * k as f32 / (nz - 1) as f32;
         for j in 0..ny {
-            let y = -1.0 + 2.0 * j as f32 / (ny - 1) as f32;
+            let y = -1.05 + 2.1 * j as f32 / (ny - 1) as f32;
             for i in 0..nx {
-                let x = -2.0 + 4.0 * i as f32 / (nx - 1) as f32;
-                let dy1 = y - 0.36 * (1.6 * x).sin();
-                let dz1 = z - 0.36 * (1.6 * x).cos();
-                let r1 = dy1 * dy1 + dz1 * dz1 + 0.06;
+                let x = -2.2 + 4.4 * i as f32 / (nx - 1) as f32;
+                let phase = 1.9 * x;
+                let dy1 = y - 0.42 * phase.sin();
+                let dz1 = z - 0.42 * phase.cos();
+                let r1 = dy1 * dy1 + dz1 * dz1 + 0.055;
 
-                let dy2 = y + 0.36 * (1.6 * x).sin();
-                let dz2 = z + 0.36 * (1.6 * x).cos();
-                let r2 = dy2 * dy2 + dz2 * dz2 + 0.06;
+                let dy2 = y + 0.42 * phase.sin();
+                let dz2 = z + 0.42 * phase.cos();
+                let r2 = dy2 * dy2 + dz2 * dz2 + 0.055;
 
-                let vx = 1.65 - 0.35 * (y * y + z * z) + 0.30 * (2.0 * x).cos();
-                let vy = -dz1 / r1 + dz2 / r2;
-                let vz = dy1 / r1 - dy2 / r2;
+                let r_core = y * y + z * z + 0.12;
+                let vx = 2.1 - 0.45 * (y * y + z * z) + 0.45 * (1.8 * x).cos() + 0.65 / r_core;
+                let vy = -1.35 * dz1 / r1 + 1.35 * dz2 / r2 - 0.35 * z / r_core;
+                let vz = 1.35 * dy1 / r1 - 1.35 * dy2 / r2 + 0.35 * y / r_core;
                 vel.push([vx, vy, vz]);
-                pres.push(1.2 - 0.35 * (1.0 / r1 + 1.0 / r2).min(4.5) + 0.15 * x);
-                vort.push((1.0 / r1 + 1.0 / r2).min(12.0));
+                pres.push(1.5 - 0.35 * (1.0 / r1 + 1.0 / r2).min(5.0) + 0.2 * x);
+                vort.push((1.0 / r1 + 1.0 / r2).min(14.0));
             }
         }
     }
@@ -999,27 +1006,41 @@ fn generate_cfd_mixing_duct_vti(path: &Path) {
 }
 
 fn generate_fea_l_bracket_vtu(path: &Path) {
-    let [nx, ny, nz] = [42usize, 32, 12];
+    // Smooth conformal 3D twisted & cambered aerospace turbine blade (zero voxel staircases)
+    let [nc, ns, nt] = [30usize, 52, 7];
     let mut ug = UnstructuredGrid::new();
-    let mut stress = Vec::with_capacity(nx * ny * nz);
-    let mut disp = Vec::with_capacity(nx * ny * nz);
+    let mut stress = Vec::with_capacity(nc * ns * nt);
+    let mut disp = Vec::with_capacity(nc * ns * nt);
 
-    for k in 0..nz {
-        let z = -0.35 + 0.70 * k as f32 / (nz - 1) as f32;
-        for j in 0..ny {
-            let y = 1.80 * j as f32 / (ny - 1) as f32;
-            for i in 0..nx {
-                let x = 2.40 * i as f32 / (nx - 1) as f32;
-                // Bending + fillet + bolt-hole Kirsch stress concentration
-                let fillet_d = ((x - 0.85).powi(2) + (y - 0.65).powi(2)).sqrt() + 0.12;
-                let hole_d = ((x - 1.85).powi(2) + z.powi(2)).sqrt() + 0.08;
-                let vm = 35.0
-                    + 185.0 * (-fillet_d * 2.4).exp()
-                    + 110.0 * (-((hole_d - 0.24) / 0.12).powi(2)).exp()
-                    + 28.0 * (x / 2.4);
-                let dx = 0.04 * x * y * 0.4;
-                let dy = -0.14 * (x / 2.4).powi(2);
-                let dz = 0.02 * z * (x / 2.4);
+    for k in 0..nt {
+        let w = -1.0 + 2.0 * k as f32 / (nt - 1) as f32;
+        for j in 0..ns {
+            let s = j as f32 / (ns - 1) as f32; // span 0 (root) -> 1 (tip)
+            let y = 2.55 * s;
+            let chord = 1.35 * (1.0 - 0.36 * s);
+            let twist = 0.72 * s; // ~41 deg smooth aerodynamic twist
+            let sweep = 0.30 * s * s;
+            for i in 0..nc {
+                let u = -1.0 + 2.0 * i as f32 / (nc - 1) as f32; // -1 trailing .. +1 leading
+                let xc = 0.5 * chord * u + sweep;
+                let half_t = (0.14 * (1.0 - u * u).max(0.05).sqrt()) * (1.0 - 0.42 * s);
+                let camber = 0.22 * (1.0 - u * u) * (1.0 - 0.25 * s);
+                let zc = camber + w * half_t;
+
+                let (st, ct) = twist.sin_cos();
+                let x = xc * ct - zc * st;
+                let z = xc * st + zc * ct;
+
+                // Bending + torsional root-fillet Von Mises stress concentration
+                let root_bend = (1.0 - s).powf(1.85);
+                let edge_conc = 0.55 + 0.45 * u * u;
+                let torsion_peak = (-((s - 0.22) / 0.16).powi(2)).exp() * (0.4 + 0.6 * w.abs());
+                let vm = 22.0 + 265.0 * root_bend * edge_conc + 95.0 * torsion_peak;
+
+                let dx = 0.03 * s * s * ct;
+                let dy = -0.02 * s * s;
+                let dz = 0.24 * s.powi(2);
+
                 ug.points.push([x, y, z]);
                 stress.push(vm);
                 disp.push([dx, dy, dz]);
@@ -1027,23 +1048,10 @@ fn generate_fea_l_bracket_vtu(path: &Path) {
         }
     }
 
-    let idx = |i: usize, j: usize, k: usize| -> u32 { (i + nx * (j + ny * k)) as u32 };
-    for k in 0..(nz - 1) {
-        for j in 0..(ny - 1) {
-            for i in 0..(nx - 1) {
-                let cx = 2.40 * (i as f32 + 0.5) / (nx - 1) as f32;
-                let cy = 1.80 * (j as f32 + 0.5) / (ny - 1) as f32;
-                let cz = -0.35 + 0.70 * (k as f32 + 0.5) / (nz - 1) as f32;
-                // Carve L-bracket cutout (x > 0.85 && y > 0.65) and bolt hole at (1.85, z=0)
-                if cx > 0.88 && cy > 0.68 {
-                    continue;
-                }
-                if ((cx - 1.85).powi(2) + cz.powi(2)).sqrt() < 0.21 {
-                    continue;
-                }
-                if ((cy - 1.35).powi(2) + cz.powi(2)).sqrt() < 0.18 && cx < 0.88 {
-                    continue;
-                }
+    let idx = |i: usize, j: usize, k: usize| -> u32 { (i + nc * (j + ns * k)) as u32 };
+    for k in 0..(nt - 1) {
+        for j in 0..(ns - 1) {
+            for i in 0..(nc - 1) {
                 ug.push_cell(
                     CellType::Hexahedron,
                     &[
@@ -1069,7 +1077,7 @@ fn generate_fea_l_bracket_vtu(path: &Path) {
 }
 
 fn generate_medical_ct_scan_vti(path: &Path) {
-    let [nx, ny, nz] = [56usize, 56, 56];
+    let [nx, ny, nz] = [88usize, 88, 88];
     let mut img = ImageData::new(
         [nx, ny, nz],
         [-1.0, -1.0, -1.0],
@@ -1082,27 +1090,48 @@ fn generate_medical_ct_scan_vti(path: &Path) {
             let y = -1.0 + 2.0 * j as f32 / (ny - 1) as f32;
             for i in 0..nx {
                 let x = -1.0 + 2.0 * i as f32 / (nx - 1) as f32;
-                let body = (x / 0.82).powi(2) + (y / 0.68).powi(2) + (z / 0.78).powi(2);
-                let lung_l = ((x + 0.30) / 0.24).powi(2) + (y / 0.28).powi(2) + (z / 0.42).powi(2);
-                let lung_r = ((x - 0.30) / 0.24).powi(2) + (y / 0.28).powi(2) + (z / 0.42).powi(2);
-                let spine = ((x) / 0.14).powi(2) + ((y + 0.38) / 0.14).powi(2);
-                let aorta = ((x - 0.05) / 0.11).powi(2) + ((y + 0.08) / 0.11).powi(2);
-                let rib_ring = (body.sqrt() - 0.78).abs();
+                let body = (x / 0.84).powi(2) + (y / 0.68).powi(2) + (z / 0.84).powi(2);
+                let lung_l = ((x + 0.34) / 0.25).powi(2) + (y / 0.30).powi(2) + (z / 0.48).powi(2);
+                let lung_r = ((x - 0.34) / 0.25).powi(2) + (y / 0.30).powi(2) + (z / 0.48).powi(2);
+                let spine = (x / 0.11).powi(2) + ((y + 0.42) / 0.11).powi(2);
+                let spinous = (x / 0.045).powi(2) + ((y + 0.56) / 0.09).powi(2);
+                let desc_aorta = ((x - 0.09) / 0.075).powi(2) + ((y + 0.18) / 0.075).powi(2);
+                let heart = ((x + 0.10) / 0.22).powi(2) + ((y - 0.14) / 0.18).powi(2) + ((z + 0.06) / 0.22).powi(2);
+                let arch_r = ((((x - 0.02).powi(2) + (z - 0.28).powi(2)).sqrt() - 0.20).powi(2)
+                    + (y + 0.05).powi(2))
+                    .sqrt();
+                let sternum = (x / 0.09).powi(2) + ((y - 0.56) / 0.065).powi(2);
 
+                let rib_shell = (body.sqrt() - 0.82).abs();
+                let rib_band = (z * 16.0).cos();
                 let mut val = 0.0f32;
                 if body < 1.0 {
-                    val = 120.0;
-                    if rib_ring < 0.055 && ((z * 16.0).sin() > 0.15) {
-                        val = 740.0;
+                    val = 110.0;
+                    // 10 pairs of curved bilateral ribs
+                    if rib_shell < 0.055 && rib_band > 0.28 && z.abs() < 0.78 && y < 0.52 {
+                        val = 820.0;
                     }
-                    if spine < 1.0 && z.abs() < 0.72 {
-                        val = 800.0;
+                    // Anterior sternum
+                    if sternum < 1.0 && z > -0.45 && z < 0.55 {
+                        val = 760.0;
                     }
+                    // Segmented vertebral column + spinous processes
+                    if (spine < 1.0 || spinous < 1.0) && z.abs() < 0.85 {
+                        let disc = (z * 16.0).sin().abs();
+                        val = if disc > 0.22 { 880.0 } else { 320.0 };
+                    }
+                    // Aerated lung cavities
                     if lung_l < 1.0 || lung_r < 1.0 {
-                        val = 25.0;
+                        val = 18.0;
                     }
-                    if aorta < 1.0 && z.abs() < 0.65 {
-                        val = 980.0;
+                    // Heart + aortic arch + descending aorta (contrast-enhanced)
+                    if heart < 1.0 {
+                        val = 540.0;
+                    }
+                    if (desc_aorta < 1.0 && z < 0.30 && z > -0.82)
+                        || (arch_r < 0.07 && z > 0.22 && x.abs() < 0.30)
+                    {
+                        val = 990.0;
                     }
                 }
                 hu.push(val);
@@ -1114,39 +1143,22 @@ fn generate_medical_ct_scan_vti(path: &Path) {
 }
 
 fn generate_karman_xdmf_series(path: &Path) {
-    let [nx, ny, nz] = [30usize, 18, 2];
-    let npts = nx * ny * nz;
-    let mut coords = String::new();
-    for k in 0..nz {
-        let z = -0.05 + 0.10 * k as f32;
-        for j in 0..ny {
-            let y = -1.0 + 2.0 * j as f32 / (ny - 1) as f32;
-            for i in 0..nx {
-                let x = 4.0 * i as f32 / (nx - 1) as f32;
-                coords.push_str(&format!("{x:.3} {y:.3} {z:.3} "));
-            }
-        }
-    }
-
+    // 3D undulating vortex-wake & wave-propagation surface (56x36 quads, 16 timesteps)
+    let [nx, ny] = [56usize, 36];
+    let npts = nx * ny;
     let mut conn = String::new();
     let mut ncells = 0usize;
-    let pid = |i: usize, j: usize, k: usize| i + nx * (j + ny * k);
-    for k in 0..(nz - 1) {
-        for j in 0..(ny - 1) {
-            for i in 0..(nx - 1) {
-                conn.push_str(&format!(
-                    "{} {} {} {} {} {} {} {} ",
-                    pid(i, j, k),
-                    pid(i + 1, j, k),
-                    pid(i + 1, j + 1, k),
-                    pid(i, j + 1, k),
-                    pid(i, j, k + 1),
-                    pid(i + 1, j, k + 1),
-                    pid(i + 1, j + 1, k + 1),
-                    pid(i, j + 1, k + 1),
-                ));
-                ncells += 1;
-            }
+    let pid = |i: usize, j: usize| i + nx * j;
+    for j in 0..(ny - 1) {
+        for i in 0..(nx - 1) {
+            conn.push_str(&format!(
+                "{} {} {} {} ",
+                pid(i, j),
+                pid(i + 1, j),
+                pid(i + 1, j + 1),
+                pid(i, j + 1),
+            ));
+            ncells += 1;
         }
     }
 
@@ -1154,37 +1166,36 @@ fn generate_karman_xdmf_series(path: &Path) {
     let nsteps = 16;
     for step in 0..nsteps {
         let t = step as f32 * 0.25;
+        let mut coords = String::new();
         let mut scalars = String::new();
-        for _k in 0..nz {
-            for j in 0..ny {
-                let y = -1.0 + 2.0 * j as f32 / (ny - 1) as f32;
-                for i in 0..nx {
-                    let x = 4.0 * i as f32 / (nx - 1) as f32;
-                    let phase = 2.6 * x - 2.2 * t;
-                    let vortex = phase.sin() * (-1.9 * y * y).exp() * (1.0 - (-1.4 * x).exp());
-                    let u_mag = 1.0 + 0.85 * vortex;
-                    scalars.push_str(&format!("{u_mag:.3} "));
-                }
+        for j in 0..ny {
+            let y = -1.25 + 2.50 * j as f32 / (ny - 1) as f32;
+            for i in 0..nx {
+                let x = 4.6 * i as f32 / (nx - 1) as f32;
+                let env = (-1.15 * y * y).exp() * (1.0 - (-1.3 * x).exp());
+                let phase = 2.5 * x - 2.3 * t;
+                let z = 0.42 * phase.sin() * env + 0.12 * (1.2 * x - 1.1 * t).cos() * (-0.5 * y * y).exp();
+                let u_mag = 1.0 + 0.95 * phase.sin() * env + 0.18 * (x / 4.6);
+                coords.push_str(&format!("{x:.3} {y:.3} {z:.3} "));
+                scalars.push_str(&format!("{u_mag:.3} "));
             }
         }
-        let geom_block = if step == 0 {
+        let topo_block = if step == 0 {
             format!(
-                r#"<Topology Name="Topo" TopologyType="Hexahedron" NumberOfElements="{ncells}">
-          <DataItem Name="Conn" Format="XML" Dimensions="{ncells} 8">{conn}</DataItem>
-        </Topology>
-        <Geometry Name="Geom" GeometryType="XYZ">
-          <DataItem Name="Pts" Format="XML" Dimensions="{npts} 3">{coords}</DataItem>
-        </Geometry>"#
+                r#"<Topology Name="Topo" TopologyType="Quadrilateral" NumberOfElements="{ncells}">
+          <DataItem Name="Conn" Format="XML" Dimensions="{ncells} 4">{conn}</DataItem>
+        </Topology>"#
             )
         } else {
-            r#"<Topology Reference="/Xdmf/Domain/Grid/Grid[1]/Topology"/>
-        <Geometry Reference="/Xdmf/Domain/Grid/Grid[1]/Geometry"/>"#
-                .to_string()
+            r#"<Topology Reference="/Xdmf/Domain/Grid/Grid[1]/Topology"/>"#.to_string()
         };
         grids_xml.push_str(&format!(
             r#"      <Grid Name="Step_{step}" GridType="Uniform">
         <Time Value="{t:.2}"/>
-        {geom_block}
+        {topo_block}
+        <Geometry GeometryType="XYZ">
+          <DataItem Format="XML" Dimensions="{npts} 3">{coords}</DataItem>
+        </Geometry>
         <Attribute Name="WakeVelocity" AttributeType="Scalar" Center="Node">
           <DataItem Format="XML" Dimensions="{npts}">{scalars}</DataItem>
         </Attribute>
@@ -1208,41 +1219,59 @@ fn generate_karman_xdmf_series(path: &Path) {
 
 fn generate_protein_ligand_xyz(path: &Path) {
     let mut lines = Vec::new();
-    let n_helix = 180;
+    let n_helix = 140;
     let mut coords = Vec::new();
+    let tilt = 0.62_f32; // ~35 deg diagonal 3D tilt
+    let (st, ct) = tilt.sin_cos();
+    let push_tilted = |out: &mut Vec<(&'static str, f32, f32, f32)>,
+                       sym: &'static str,
+                       x: f32,
+                       y: f32,
+                       z: f32| {
+        let yt = y * ct - z * st;
+        let zt = y * st + z * ct;
+        out.push((sym, x, yt, zt));
+    };
+
     for i in 0..n_helix {
-        let t = i as f32 * 0.32;
-        let z = (i as f32 - n_helix as f32 * 0.5) * 0.11;
-        coords.push(("P", 2.1 * t.cos(), 2.1 * t.sin(), z));
-        coords.push(("O", 1.65 * (t + 0.22).cos(), 1.65 * (t + 0.22).sin(), z));
-        coords.push((
-            "N",
-            2.1 * (t + std::f32::consts::PI).cos(),
-            2.1 * (t + std::f32::consts::PI).sin(),
-            z,
-        ));
-        coords.push((
-            "C",
-            1.65 * (t + std::f32::consts::PI + 0.22).cos(),
-            1.65 * (t + std::f32::consts::PI + 0.22).sin(),
-            z,
-        ));
+        let t = i as f32 * 0.28;
+        let z = (i as f32 - n_helix as f32 * 0.5) * 0.13;
+        // Strand A (major/minor groove offset 2.5 rad)
+        push_tilted(&mut coords, "P", 2.35 * t.cos(), 2.35 * t.sin(), z);
+        push_tilted(&mut coords, "O", 1.85 * (t + 0.18).cos(), 1.85 * (t + 0.18).sin(), z);
+        push_tilted(&mut coords, "C", 1.55 * (t - 0.16).cos(), 1.55 * (t - 0.16).sin(), z + 0.06);
+        // Strand B
+        let tb = t + 2.55;
+        push_tilted(&mut coords, "P", 2.35 * tb.cos(), 2.35 * tb.sin(), z);
+        push_tilted(&mut coords, "O", 1.85 * (tb + 0.18).cos(), 1.85 * (tb + 0.18).sin(), z);
+        push_tilted(&mut coords, "C", 1.55 * (tb - 0.16).cos(), 1.55 * (tb - 0.16).sin(), z - 0.06);
+
+        // Base-pair rungs bridging the two strands
         if i % 3 == 0 {
-            for r in -3i32..=3 {
-                let frac = r as f32 / 3.5;
-                let sym = if r == 0 {
-                    "S"
-                } else if r.abs() % 2 == 1 {
-                    "C"
-                } else {
-                    "H"
+            let ax = 1.65 * t.cos();
+            let ay = 1.65 * t.sin();
+            let bx = 1.65 * tb.cos();
+            let by = 1.65 * tb.sin();
+            for s_idx in 1..=5 {
+                let f = s_idx as f32 / 6.0;
+                let sym = match s_idx {
+                    1 | 5 => "N",
+                    3 => "S",
+                    _ => "C",
                 };
-                coords.push((sym, frac * 1.55 * t.cos(), frac * 1.55 * t.sin(), z));
+                push_tilted(&mut coords, sym, ax + (bx - ax) * f, ay + (by - ay) * f, z);
             }
         }
     }
+    // Docked metallic ligand cluster in the major groove
+    for k in 0..18 {
+        let a = k as f32 * 0.65;
+        let r = 0.55 + 0.35 * (k as f32 * 0.4).sin();
+        let sym = if k % 4 == 0 { "Fe" } else { "S" };
+        push_tilted(&mut coords, sym, 0.7 + r * a.cos(), r * a.sin(), -0.8 + k as f32 * 0.11);
+    }
     lines.push(coords.len().to_string());
-    lines.push("ParaViz Protein Helix & Ligand".to_string());
+    lines.push("ParaViz DNA Double Helix & Intercalated Ligand".to_string());
     for (s, x, y, z) in coords {
         lines.push(format!("{s} {x:.4} {y:.4} {z:.4}"));
     }
@@ -1308,8 +1337,8 @@ fn generate_showcase_video() {
     studio.mark_act("01_cfd");
     studio.set_callout(
         "01 / 05  •  CFD FLOW & COMMAND PALETTE",
-        "Twin-Vortex Mixing Duct",
-        "CFD profile, live 3D Stream Tracer & interactive Slice",
+        "Swirling Vortex Mixing Duct",
+        "Turbo streamlines, live Slice & Cmd+K palette",
         false,
     );
 
@@ -1319,8 +1348,7 @@ fn generate_showcase_video() {
     studio.click_label("CFD", None, egui::pos2(248.0, 88.0), 10);
     studio.idle_frames(8);
 
-    // Enable Bounds and EDL in toolbar
-    studio.click_label("Bounds", Some(TOOLBAR_RECT), egui::pos2(725.0, 44.0), 12);
+    // Enable EDL in toolbar (skip Bounds wireframe clutter)
     studio.click_label("EDL", Some(TOOLBAR_RECT), egui::pos2(890.0, 44.0), 10);
 
     // Orbit 3D Viewport smoothly with real mouse drag
@@ -1335,6 +1363,13 @@ fn generate_showcase_video() {
     studio.idle_frames(12);
     studio.press_key(egui::Key::Enter, egui::Modifiers::NONE);
     studio.app.wait_for_idle_jobs();
+    if let Some(id) = studio.app.selected_node {
+        if let Ok(node) = studio.app.session.node_mut(id) {
+            node.style.line_width = 2.8;
+            node.style.colormap = ColorMap::from_preset(ColorMapPreset::Turbo);
+        }
+        studio.app.invalidate_viewport();
+    }
     studio.set_focus_zoom(1.0, [0.5, 0.5]);
     studio.idle_frames(22);
 
@@ -1350,6 +1385,13 @@ fn generate_showcase_video() {
     studio.idle_frames(8);
     studio.press_key(egui::Key::Enter, egui::Modifiers::NONE);
     studio.app.wait_for_idle_jobs();
+    if let Some(id) = studio.app.selected_node {
+        if let Ok(node) = studio.app.session.node_mut(id) {
+            node.style.colormap = ColorMap::from_preset(ColorMapPreset::Turbo);
+            node.style.opacity = 0.82;
+        }
+        studio.app.invalidate_viewport();
+    }
 
     // Ensure Properties tab is active and drag Slice Origin X interactively
     studio.click_label("Properties", Some(INSPECTOR_TABS_RECT), egui::pos2(45.0, 210.0), 10);
@@ -1365,13 +1407,13 @@ fn generate_showcase_video() {
     studio.idle_frames(14);
 
     // =========================================================================
-    // ACT 2: Structural FEA L-Bracket — Filters Menu, 3D Picking & Spreadsheet
+    // ACT 2: Structural FEA Turbine Blade — Filters Menu, 3D Picking & Spreadsheet
     // =========================================================================
     studio.mark_act("02_fea");
     studio.set_callout(
         "02 / 05  •  STRUCTURAL FEA & 3D PICKING",
-        "Perforated L-Bracket Stress Analysis",
-        "Von Mises stress mesh, 3D raycast picking & Spreadsheet",
+        "Twisted Aerospace Turbine Blade",
+        "Conformal FEA mesh, Plasma stress, 3D pick & Spreadsheet",
         true,
     );
 
@@ -1393,15 +1435,22 @@ fn generate_showcase_video() {
     studio.app.wait_for_idle_jobs();
     studio.click_label("Solo", Some(LEFT_DOCK_RECT), egui::pos2(76.0, 96.0), 10);
 
-    // Switch to Display tab and choose SurfaceWithEdges
+    // Switch to Display tab, apply Plasma colormap + refined SurfaceWithEdges
     studio.click_label("Display", Some(INSPECTOR_TABS_RECT), egui::pos2(105.0, 195.0), 12);
     studio.idle_frames(8);
     studio.click_label("Surface", Some(LEFT_DOCK_RECT), egui::pos2(140.0, 285.0), 10);
     studio.idle_frames(6);
     studio.click_label("SurfaceWithEdges", None, egui::pos2(140.0, 315.0), 8);
+    if let Some(id) = studio.app.selected_node {
+        if let Ok(node) = studio.app.session.node_mut(id) {
+            node.style.colormap = ColorMap::from_preset(ColorMapPreset::Plasma);
+            node.style.edge_width = 0.45;
+        }
+        studio.app.invalidate_viewport();
+    }
     studio.idle_frames(8);
 
-    // Orbit bracket to expose inner fillet
+    // Orbit blade to expose root stress fillet
     studio.drag_smooth(egui::pos2(860.0, 450.0), egui::vec2(-115.0, -45.0), 28);
 
     // Switch to Pick mode and pick a guaranteed mesh point via pick_scene candidates
@@ -1412,12 +1461,13 @@ fn generate_showcase_video() {
     let pane_x0 = (LOGICAL_W - tw as f32 / PPP).max(0.0);
     let pane_y0 = (LOGICAL_H - 22.0 - th as f32 / PPP).max(0.0);
     let candidates = [
-        (995.0_f32, 505.0_f32),
-        (975.0, 480.0),
-        (1010.0, 525.0),
-        (965.0, 600.0),
-        (1020.0, 615.0),
-        (955.0, 420.0),
+        (960.0_f32, 470.0_f32),
+        (945.0, 505.0),
+        (985.0, 450.0),
+        (930.0, 540.0),
+        (975.0, 510.0),
+        (920.0, 430.0),
+        (1005.0, 485.0),
     ];
     let pick_pt = studio.app.panes[0]
         .cached_scene
@@ -1467,6 +1517,9 @@ fn generate_showcase_video() {
         true,
     );
     studio.set_focus_zoom(1.0, [0.5, 0.5]);
+    studio.app.last_pick = None;
+    studio.app.picked_highlight = None;
+    studio.app.invalidate_viewport();
 
     // Select bracket node, switch to Orbit, and add Probe Over Line via Cmd+K
     studio.click_label("fea_l_bracket.vtu", Some(LEFT_DOCK_RECT), egui::pos2(115.0, 128.0), 8);
@@ -1515,8 +1568,8 @@ fn generate_showcase_video() {
     studio.mark_act("04_volume");
     studio.set_callout(
         "04 / 05  •  MEDICAL 3D VOLUME RAYMARCHING",
-        "CT Scan Opacity Curve & Live Clip Plane",
-        "R32Float raymarching, opacity TF curve & 3D clip plane",
+        "Thoracic & Cardiac 3D CT Scan",
+        "Inferno raymarching, opacity TF curve & 3D clip plane",
         false,
     );
 
@@ -1538,6 +1591,16 @@ fn generate_showcase_video() {
     studio.click_label(init_vol_repr, Some(LEFT_DOCK_RECT), egui::pos2(140.0, 285.0), 10);
     studio.idle_frames(5);
     studio.click_label("Volume", None, egui::pos2(140.0, 405.0), 8);
+    if let Some(id) = studio.app.selected_node {
+        if let Ok(node) = studio.app.session.node_mut(id) {
+            let inferno = ColorMap::from_preset(ColorMapPreset::Inferno);
+            node.style.colormap = inferno.clone();
+            node.style.volume_tf.color_map = inferno;
+            node.style.volume_step_size = 0.25;
+            node.style.volume_shading = true;
+        }
+        studio.app.invalidate_viewport();
+    }
     studio.idle_frames(18);
 
     // Scroll Left Dock down to reveal Volume Transfer Function controls cleanly
@@ -1569,26 +1632,29 @@ fn generate_showcase_video() {
     studio.mark_act("05_timeline");
     studio.set_callout(
         "05 / 05  •  TEMPORAL XDMF & MOLECULAR .XYZ",
-        "16-Timestep Vortex Wake Playback",
-        "On-demand 16-timestep XDMF playback & time badge",
+        "16-Timestep 3D Vortex Wave Playback",
+        "On-demand 3D XDMF wave animation & time badge",
         false,
     );
 
     studio.reset_scene_for_act(&xdmf_path);
 
-    // Switch to Display -> SurfaceWithEdges so the Karman wake mesh shows crisp cell shading
+    // Switch to Display tab and apply Turbo colormap on the 3D undulating wave surface
     studio.click_label("Display", Some(INSPECTOR_TABS_RECT), egui::pos2(105.0, 195.0), 10);
-    studio.idle_frames(5);
-    studio.click_label("Surface", Some(LEFT_DOCK_RECT), egui::pos2(140.0, 285.0), 10);
-    studio.idle_frames(5);
-    studio.click_label("SurfaceWithEdges", None, egui::pos2(140.0, 315.0), 8);
+    if let Some(id) = studio.app.selected_node {
+        if let Ok(node) = studio.app.session.node_mut(id) {
+            node.style.colormap = ColorMap::from_preset(ColorMapPreset::Turbo);
+            node.style.edge_width = 0.35;
+        }
+        studio.app.invalidate_viewport();
+    }
     studio.idle_frames(6);
 
     // Enable Time annotation and click Play on the Time Transport bar
     studio.click_label("Time:", Some(TOOLBAR_RECT), egui::pos2(815.0, 44.0), 12);
     studio.click_label("Play", Some(TOOLBAR_RECT), egui::pos2(225.0, 74.0), 12);
 
-    // Advance time deterministically across timesteps while keeping the flat wake broadside
+    // Advance time deterministically across timesteps while keeping the 3D wave broadside
     let steps = studio.app.session.all_time_steps();
     let total_play_frames = 84;
     for f in 0..total_play_frames {
@@ -1603,12 +1669,12 @@ fn generate_showcase_video() {
     }
     studio.click_label("Pause", Some(TOOLBAR_RECT), egui::pos2(225.0, 74.0), 10);
 
-    // Load Protein Helix + Ligand .xyz and switch to PointGaussian + Light UI toggle
+    // Load DNA Double Helix & Ligand .xyz and switch to PointGaussian + Turbo + Light UI toggle
     studio.reset_scene_for_act(&xyz_path);
 
     studio.set_callout(
         "05 / 05  •  MOLECULAR & THEME STUDIO",
-        "Protein Helix (.xyz) & Instant Themes",
+        "DNA Double Helix (.xyz) & Instant Themes",
         "PointGaussian atomic splats with Light & Dark themes",
         false,
     );
@@ -1624,7 +1690,8 @@ fn generate_showcase_video() {
     studio.click_label("PointGaussian", None, egui::pos2(140.0, 360.0), 8);
     if let Some(id) = studio.app.selected_node {
         if let Ok(node) = studio.app.session.node_mut(id) {
-            node.style.point_size = 9.0;
+            node.style.point_size = 11.5;
+            node.style.colormap = ColorMap::from_preset(ColorMapPreset::Turbo);
         }
         studio.app.invalidate_viewport();
     }
