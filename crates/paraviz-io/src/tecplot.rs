@@ -144,8 +144,11 @@ fn parse_zone(
         .unwrap_or(false);
 
     let n_vars = variables.len();
+    if n_vars == 0 {
+        return Err(IoError::Parse("Tecplot ZONE has 0 variables".into()));
+    }
     let x_idx = find_var_idx(variables, &["X"]).unwrap_or(0);
-    let y_idx = find_var_idx(variables, &["Y"]).unwrap_or(1.min(n_vars - 1));
+    let y_idx = find_var_idx(variables, &["Y"]).unwrap_or(1.min(n_vars.saturating_sub(1)));
     let z_idx = find_var_idx(variables, &["Z"]);
 
     if let (Some(nodes), Some(elems)) = (n_nodes, n_elems) {

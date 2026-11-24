@@ -416,7 +416,10 @@ fn read_nc3_slice(
     elem_sz: usize,
     out: &mut Vec<f64>,
 ) -> Result<()> {
-    if base + count * elem_sz > bytes.len() {
+    let byte_len = count
+        .checked_mul(elem_sz)
+        .ok_or_else(|| IoError::InvalidData("NetCDF-3 variable size overflow".into()))?;
+    if base.checked_add(byte_len).is_none_or(|end| end > bytes.len()) {
         return Err(IoError::Parse("Truncated NetCDF-3 variable data".into()));
     }
     for i in 0..count {
@@ -448,7 +451,14 @@ fn skip_nc3_atts(bytes: &[u8], pos: &mut usize) -> Result<()> {
             6 => 8,
             _ => 1,
         };
-        let padded = ((nelems * elem_sz) + 3) & !3;
+        let padded = nelems
+            .checked_mul(elem_sz)
+            .and_then(|v| v.checked_add(3))
+            .map(|v| v & !3)
+            .ok_or_else(|| IoError::InvalidData("NetCDF-3 attribute size overflow".into()))?;
+        if padded > bytes.len().saturating_sub(*pos) {
+            return Err(IoError::Parse("Truncated NetCDF-3 attribute".into()));
+        }
         *pos += padded;
     }
     Ok(())

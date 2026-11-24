@@ -90,10 +90,19 @@ pub fn read_bmp_bytes(bytes: &[u8]) -> Result<DataSet> {
             )));
         }
     };
-    let row_stride = (w * (bpp as usize / 8) + 3) & !3;
-    if pixel_offset + row_stride * h > bytes.len() {
+    let row_bytes = w
+        .checked_mul(bpp as usize / 8)
+        .and_then(|v| v.checked_add(3))
+        .map(|v| v & !3)
+        .ok_or_else(|| IoError::InvalidData("BMP row stride overflow".into()))?;
+    let total_bytes = row_bytes
+        .checked_mul(h)
+        .and_then(|v| pixel_offset.checked_add(v))
+        .ok_or_else(|| IoError::InvalidData("BMP image size overflow".into()))?;
+    if total_bytes > bytes.len() {
         return Err(IoError::Parse("Truncated BMP pixel data".into()));
     }
+    let row_stride = row_bytes;
 
     let mut out = Vec::with_capacity(safe_prealloc_capacity(w * h, n_comp, MAX_ALLOC_BYTES)?);
     for y in 0..h {

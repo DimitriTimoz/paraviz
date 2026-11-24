@@ -723,19 +723,28 @@ fn gltf_read_accessor_f32(
 
     let bv_offset = bv.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let acc_offset = acc.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let base = bv_offset + acc_offset;
+    let base = bv_offset
+        .checked_add(acc_offset)
+        .ok_or_else(|| IoError::InvalidData("glTF buffer offset overflow".into()))?;
     let stride = bv
         .get("byteStride")
         .and_then(|v| v.as_u64())
         .map(|s| s as usize)
         .unwrap_or(n_comp * elem_size);
 
+    let total_elems = count
+        .checked_mul(n_comp)
+        .ok_or_else(|| IoError::InvalidData("glTF accessor count overflow".into()))?;
     let mut out = Vec::with_capacity(
-        crate::limits::safe_prealloc_capacity(count * n_comp, 4, crate::limits::MAX_ALLOC_BYTES)?,
+        crate::limits::safe_prealloc_capacity(total_elems, 4, crate::limits::MAX_ALLOC_BYTES)?,
     );
+    let tuple_bytes = n_comp * elem_size;
     for i in 0..count {
-        let row = base + i * stride;
-        if row + n_comp * elem_size > buf.len() {
+        let row = i
+            .checked_mul(stride)
+            .and_then(|off| base.checked_add(off))
+            .ok_or_else(|| IoError::InvalidData("glTF accessor offset overflow".into()))?;
+        if row.checked_add(tuple_bytes).is_none_or(|end| end > buf.len()) {
             return Err(IoError::Parse("glTF accessor reads past end of buffer".into()));
         }
         for c in 0..n_comp {

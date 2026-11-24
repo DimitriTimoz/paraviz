@@ -146,13 +146,9 @@ fn parse_plot3d_xyz_binary(bytes: &[u8]) -> Result<Vec<StructuredGrid>> {
     let le_rec = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let be_rec = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
 
-    let (records, big_endian) = if le_rec > 0 && le_rec < bytes.len() && 4 + le_rec + 4 <= bytes.len()
-        && u32::from_le_bytes(bytes[4 + le_rec..8 + le_rec].try_into().unwrap()) as usize == le_rec
-    {
+    let (records, big_endian) = if is_valid_fortran_first_record(bytes, le_rec, false) {
         (split_fortran_records(bytes, false)?, false)
-    } else if be_rec > 0 && be_rec < bytes.len() && 4 + be_rec + 4 <= bytes.len()
-        && u32::from_be_bytes(bytes[4 + be_rec..8 + be_rec].try_into().unwrap()) as usize == be_rec
-    {
+    } else if is_valid_fortran_first_record(bytes, be_rec, true) {
         (split_fortran_records(bytes, true)?, true)
     } else {
         return Err(IoError::Parse(
@@ -198,10 +194,16 @@ fn parse_plot3d_xyz_binary(bytes: &[u8]) -> Result<Vec<StructuredGrid>> {
         let rec = records.get(next_rec + gi).ok_or_else(|| {
             IoError::Parse(format!("Missing PLOT3D coordinate record for grid {gi}"))
         })?;
-        let n_pts = ni * nj * nk;
-        let has_f64 = rec.len() >= n_pts * 24;
+        let n_pts = ni
+            .checked_mul(nj)
+            .and_then(|v| v.checked_mul(nk))
+            .ok_or_else(|| IoError::InvalidData("PLOT3D grid dimensions overflow".into()))?;
+        let has_f64 = n_pts.checked_mul(24).is_some_and(|need| rec.len() >= need);
         let elem_sz = if has_f64 { 8 } else { 4 };
-        if rec.len() < n_pts * 3 * elem_sz {
+        let coord_bytes = n_pts
+            .checked_mul(3 * elem_sz)
+            .ok_or_else(|| IoError::InvalidData("PLOT3D coordinate size overflow".into()))?;
+        if rec.len() < coord_bytes {
             return Err(IoError::Parse("Truncated PLOT3D coordinate record".into()));
         }
         let mut points = Vec::with_capacity(safe_prealloc_capacity(n_pts, 12, MAX_ALLOC_BYTES)?);
@@ -238,11 +240,7 @@ fn attach_plot3d_q(grids: &mut [StructuredGrid], q_bytes: &[u8]) -> Result<()> {
     } else {
         return Ok(());
     };
-    let big_endian = !(le_rec > 0
-        && le_rec < q_bytes.len()
-        && 4 + le_rec + 4 <= q_bytes.len()
-        && u32::from_le_bytes(q_bytes[4 + le_rec..8 + le_rec].try_into().unwrap()) as usize
-            == le_rec);
+    let big_endian = !is_valid_fortran_first_record(q_bytes, le_rec, false);
     let records = split_fortran_records(q_bytes, big_endian)?;
     let data_start = if records.first().map(|r| r.len()) == Some(4) {
         2usize
@@ -289,6 +287,23 @@ fn attach_plot3d_q(grids: &mut [StructuredGrid], q_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn is_valid_fortran_first_record(bytes: &[u8], rec_len: usize, big_endian: bool) -> bool {
+    let Some(end) = rec_len.checked_add(8) else {
+        return false;
+    };
+    if rec_len == 0 || end > bytes.len() {
+        return false;
+    }
+    let tail = &bytes[4 + rec_len..end];
+    let b: [u8; 4] = tail.try_into().unwrap();
+    let marker = if big_endian {
+        u32::from_be_bytes(b) as usize
+    } else {
+        u32::from_le_bytes(b) as usize
+    };
+    marker == rec_len
+}
+
 fn split_fortran_records(bytes: &[u8], big_endian: bool) -> Result<Vec<&[u8]>> {
     let mut records = Vec::new();
     let mut pos = 0usize;
@@ -299,11 +314,14 @@ fn split_fortran_records(bytes: &[u8], big_endian: bool) -> Result<Vec<&[u8]>> {
             u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize
         };
         pos += 4;
-        if pos + len + 4 > bytes.len() {
+        let Some(next_pos) = pos.checked_add(len).and_then(|v| v.checked_add(4)) else {
+            return Err(IoError::Parse("PLOT3D Fortran record length overflow".into()));
+        };
+        if next_pos > bytes.len() {
             return Err(IoError::Parse("Truncated Fortran record in PLOT3D file".into()));
         }
         records.push(&bytes[pos..pos + len]);
-        pos += len + 4;
+        pos = next_pos;
     }
     Ok(records)
 }

@@ -321,7 +321,11 @@ fn parse_pdb_models(text: &str) -> Result<Vec<PolyData>> {
                 current.is_hetatm.push(u8::from(record == "HETATM"));
             }
             "CONECT" => {
-                let mut nums = line[6..].split_whitespace().filter_map(|s| s.parse::<i32>().ok());
+                let mut nums = line
+                    .get(6..)
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .filter_map(|s| s.parse::<i32>().ok());
                 if let Some(src) = nums.next() {
                     for dst in nums {
                         if src < dst {

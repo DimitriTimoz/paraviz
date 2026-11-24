@@ -108,7 +108,7 @@ pub fn read_dicom_bytes(bytes: &[u8]) -> Result<DataSet> {
             continue;
         }
 
-        if pos + val_len > bytes.len() {
+        if val_len > bytes.len().saturating_sub(pos) {
             break;
         }
         let val = &bytes[pos..pos + val_len];
@@ -174,7 +174,10 @@ pub fn read_dicom_bytes(bytes: &[u8]) -> Result<DataSet> {
     if rows == 0 || cols == 0 {
         return Err(IoError::InvalidData("DICOM file has zero Rows or Columns".into()));
     }
-    let n_vox = rows * cols * samples_per_pixel;
+    let n_vox = rows
+        .checked_mul(cols)
+        .and_then(|v| v.checked_mul(samples_per_pixel))
+        .ok_or_else(|| IoError::InvalidData("DICOM image dimensions overflow".into()))?;
 
     let array_data = match bits_allocated {
         8 => {
