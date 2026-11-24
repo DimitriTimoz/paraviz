@@ -31,6 +31,8 @@ mod drawer;
 mod editors;
 mod inspector;
 mod menu_pipeline;
+#[cfg(test)]
+mod showcase_video;
 mod viewport;
 
 use drawer::{dataset_cell_center, dataset_element_scalar, dataset_point_at, export_spreadsheet_csv};
@@ -427,10 +429,52 @@ impl ParaVizApp {
             .wgpu_render_state
             .as_ref()
             .expect("eframe must be configured with the WGPU backend");
-        let device = rs.device.clone();
-        let queue = rs.queue.clone();
-        let egui_renderer = rs.renderer.clone();
+        let mut app = Self::build_app_state(
+            rs.device.clone(),
+            rs.queue.clone(),
+            rs.renderer.clone(),
+            &cc.egui_ctx,
+        );
 
+        #[cfg(not(target_arch = "wasm32"))]
+        app.trigger_update_check(false);
+
+        if let Some(path) = initial_path {
+            app.load_path(&path);
+        } else {
+            app.load_demo(DemoPreset::VortexStreamlines);
+        }
+
+        app
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_headless(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        egui_renderer: Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>,
+        egui_ctx: &egui::Context,
+    ) -> Self {
+        Self::build_app_state(device, queue, egui_renderer, egui_ctx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_idle_jobs(&mut self) {
+        for _ in 0..600 {
+            self.poll_worker_jobs();
+            if self.active_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn build_app_state(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        egui_renderer: Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>,
+        egui_ctx: &egui::Context,
+    ) -> Self {
         let renderer = WebGpuRenderer::from_device(
             Arc::new(device.clone()),
             Arc::new(queue),
@@ -438,14 +482,14 @@ impl ParaVizApp {
         );
 
         let theme = UiTheme::DarkStudio;
-        apply_theme(&cc.egui_ctx, theme);
+        apply_theme(egui_ctx, theme);
 
         #[cfg(not(target_arch = "wasm32"))]
         let (worker_tx, worker_rx) = mpsc::channel();
         #[cfg(not(target_arch = "wasm32"))]
         let (update_tx, update_rx) = mpsc::channel();
 
-        let mut app = Self {
+        Self {
             session: ParaViz::new(),
             renderer,
             device,
@@ -532,18 +576,7 @@ impl ParaVizApp {
             update_tx,
             #[cfg(not(target_arch = "wasm32"))]
             update_rx,
-        };
-
-        #[cfg(not(target_arch = "wasm32"))]
-        app.trigger_update_check(false);
-
-        if let Some(path) = initial_path {
-            app.load_path(&path);
-        } else {
-            app.load_demo(DemoPreset::VortexStreamlines);
         }
-
-        app
     }
 
     fn invalidate_viewport(&mut self) {
@@ -2461,8 +2494,8 @@ impl ParaVizApp {
 }
 
 
-impl eframe::App for ParaVizApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl ParaVizApp {
+    pub(crate) fn draw_studio_ui(&mut self, ui: &mut egui::Ui) {
         if !self.theme_applied {
             apply_theme(ui.ctx(), self.theme);
             self.theme_applied = true;
@@ -2701,6 +2734,12 @@ impl eframe::App for ParaVizApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         self.draw_update_modal(ui.ctx());
+    }
+}
+
+impl eframe::App for ParaVizApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw_studio_ui(ui);
     }
 }
 
