@@ -61,7 +61,7 @@ pub use histogram::{compute_histogram, HistogramResult};
 pub use integrate::IntegrateVariablesFilter;
 pub use isovolume::IsoVolumeFilter;
 pub use normals::GenerateNormalsFilter;
-pub use probe::{CellDataToPointDataFilter, PointDataToCellDataFilter, ProbeOverLineFilter};
+pub use probe::{CellDataToPointDataFilter, PointDataToCellDataFilter, ProbeOverLineFilter, sample_point_component};
 pub use reflect::{ReflectFilter, ReflectPlane};
 pub use resample::{ResampleToImageFilter, ResampleWithDatasetFilter};
 pub use shrink::ShrinkFilter;

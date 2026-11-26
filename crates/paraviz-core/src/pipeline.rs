@@ -79,14 +79,15 @@ pub type BoxedSource = Box<dyn Source>;
 pub type BoxedFilter = Box<dyn Filter>;
 pub type BoxedMultiFilter = Box<dyn MultiInputFilter>;
 
+#[derive(Clone)]
 enum NodeKind {
-    Source(BoxedSource),
+    Source(Arc<dyn Source>),
     Filter {
-        filter: BoxedFilter,
+        filter: Arc<dyn Filter>,
         input: NodeId,
     },
     MultiFilter {
-        filter: BoxedMultiFilter,
+        filter: Arc<dyn MultiInputFilter>,
         inputs: Vec<NodeId>,
     },
 }
@@ -121,7 +122,7 @@ impl PipelineGraph {
             id,
             PipelineNodeEntry {
                 label: label.into(),
-                kind: NodeKind::Source(source),
+                kind: NodeKind::Source(source.into()),
                 dirty: true,
                 cached_output: None,
                 cached_time: 0.0,
@@ -146,7 +147,7 @@ impl PipelineGraph {
             id,
             PipelineNodeEntry {
                 label: label.into(),
-                kind: NodeKind::Filter { filter, input },
+                kind: NodeKind::Filter { filter: filter.into(), input },
                 dirty: true,
                 cached_output: None,
                 cached_time: 0.0,
@@ -184,7 +185,7 @@ impl PipelineGraph {
             id,
             PipelineNodeEntry {
                 label: label.into(),
-                kind: NodeKind::MultiFilter { filter, inputs },
+                kind: NodeKind::MultiFilter { filter: filter.into(), inputs },
                 dirty: true,
                 cached_output: None,
                 cached_time: 0.0,
@@ -247,7 +248,7 @@ impl PipelineGraph {
             .nodes
             .get_mut(&id)
             .ok_or(PipelineError::MissingNode(id))?;
-        entry.kind = NodeKind::MultiFilter { filter, inputs };
+        entry.kind = NodeKind::MultiFilter { filter: filter.into(), inputs };
         self.mark_dirty(id);
         Ok(())
     }
@@ -259,7 +260,7 @@ impl PipelineGraph {
             .nodes
             .get_mut(&id)
             .ok_or(PipelineError::MissingNode(id))?;
-        entry.kind = NodeKind::Source(source);
+        entry.kind = NodeKind::Source(source.into());
         for input in inputs {
             if let Some(dependents) = self.dependents.get_mut(&input) {
                 dependents.retain(|&dependent| dependent != id);
@@ -283,7 +284,7 @@ impl PipelineGraph {
                 ))
             }
         };
-        entry.kind = NodeKind::Filter { filter, input };
+        entry.kind = NodeKind::Filter { filter: filter.into(), input };
         self.mark_dirty(id);
         Ok(())
     }
@@ -343,7 +344,7 @@ impl PipelineGraph {
 
         let (needs_eval, input_ids) = {
             let entry = self.nodes.get(&id).ok_or(PipelineError::MissingNode(id))?;
-            let time_changed = (entry.cached_time - time).abs() > 1e-12;
+            let time_changed = entry.cached_time != time;
             let needs_eval = entry.dirty || entry.cached_output.is_none() || time_changed;
             let input_ids = match &entry.kind {
                 NodeKind::Source(_) => Vec::new(),
@@ -417,6 +418,41 @@ impl PipelineGraph {
         let mut ids: Vec<NodeId> = self.nodes.keys().copied().collect();
         ids.sort();
         ids
+    }
+
+    /// Returns the node and its transitive input nodes exactly once.
+    pub fn upstream_nodes(&self, root: NodeId) -> Result<Vec<NodeId>, PipelineError> {
+        if !self.nodes.contains_key(&root) {
+            return Err(PipelineError::MissingNode(root));
+        }
+        let mut nodes = vec![root];
+        let mut visited = HashSet::from([root]);
+        let mut index = 0;
+        while let Some(&node) = nodes.get(index) {
+            nodes.extend(self.inputs(node).into_iter().filter(|id| visited.insert(*id)));
+            index += 1;
+        }
+        Ok(nodes)
+    }
+
+    /// Shares the current upstream algorithms with a new graph that has its own output cache.
+    /// Subsequent edits to either graph replace its algorithms independently.
+    pub fn fork_upstream(&self, root: NodeId) -> Result<Self, PipelineError> {
+        let mut fork = Self { next_id: self.next_id, ..Self::default() };
+        for id in self.upstream_nodes(root)? {
+            let entry = &self.nodes[&id];
+            fork.nodes.insert(id, PipelineNodeEntry {
+                label: entry.label.clone(),
+                kind: entry.kind.clone(),
+                dirty: true,
+                cached_output: None,
+                cached_time: 0.0,
+            });
+            for input in self.inputs(id) {
+                fork.dependents.entry(input).or_default().push(id);
+            }
+        }
+        Ok(fork)
     }
 
     /// Returns the primary parent node ID if `id` is a filter node.

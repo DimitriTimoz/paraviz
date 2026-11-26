@@ -34,6 +34,7 @@ mod menu_pipeline;
 #[cfg(test)]
 mod showcase_video;
 mod viewport;
+mod temporal_probe;
 
 use drawer::{dataset_cell_center, dataset_element_scalar, dataset_point_at, export_spreadsheet_csv};
 
@@ -49,6 +50,7 @@ enum InspectorTab {
 enum DrawerTab {
     Spreadsheet,
     Chart,
+    TemporalProbe,
     RustTrace,
 }
 
@@ -367,6 +369,7 @@ pub struct ParaVizApp {
     show_drawer: bool,
     drawer_tab: DrawerTab,
     chart_state: ChartState,
+    temporal_probe: temporal_probe::TemporalProbePanel,
     spreadsheet_target: SpreadsheetTarget,
     spreadsheet_offset: usize,
     spreadsheet_page_size: usize,
@@ -528,6 +531,7 @@ impl ParaVizApp {
             show_drawer: false,
             drawer_tab: DrawerTab::Spreadsheet,
             chart_state: ChartState::default(),
+            temporal_probe: Default::default(),
             spreadsheet_target: SpreadsheetTarget::Points,
             spreadsheet_offset: 0,
             spreadsheet_page_size: 200,
@@ -844,6 +848,7 @@ impl ParaVizApp {
     }
 
     fn reset_pane_overrides(&mut self) {
+        self.temporal_probe = Default::default();
         self.selected_multiblock_patch = None;
         for pane in &mut self.panes {
             pane.visible_nodes_override = None;

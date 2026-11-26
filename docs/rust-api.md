@@ -85,6 +85,7 @@ For every underlying `ActorStyle`, `SceneSettings`, `Camera`, `ScalarBarConfig`,
 | `seed_evaluated(id, arc_ds, time)` | Populate an already-evaluated dataset into the pipeline cache (for background worker integration) |
 | `gpu_contour(label, input, field_opt, iso)` | Run WebGPU Compute Marching Cubes (`GpuContourEngine`) on an `ImageData` node |
 | `set_time(t)` / `all_time_steps()` | Switch active time step and query source time steps |
+| `prepare_temporal_probe(id, request)?.run()` | Sample a point-data component at fixed world coordinates across the selected pipeline’s time steps. Missing samples are `None` and have an empty value in `to_csv()`. |
 | `evaluate(id)` / `update_visible()` / `update_all()` | Execute demand-driven pipeline nodes |
 | `pick(px, py, width, height)` | Cast a 3D raycast pick query against visible actors (`PickResult`, including `block_path`) |
 | `render_rgba(w, h)` / `render_png(path, w, h)` | Render headless `Rgba8Unorm` pixels or PNG (supports `transparent_background`, `show_scalar_bar`, `ScalarBarConfig`, `show_time_annotation`, and `annotations`) |

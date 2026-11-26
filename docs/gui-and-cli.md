@@ -60,6 +60,7 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 ### Bottom Drawer Tabs
 - **Spreadsheet**: Paged `Points` / `Cells` / `Field` table, column filter, click-to-highlight in 3D, `Export CSV`.
 - **Chart / Histogram**: Multi-series `XY Plot (ArcLength)` for `ProbeOverLine` / streamlines (`Markers`, `Log Y`, CSV export) and binned `Scalar Histogram`.
+- **Temporal Probe**: Select a temporal pipeline node, enter a fixed world position or use **Use picked position**, enter a point field and its zero-based component, and click **Compute**. The chart marks missing steps and **Export CSV…** includes them as rows with an empty value.
 - **Rust Trace**: Compilable `paraviz` Rust code with `Copy to Clipboard`.
 
 ---

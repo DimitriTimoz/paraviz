@@ -142,6 +142,7 @@ For detailed API field behavior see [Rendering & Scene Parameters](rendering-and
 
 - **Spreadsheet**: Inspect `Points`, `Cells`, or `Field` attributes in pages, filter columns by name, click any row to place the 3D selection highlight marker in the viewport, and export to `.csv`.
 - **Chart / Histogram**: Automatically switches to multi-series **XY Plot (`ArcLength`)** for `ProbeOverLineFilter` and `StreamTracerFilter` outputs (with `Markers`, `Log Y`, series checkboxes, and `.csv` export), or displays an interactive binned **Scalar Histogram** for any array/component.
+- **Temporal Probe**: Plot a point-data component at a fixed position across the selected node’s available time steps. Select the node, open the drawer’s **Temporal Probe** tab, set the coordinates or use **Use picked position**, then select **Compute**. Hover **Missing** to see unavailable times. Export the full series with **Export CSV…**. Saving the session retains the last probe settings so you can recompute after reopening.
 - **Rust Trace**: Live generated `paraviz` Rust API source reproducing your session (`ParaViz::to_rust_trace()`) with **Copy to Clipboard**.
 
 ---

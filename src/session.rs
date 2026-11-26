@@ -1,5 +1,6 @@
 //! High-level stateful ParaView-style pipeline, scene, and rendering session API.
 
+use crate::temporal_probe::{TemporalProbe, TemporalProbeRequest};
 use paraviz_core::{
     ColorMap, ColorMapPreset, DataSet, Filter, NodeId, PipelineError, PipelineGraph,
     PipelineInfo, Source, TransferFunction,
@@ -500,6 +501,8 @@ pub struct PipelineState {
     pub camera: Camera,
     pub settings: SceneSettings,
     pub time: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_probe: Option<(u64, TemporalProbeRequest)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,6 +531,7 @@ pub struct ParaViz {
     pub widgets: Vec<ViewportWidget>,
     pub selection_highlight: Option<[f32; 3]>,
     pub time: f64,
+    pub temporal_probe: Option<(NodeId, TemporalProbeRequest)>,
     renderer: Option<WebGpuRenderer>,
 }
 
@@ -548,6 +552,7 @@ impl ParaViz {
             widgets: Vec::new(),
             selection_highlight: None,
             time: 0.0,
+            temporal_probe: None,
             renderer: None,
         }
     }
@@ -815,6 +820,9 @@ impl ParaViz {
     pub fn remove_node(&mut self, id: NodeId) -> Vec<NodeId> {
         let removed = self.graph.remove_node(id);
         self.nodes.retain(|n| !removed.contains(&n.id));
+        if self.temporal_probe.as_ref().is_some_and(|(id, _)| removed.contains(id)) {
+            self.temporal_probe = None;
+        }
         removed
     }
 
@@ -856,6 +864,33 @@ impl ParaViz {
         ts.sort_by(|a, b| a.total_cmp(b));
         ts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
         ts
+    }
+
+    /// Creates an independent probe over time steps advertised by the node or its inputs.
+    pub fn prepare_temporal_probe(
+        &self,
+        node: NodeId,
+        request: TemporalProbeRequest,
+    ) -> Result<TemporalProbe, SessionError> {
+        if request.field.is_empty() || request.position.iter().any(|value| !value.is_finite()) {
+            return Err(PipelineError::ExecutionFailed(
+                "Temporal probe requires a field name and finite coordinates".into(),
+            ).into());
+        }
+        let upstream = self.graph.upstream_nodes(node)?;
+        let mut times: Vec<_> = self.nodes.iter()
+            .filter(|entry| upstream.contains(&entry.id))
+            .flat_map(|entry| entry.time_steps.iter().copied())
+            .filter(|time| time.is_finite())
+            .collect();
+        times.sort_by(f64::total_cmp);
+        times.dedup();
+        if times.is_empty() {
+            return Err(PipelineError::ExecutionFailed(
+                "The selected node has no advertised time steps".into(),
+            ).into());
+        }
+        Ok(TemporalProbe { graph: self.graph.fork_upstream(node)?, node, times, request })
     }
 
     /// Evaluates a single node on demand at the current `time`.
@@ -1284,6 +1319,7 @@ impl ParaViz {
             camera: self.camera.clone(),
             settings: self.settings.clone(),
             time: self.time,
+            temporal_probe: self.temporal_probe.clone().map(|(id, request)| (id.0, request)),
         };
         Ok(serde_json::to_string_pretty(&state)?)
     }
@@ -1344,6 +1380,9 @@ impl ParaViz {
             id_map.insert(sn.id, new_id);
             depth_map.insert(sn.id, depth);
         }
+        pv.temporal_probe = state.temporal_probe.and_then(|(id, request)| {
+            id_map.get(&id).copied().map(|id| (id, request))
+        });
         Ok(pv)
     }
 

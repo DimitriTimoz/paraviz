@@ -369,6 +369,41 @@ fn paint_xy_arclength_plot(
         return;
     }
 
+    paint_xy_series(ui, &x_vals, &active_series, PlotOptions {
+        x_label: "ArcLength",
+        show_markers: state.show_markers,
+        log_y: state.log_y,
+        show_gaps: false,
+    }, theme);
+}
+
+pub fn paint_temporal_probe(ui: &mut egui::Ui, result: &TemporalProbeResult, theme: UiTheme) {
+    let times: Vec<_> = result.samples.iter().map(|sample| sample.time).collect();
+    let values: Vec<_> = result.samples.iter().map(|sample| sample.value.unwrap_or(f64::NAN)).collect();
+    let active = [(result.request.field.as_str(), &values, CHART_PALETTE[0])];
+    paint_xy_series(ui, &times, &active, PlotOptions {
+        x_label: "Time",
+        show_markers: true,
+        log_y: false,
+        show_gaps: true,
+    }, theme);
+}
+
+struct PlotOptions<'a> {
+    x_label: &'a str,
+    show_markers: bool,
+    log_y: bool,
+    show_gaps: bool,
+}
+
+fn paint_xy_series(
+    ui: &mut egui::Ui,
+    x_vals: &[f64],
+    active_series: &[(&str, &Vec<f64>, egui::Color32)],
+    options: PlotOptions<'_>,
+    theme: UiTheme,
+) {
+    let pal = palette(theme);
     let x_min = x_vals.iter().copied().fold(f64::INFINITY, f64::min);
     let x_max = x_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let (x_min, x_max) = if (x_max - x_min).abs() < 1e-12 {
@@ -379,7 +414,7 @@ fn paint_xy_arclength_plot(
 
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
-    for (_, ys, _) in &active_series {
+    for (_, ys, _) in active_series {
         for &y in ys.iter() {
             if y.is_finite() {
                 y_min = y_min.min(y);
@@ -450,7 +485,7 @@ fn paint_xy_arclength_plot(
 
     let label_font = egui::FontId::monospace(10.0);
     let y_fmt = |v: f64| -> String {
-        if state.log_y {
+        if options.log_y {
             format!("1e{v:.2}")
         } else {
             format!("{v:.3}")
@@ -487,7 +522,7 @@ fn paint_xy_arclength_plot(
     painter.text(
         egui::pos2(plot_rect.center().x, plot_rect.bottom() + 4.0),
         egui::Align2::CENTER_TOP,
-        "ArcLength",
+        options.x_label,
         label_font.clone(),
         pal.plot_axis,
     );
@@ -508,19 +543,25 @@ fn paint_xy_arclength_plot(
         )
     };
 
-    for (_, ys, color) in &active_series {
-        let pts: Vec<egui::Pos2> = x_vals
-            .iter()
-            .zip(ys.iter())
-            .filter(|(x, y)| x.is_finite() && y.is_finite())
-            .map(|(&x, &y)| to_screen(x, y))
-            .collect();
-        if pts.len() >= 2 {
-            painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(2.0, *color)));
-        }
-        if state.show_markers {
-            for pt in pts {
-                painter.circle_filled(pt, 2.5, *color);
+    for (_, ys, color) in active_series {
+        let mut previous = None;
+        for (&x, &y) in x_vals.iter().zip(ys.iter()) {
+            if x.is_finite() && y.is_finite() {
+                let point = to_screen(x, y);
+                if let Some(previous) = previous {
+                    painter.line_segment([previous, point], egui::Stroke::new(2.0, *color));
+                }
+                if options.show_markers {
+                    painter.circle_filled(point, 2.5, *color);
+                }
+                previous = Some(point);
+            } else if options.show_gaps {
+                previous = None;
+                let bottom = to_screen(x, y_min);
+                painter.line_segment(
+                    [bottom, bottom - egui::vec2(0.0, 8.0)],
+                    egui::Stroke::new(2.0, pal.warning),
+                );
             }
         }
     }
@@ -548,14 +589,16 @@ fn paint_xy_arclength_plot(
             egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.7)),
         );
 
-        let mut tip_lines = vec![format!("ArcLength: {:.4}", x_vals[nearest])];
-        for (name, ys, color) in &active_series {
+        let mut tip_lines = vec![format!("{}: {:.4}", options.x_label, x_vals[nearest])];
+        for (name, ys, color) in active_series {
             let yv = ys[nearest];
             if yv.is_finite() {
                 let pt = to_screen(x_vals[nearest], yv);
                 painter.circle_filled(pt, 4.0, *color);
-                let disp = if state.log_y { 10f64.powf(yv) } else { yv };
+                let disp = if options.log_y { 10f64.powf(yv) } else { yv };
                 tip_lines.push(format!("{name}: {disp:.4}"));
+            } else if options.show_gaps {
+                tip_lines.push(format!("{name}: missing"));
             }
         }
 

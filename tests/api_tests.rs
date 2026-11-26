@@ -196,3 +196,44 @@ fn state_roundtrip_preserves_live_inputs_and_unevaluated_datasets() {
         assert!(restored.evaluate(append).unwrap().bounds().max.x > 10.0);
     }
 }
+
+#[test]
+fn temporal_probe_samples_the_selected_pipeline_and_keeps_gaps() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("series.pvd");
+    let frames = [(0.0, Some(-10.0)), (1.0, None), (2.0, Some(30.0))].map(|(time, value)| {
+        let mut grid = ImageData::new([2, 2, 2], [0.0; 3], [1.0; 3]);
+        if let Some(value) = value {
+            grid.point_data.set_scalars(DataArray::scalars_f32("Pressure", vec![value; 8]));
+        }
+        (time, DataSet::ImageData(grid))
+    });
+    write_pvd_series(&path, &frames).unwrap();
+
+    let mut session = ParaViz::new();
+    let node = session.open(path).unwrap();
+    session.set_time(2.0);
+    let before = session.evaluate(node).unwrap();
+    let isolated = session.add_source_cfg("Other times", SourceConfig::Wavelet(WaveletSource::default())).unwrap();
+    assert!(!session.node(isolated).unwrap().time_steps.is_empty());
+
+    let result = session.prepare_temporal_probe(node, TemporalProbeRequest {
+        position: [0.5; 3],
+        field: "Pressure".into(),
+        component: 0,
+    }).unwrap().run().unwrap();
+    assert_eq!(result.samples.iter().map(|step| step.value).collect::<Vec<_>>(), vec![Some(-10.0), None, Some(30.0)]);
+    assert!(result.to_csv().contains("1,,missing,\"Pressure\",0,0.5,0.5,0.5"));
+    session.temporal_probe = Some((node, result.request.clone()));
+    let restored = ParaViz::load_state_json(&session.save_state_json().unwrap()).unwrap();
+    let (restored_node, request) = restored.temporal_probe.clone().unwrap();
+    assert_eq!(restored.prepare_temporal_probe(restored_node, request).unwrap().run().unwrap(), result);
+    assert_eq!(session.time, 2.0);
+    assert!(std::sync::Arc::ptr_eq(&before, &session.evaluate(node).unwrap()));
+
+    let steps: Vec<_> = frames.iter().map(|(_, dataset)| dataset).collect();
+    let statistics = TemporalStatisticsFilter::default().compute_over_steps(&steps).unwrap();
+    let fields = statistics.point_data().unwrap();
+    assert_eq!(fields.get("Pressure_average").unwrap().get_scalar(0), 10.0);
+    assert_eq!(fields.get("Pressure_stddev").unwrap().get_scalar(0), 20.0);
+}

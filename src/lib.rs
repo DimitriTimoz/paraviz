@@ -57,6 +57,7 @@ pub use paraviz_sources as sources;
 
 pub mod demos;
 pub mod session;
+pub mod temporal_probe;
 
 pub use demos::DemoPreset;
 pub use session::{
@@ -101,6 +102,7 @@ pub mod prelude {
         ViewportAnnotation, ViewportWidget, WebGpuRenderer,
     };
     pub use crate::session::{FilterConfig, ParaViz, SessionError, SourceConfig};
+    pub use crate::temporal_probe::{TemporalProbe, TemporalProbeRequest, TemporalProbeResult, TemporalSample};
     pub use crate::sources::{
         ArrowSource, ConeSource, CubeSource, CylinderSource, DiskSource, GyroidSource, LineSource,
         PlaneSource, PointCloudSource, SphereSource, SuperquadricSource, TorusSource,

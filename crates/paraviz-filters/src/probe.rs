@@ -295,3 +295,32 @@ impl Filter for ProbeOverLineFilter {
         }))
     }
 }
+
+
+/// Interpolates a point-data component at a fixed world-space position.
+/// For multi-block data, uses the first block with a finite sample.
+pub fn sample_point_component(
+    dataset: &DataSet,
+    position: [f32; 3],
+    field: &str,
+    component: usize,
+) -> Option<f64> {
+    if let DataSet::MultiBlock(blocks) = dataset {
+        return blocks.blocks.iter().find_map(|(_, block)| {
+            sample_point_component(block, position, field, component)
+        });
+    }
+    let array = dataset.point_data()?.get(field)?;
+    if component >= array.num_components || array.num_tuples() != dataset.num_points() {
+        return None;
+    }
+    let sampler = SpatialSampler::new(dataset).ok()?;
+    let weights = sampler.sample_weights(Vec3::from_array(position))?;
+    let mut value = 0.0;
+    for (index, weight) in weights {
+        if weight != 0.0 {
+            value += array.data.get_f64(index * array.num_components + component) * weight;
+        }
+    }
+    value.is_finite().then_some(value)
+}

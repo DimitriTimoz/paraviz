@@ -631,7 +631,7 @@ Merges `PolyData` inputs into `PolyData`, or mixed/volumetric datasets into `Uns
 ---
 
 #### `TemporalStatisticsFilter` (`FilterConfig::TemporalStatistics`)
-Aggregates vertex statistics across every block/time step of a `MultiBlockDataSet` into arrays suffixed `_average`, `_minimum`, `_maximum`, `_stddev`.
+Aggregates vertex statistics across every block/time step of a `MultiBlockDataSet` into arrays suffixed `_average`, `_minimum`, `_maximum`, `_stddev`. Each component uses only finite values from steps with a matching array and shape. A component with no observations is NaN.
 
 | Parameter | Type | Default | Notes |
 | --- | --- | --- | --- |

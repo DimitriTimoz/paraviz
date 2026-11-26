@@ -121,73 +121,45 @@ impl TemporalStatisticsFilter {
             return Err(PipelineError::ExecutionFailed("No time steps provided".into()));
         };
         let mut out = (*first).clone();
-        let n_steps = steps.len() as f64;
-
-        let Some(first_pd) = first.point_data() else {
-            return Ok(out);
-        };
+        let point_count = first.num_points();
+        let fields: Vec<_> = steps.iter()
+            .filter(|step| step.num_points() == point_count)
+            .filter_map(|step| step.point_data())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
         let mut new_arrays = Vec::new();
-        for arr in first_pd.arrays() {
-            let len = arr.data.len();
-            let nc = arr.num_components;
-            let mut sum = vec![0.0f64; len];
-            let mut sum_sq = vec![0.0f64; len];
-            let mut min_v = vec![f64::INFINITY; len];
-            let mut max_v = vec![f64::NEG_INFINITY; len];
-
-            for step in steps {
-                if let Some(a) = step.point_data().and_then(|pd| pd.get(&arr.name))
-                    && a.data.len() == len {
-                        for i in 0..len {
-                            let v = a.data.get_f64(i);
-                            sum[i] += v;
-                            sum_sq[i] += v * v;
-                            if v < min_v[i] {
-                                min_v[i] = v;
-                            }
-                            if v > max_v[i] {
-                                max_v[i] = v;
-                            }
-                        }
-                    }
+        for array in fields.iter().flat_map(|field| field.arrays()) {
+            let components = array.num_components;
+            if array.num_tuples() != point_count || !seen.insert(&array.name) {
+                continue;
             }
-
-            if self.compute_average {
-                let avg: Vec<f32> = sum.iter().map(|&s| (s / n_steps) as f32).collect();
-                new_arrays.push(DataArray::new(
-                    format!("{}_average", arr.name),
-                    nc,
-                    ArrayData::F32(avg),
-                ));
+            let len = array.data.len();
+            let mut stats = vec![RunningStatistics::default(); len];
+            for other in fields.iter().filter_map(|field| field.get(&array.name)) {
+                if other.num_components != components || other.data.len() != len {
+                    continue;
+                }
+                for (i, stat) in stats.iter_mut().enumerate() {
+                    stat.add(other.data.get_f64(i));
+                }
             }
-            if self.compute_minimum {
-                let mn: Vec<f32> = min_v.iter().map(|&v| v as f32).collect();
-                new_arrays.push(DataArray::new(
-                    format!("{}_minimum", arr.name),
-                    nc,
-                    ArrayData::F32(mn),
-                ));
-            }
-            if self.compute_maximum {
-                let mx: Vec<f32> = max_v.iter().map(|&v| v as f32).collect();
-                new_arrays.push(DataArray::new(
-                    format!("{}_maximum", arr.name),
-                    nc,
-                    ArrayData::F32(mx),
-                ));
-            }
-            if self.compute_stddev {
-                let sd: Vec<f32> = (0..len)
-                    .map(|i| {
-                        let mean = sum[i] / n_steps;
-                        ((sum_sq[i] / n_steps) - mean * mean).max(0.0).sqrt() as f32
-                    })
-                    .collect();
-                new_arrays.push(DataArray::new(
-                    format!("{}_stddev", arr.name),
-                    nc,
-                    ArrayData::F32(sd),
-                ));
+            let outputs: [(bool, &str, StatisticValue); 4] = [
+                (self.compute_average, "average", |stat| stat.mean),
+                (self.compute_minimum, "minimum", |stat| stat.min),
+                (self.compute_maximum, "maximum", |stat| stat.max),
+                (self.compute_stddev, "stddev", |stat| (stat.m2 / stat.count as f64).max(0.0).sqrt()),
+            ];
+            for (enabled, suffix, value) in outputs {
+                if enabled {
+                    let values = stats.iter().map(|stat| {
+                        if stat.count == 0 { f32::NAN } else { value(stat) as f32 }
+                    }).collect();
+                    new_arrays.push(DataArray::new(
+                        format!("{}_{suffix}", array.name),
+                        components,
+                        ArrayData::F32(values),
+                    ));
+                }
             }
         }
 
@@ -197,6 +169,36 @@ impl TemporalStatisticsFilter {
             }
         }
         Ok(out)
+    }
+}
+
+type StatisticValue = fn(&RunningStatistics) -> f64;
+
+#[derive(Clone)]
+struct RunningStatistics {
+    count: usize,
+    mean: f64,
+    m2: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for RunningStatistics {
+    fn default() -> Self {
+        Self { count: 0, mean: 0.0, m2: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY }
+    }
+}
+
+impl RunningStatistics {
+    fn add(&mut self, value: f64) {
+        if value.is_finite() {
+            self.count += 1;
+            let delta = value - self.mean;
+            self.mean += delta / self.count as f64;
+            self.m2 += delta * (value - self.mean);
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+        }
     }
 }
 

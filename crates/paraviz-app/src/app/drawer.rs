@@ -5,6 +5,7 @@ impl ParaVizApp {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.drawer_tab, DrawerTab::Spreadsheet, "Spreadsheet");
             ui.selectable_value(&mut self.drawer_tab, DrawerTab::Chart, "Chart / Histogram");
+            ui.selectable_value(&mut self.drawer_tab, DrawerTab::TemporalProbe, "Temporal Probe");
             ui.selectable_value(&mut self.drawer_tab, DrawerTab::RustTrace, "Rust Trace");
             if self.drawer_tab == DrawerTab::Spreadsheet {
                 ui.separator();
@@ -43,6 +44,7 @@ impl ParaVizApp {
                     self.draw_chart_view(ui);
                 });
             }
+            DrawerTab::TemporalProbe => self.draw_temporal_probe(ui),
             DrawerTab::RustTrace => {
                 let mut trace = self.session.to_rust_trace();
                 ui.horizontal(|ui| {
