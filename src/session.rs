@@ -50,6 +50,9 @@ pub enum SessionError {
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
+    #[error("Cannot save node '{0}': evaluate this custom node first")]
+    UnsavedCustomNode(String),
+
     #[error("Node {0:?} not found in session")]
     MissingNode(NodeId),
 }
@@ -325,6 +328,8 @@ pub struct SessionNode {
     pub cached_dataset: Option<Arc<DataSet>>,
     pub time_steps: Vec<f64>,
     auto_styled: bool,
+    in_memory_dataset: Option<Arc<DataSet>>,
+    multi_filter_config: Option<MultiFilterConfig>,
 }
 
 impl SessionNode {
@@ -468,6 +473,26 @@ impl<'a> DisplayHandle<'a> {
     }
 }
 
+/// Serializable configuration for the built-in filters with multiple live inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MultiFilterConfig {
+    AppendDatasets,
+    ResampleWithDataset,
+    StreamTracerWithCustomSource(StreamTracerFilter),
+}
+
+impl MultiFilterConfig {
+    fn build_filter(&self) -> Box<dyn paraviz_core::MultiInputFilter> {
+        match self {
+            Self::AppendDatasets => Box::new(AppendDatasetsFilter::new()),
+            Self::ResampleWithDataset => Box::new(ResampleWithDatasetFilter),
+            Self::StreamTracerWithCustomSource(config) => {
+                Box::new(StreamTracerWithCustomSource::new(config.clone()))
+            }
+        }
+    }
+}
+
 /// Serializable snapshot of a [`ParaViz`] pipeline, styles, and camera.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineState {
@@ -486,6 +511,10 @@ pub struct SerializedNode {
     pub filter: Option<FilterConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_dataset: Option<DataSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_filter: Option<MultiFilterConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<u64>,
     pub style: ActorStyle,
 }
 
@@ -545,6 +574,8 @@ impl ParaViz {
             cached_dataset: None,
             time_steps: info.time_steps,
             auto_styled: false,
+            in_memory_dataset: None,
+            multi_filter_config: None,
         });
         id
     }
@@ -575,6 +606,8 @@ impl ParaViz {
             cached_dataset: None,
             time_steps: info.time_steps,
             auto_styled: false,
+            in_memory_dataset: None,
+            multi_filter_config: None,
         });
         Ok(id)
     }
@@ -582,11 +615,14 @@ impl ParaViz {
     /// Wraps an in-memory [`DataSet`] as a pipeline source node.
     pub fn add_dataset(&mut self, label: impl Into<String>, dataset: DataSet) -> NodeId {
         let name = label.into();
+        let dataset = Arc::new(dataset);
         let src = InMemorySource {
             label: name.clone(),
-            dataset: Arc::new(dataset),
+            dataset: Arc::clone(&dataset),
         };
-        self.add_source(name, src)
+        let id = self.add_source(name, src);
+        self.nodes.last_mut().unwrap().in_memory_dataset = Some(dataset);
+        id
     }
 
     /// Opens a scientific file (`.vtk`, `.vtp`, `.vti`, `.vtu`, `.vtr`, `.vts`, `.vtm`, `.pvd`, `.xdmf`, `.xmf`, `.stl`, `.obj`, `.ply`, `.csv`, etc.).
@@ -659,6 +695,8 @@ impl ParaViz {
             cached_dataset: Some(arc),
             time_steps,
             auto_styled: true,
+            in_memory_dataset: None,
+            multi_filter_config: None,
         });
         Ok(id)
     }
@@ -682,6 +720,8 @@ impl ParaViz {
             cached_dataset: None,
             time_steps: Vec::new(),
             auto_styled: false,
+            in_memory_dataset: None,
+            multi_filter_config: None,
         });
         Ok(id)
     }
@@ -714,6 +754,8 @@ impl ParaViz {
             cached_dataset: None,
             time_steps,
             auto_styled: false,
+            in_memory_dataset: None,
+            multi_filter_config: None,
         });
         Ok(id)
     }
@@ -729,6 +771,10 @@ impl ParaViz {
         self.graph.update_source(id, src)?;
         let node = self.node_mut(id)?;
         node.source_config = Some(config);
+        node.parent = None;
+        node.filter_config = None;
+        node.in_memory_dataset = None;
+        node.multi_filter_config = None;
         node.time_steps = info.time_steps;
         self.invalidate_subtree(id);
         Ok(())
@@ -753,15 +799,14 @@ impl ParaViz {
     }
 
     fn invalidate_subtree(&mut self, root: NodeId) {
-        let mut stack = vec![root];
-        while let Some(cur) = stack.pop() {
-            if let Some(n) = self.nodes.iter_mut().find(|n| n.id == cur) {
-                n.cached_dataset = None;
-            }
-            for n in &self.nodes {
-                if n.parent == Some(cur) {
-                    stack.push(n.id);
-                }
+        let mut invalidated = std::collections::HashSet::from([root]);
+        // Session nodes are stored in topological order.
+        for node in &mut self.nodes {
+            if invalidated.contains(&node.id)
+                || self.graph.inputs(node.id).iter().any(|id| invalidated.contains(id))
+            {
+                node.cached_dataset = None;
+                invalidated.insert(node.id);
             }
         }
     }
@@ -1120,8 +1165,21 @@ impl ParaViz {
             style: ActorStyle::default(),
             cached_dataset: None,
             auto_styled: false,
+            in_memory_dataset: None,
+            multi_filter_config: None,
             time_steps: Vec::new(),
         });
+        Ok(id)
+    }
+
+    fn add_multi_filter_cfg(
+        &mut self,
+        label: impl Into<String>,
+        inputs: Vec<NodeId>,
+        config: MultiFilterConfig,
+    ) -> Result<NodeId, SessionError> {
+        let id = self.add_multi_filter(label, inputs, config.build_filter())?;
+        self.node_mut(id)?.multi_filter_config = Some(config);
         Ok(id)
     }
 
@@ -1131,10 +1189,10 @@ impl ParaViz {
         source_node: NodeId,
         destination_node: NodeId,
     ) -> Result<NodeId, SessionError> {
-        self.add_multi_filter(
+        self.add_multi_filter_cfg(
             "ResampleWithDataset",
             vec![source_node, destination_node],
-            Box::new(ResampleWithDatasetFilter),
+            MultiFilterConfig::ResampleWithDataset,
         )
     }
 
@@ -1145,10 +1203,10 @@ impl ParaViz {
         seed_node: NodeId,
         config: StreamTracerFilter,
     ) -> Result<NodeId, SessionError> {
-        let id = self.add_multi_filter(
+        let id = self.add_multi_filter_cfg(
             "StreamTracerWithCustomSource",
             vec![field_node, seed_node],
-            Box::new(StreamTracerWithCustomSource::new(config)),
+            MultiFilterConfig::StreamTracerWithCustomSource(config),
         )?;
         if let Ok(n) = self.node_mut(id) {
             n.style.representation = Representation::Wireframe;
@@ -1158,10 +1216,10 @@ impl ParaViz {
 
     /// Appends multiple live pipeline nodes together into a single combined mesh/grid.
     pub fn append_nodes(&mut self, inputs: Vec<NodeId>) -> Result<NodeId, SessionError> {
-        self.add_multi_filter(
+        self.add_multi_filter_cfg(
             "AppendDatasets",
             inputs,
-            Box::new(AppendDatasetsFilter::new()),
+            MultiFilterConfig::AppendDatasets,
         )
     }
 
@@ -1193,25 +1251,36 @@ impl ParaViz {
                 .nodes
                 .iter()
                 .map(|n| {
-                    let custom_dataset = if n.source_config.is_none() && n.filter_config.is_none() {
-                        n.cached_dataset
-                            .as_deref()
-                            .cloned()
-                            .or_else(|| self.graph.cached_output(n.id).map(|arc| (*arc).clone()))
+                    let custom_dataset = if n.source_config.is_none()
+                        && n.filter_config.is_none()
+                        && n.multi_filter_config.is_none()
+                    {
+                        let dataset = n.in_memory_dataset.clone()
+                            .or_else(|| n.cached_dataset.clone())
+                            .or_else(|| self.graph.cached_output(n.id))
+                            .ok_or_else(|| SessionError::UnsavedCustomNode(n.name.clone()))?;
+                        Some((*dataset).clone())
                     } else {
                         None
                     };
-                    SerializedNode {
+                    let inputs = if n.multi_filter_config.is_some() {
+                        self.graph.inputs(n.id).into_iter().map(|id| id.0).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(SerializedNode {
                         id: n.id.0,
                         name: n.name.clone(),
                         parent: n.parent.map(|p| p.0),
                         source: n.source_config.clone(),
                         filter: n.filter_config.clone(),
                         custom_dataset,
+                        multi_filter: n.multi_filter_config.clone(),
+                        inputs,
                         style: n.style.clone(),
-                    }
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, SessionError>>()?,
             camera: self.camera.clone(),
             settings: self.settings.clone(),
             time: self.time,
@@ -1240,22 +1309,29 @@ impl ParaViz {
         let mut id_map: HashMap<u64, NodeId> = HashMap::new();
         let mut depth_map: HashMap<u64, usize> = HashMap::new();
         for sn in state.nodes {
+            let resolve_inputs = |ids: &[u64]| -> Result<(Vec<NodeId>, usize), SessionError> {
+                let mut inputs = Vec::with_capacity(ids.len());
+                let mut depth = 0;
+                for old_id in ids {
+                    inputs.push(*id_map.get(old_id)
+                        .ok_or(SessionError::MissingNode(NodeId(*old_id)))?);
+                    depth = depth.max(depth_map[old_id] + 1);
+                }
+                if depth > MAX_PIPELINE_DEPTH {
+                    return Err(PipelineError::ExecutionFailed(format!(
+                        "Session pipeline depth exceeds limit of {MAX_PIPELINE_DEPTH}"
+                    )).into());
+                }
+                Ok((inputs, depth))
+            };
             let (new_id, depth) = if let Some(src) = sn.source {
                 (pv.add_source_cfg(sn.name, src)?, 0)
+            } else if let Some(config) = sn.multi_filter {
+                let (inputs, depth) = resolve_inputs(&sn.inputs)?;
+                (pv.add_multi_filter_cfg(sn.name, inputs, config)?, depth)
             } else if let (Some(old_parent), Some(flt)) = (sn.parent, sn.filter) {
-                let mapped_parent = *id_map
-                    .get(&old_parent)
-                    .ok_or(SessionError::MissingNode(NodeId(old_parent)))?;
-                let parent_depth = depth_map.get(&old_parent).copied().unwrap_or(0);
-                let next_depth = parent_depth + 1;
-                if next_depth > MAX_PIPELINE_DEPTH {
-                    return Err(SessionError::Pipeline(
-                        paraviz_core::PipelineError::ExecutionFailed(format!(
-                            "Session pipeline depth exceeds limit of {MAX_PIPELINE_DEPTH}"
-                        )),
-                    ));
-                }
-                (pv.add_filter_cfg(sn.name, mapped_parent, flt)?, next_depth)
+                let (inputs, depth) = resolve_inputs(&[old_parent])?;
+                (pv.add_filter_cfg(sn.name, inputs[0], flt)?, depth)
             } else if let Some(ds) = sn.custom_dataset {
                 (pv.add_dataset(sn.name, ds), 0)
             } else {

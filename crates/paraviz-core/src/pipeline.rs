@@ -1,7 +1,7 @@
 //! Demand-driven visualization pipeline (equivalent to VTK's `vtkAlgorithm` + `vtkExecutive`).
 
 use crate::dataset::{BoundingBox, DataSet};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -215,7 +215,18 @@ impl PipelineGraph {
             }
         };
         let inputs = if let Some(ni) = new_inputs {
+            if ni.is_empty() {
+                return Err(PipelineError::InputCountMismatch {
+                    node: id,
+                    expected: 1,
+                    actual: 0,
+                });
+            }
+            let downstream: HashSet<_> = self.downstream(id).into_iter().collect();
             for &inp in &ni {
+                if downstream.contains(&inp) {
+                    return Err(PipelineError::CycleDetected(id));
+                }
                 if !self.nodes.contains_key(&inp) {
                     return Err(PipelineError::MissingNode(inp));
                 }
@@ -243,11 +254,17 @@ impl PipelineGraph {
 
     /// Replaces a source implementation and invalidates downstream caches.
     pub fn update_source(&mut self, id: NodeId, source: BoxedSource) -> Result<(), PipelineError> {
+        let inputs = self.inputs(id);
         let entry = self
             .nodes
             .get_mut(&id)
             .ok_or(PipelineError::MissingNode(id))?;
         entry.kind = NodeKind::Source(source);
+        for input in inputs {
+            if let Some(dependents) = self.dependents.get_mut(&input) {
+                dependents.retain(|&dependent| dependent != id);
+            }
+        }
         self.mark_dirty(id);
         Ok(())
     }
@@ -271,31 +288,32 @@ impl PipelineGraph {
         Ok(())
     }
 
+    fn downstream(&self, root: NodeId) -> Vec<NodeId> {
+        let mut nodes = vec![root];
+        let mut visited = HashSet::from([root]);
+        let mut index = 0;
+        while let Some(node) = nodes.get(index) {
+            if let Some(children) = self.dependents.get(node) {
+                nodes.extend(children.iter().copied().filter(|id| visited.insert(*id)));
+            }
+            index += 1;
+        }
+        nodes
+    }
+
     /// Marks `id` and all transitive downstream dependents as dirty.
     pub fn mark_dirty(&mut self, id: NodeId) {
-        let mut stack = vec![id];
-        while let Some(cur) = stack.pop() {
-            if let Some(entry) = self.nodes.get_mut(&cur) {
+        for node in self.downstream(id) {
+            if let Some(entry) = self.nodes.get_mut(&node) {
                 entry.dirty = true;
                 entry.cached_output = None;
-            }
-            if let Some(children) = self.dependents.get(&cur) {
-                stack.extend(children.iter().copied());
             }
         }
     }
 
     /// Removes a node (and recursively detaches/removes any dependents).
     pub fn remove_node(&mut self, id: NodeId) -> Vec<NodeId> {
-        let mut to_remove = vec![id];
-        let mut i = 0;
-        while i < to_remove.len() {
-            let cur = to_remove[i];
-            if let Some(children) = self.dependents.get(&cur) {
-                to_remove.extend(children.iter().copied());
-            }
-            i += 1;
-        }
+        let to_remove = self.downstream(id);
         for rem in &to_remove {
             self.nodes.remove(rem);
             self.dependents.remove(rem);

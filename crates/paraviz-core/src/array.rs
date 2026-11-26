@@ -65,8 +65,8 @@ impl ScalarType {
 /// Underlying typed buffer of a [`DataArray`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ArrayData {
-    F32(Vec<f32>),
-    F64(Vec<f64>),
+    F32(#[serde(with = "float32_buffer")] Vec<f32>),
+    F64(#[serde(with = "float64_buffer")] Vec<f64>),
     I8(Vec<i8>),
     I16(Vec<i16>),
     I32(Vec<i32>),
@@ -76,6 +76,76 @@ pub enum ArrayData {
     U32(Vec<u32>),
     U64(Vec<u64>),
 }
+
+// JSON cannot represent non-finite floats as numbers. Keep the existing numeric format
+// for finite values and accept null from older saves that wrote NaN as null.
+macro_rules! float_buffer_serde {
+    ($module:ident, $float:ty) => {
+        mod $module {
+            use serde::{Deserialize, Deserializer, Serialize, Serializer};
+            use serde::de::{Error, SeqAccess, Visitor};
+            use serde::ser::SerializeSeq;
+
+            pub fn serialize<S: Serializer>(values: &[$float], serializer: S) -> Result<S::Ok, S::Error> {
+                if !serializer.is_human_readable() {
+                    return values.serialize(serializer);
+                }
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    match *value {
+                        v if v.is_nan() => seq.serialize_element("NaN")?,
+                        <$float>::INFINITY => seq.serialize_element("Infinity")?,
+                        <$float>::NEG_INFINITY => seq.serialize_element("-Infinity")?,
+                        v => seq.serialize_element(&v)?,
+                    }
+                }
+                seq.end()
+            }
+
+            pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<$float>, D::Error> {
+                if !deserializer.is_human_readable() {
+                    return Vec::deserialize(deserializer);
+                }
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum Value {
+                    Number($float),
+                    Literal(String),
+                    Null,
+                }
+                struct FloatBuffer;
+                impl<'de> Visitor<'de> for FloatBuffer {
+                    type Value = Vec<$float>;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("an array of numbers or non-finite float literals")
+                    }
+
+                    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                        let mut values = Vec::new();
+                        while let Some(value) = seq.next_element()? {
+                            values.push(match value {
+                                Value::Number(value) => value,
+                                Value::Null => <$float>::NAN,
+                                Value::Literal(value) => match value.as_str() {
+                                    "NaN" => <$float>::NAN,
+                                    "Infinity" => <$float>::INFINITY,
+                                    "-Infinity" => <$float>::NEG_INFINITY,
+                                    _ => return Err(A::Error::unknown_variant(&value, &["NaN", "Infinity", "-Infinity"])),
+                                },
+                            });
+                        }
+                        Ok(values)
+                    }
+                }
+                deserializer.deserialize_seq(FloatBuffer)
+            }
+        }
+    };
+}
+
+float_buffer_serde!(float32_buffer, f32);
+float_buffer_serde!(float64_buffer, f64);
 
 impl ArrayData {
     /// Number of raw scalar elements (tuples * components).

@@ -837,6 +837,13 @@ impl ParaVizApp {
     }
 
     fn reset_pane_overrides_on_session_replace(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_undo_snapshot_at = None;
+        self.reset_pane_overrides();
+    }
+
+    fn reset_pane_overrides(&mut self) {
         self.selected_multiblock_patch = None;
         for pane in &mut self.panes {
             pane.visible_nodes_override = None;
@@ -1103,6 +1110,7 @@ impl ParaVizApp {
     }
 
     fn add_source(&mut self, cfg: SourceConfig) {
+        self.push_undo_snapshot();
         let is_first = self.session.nodes().is_empty();
         let label = self.unique_label(&cfg.default_label());
         match self.session.add_source_cfg(label.clone(), cfg) {
@@ -2263,9 +2271,33 @@ impl ParaVizApp {
     }
 
 
+    // Filter jobs temporarily hide actors while they evaluate. Save the intended visibility.
+    fn history_snapshot(&mut self) -> Result<String, SessionError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let original_visibility: Vec<_> = self.active_job.iter()
+            .flat_map(|job| {
+                job.restore_visibility.iter().copied()
+                    .chain(job.cancel_node_to_remove.map(|id| (id, true)))
+            })
+            .filter_map(|(id, visible)| {
+                let node = self.session.node_mut(id).ok()?;
+                Some((id, std::mem::replace(&mut node.style.visible, visible)))
+            })
+            .collect();
+        let result = self.session.save_state_json();
+        #[cfg(not(target_arch = "wasm32"))]
+        for (id, visible) in original_visibility.into_iter().rev() {
+            if let Ok(node) = self.session.node_mut(id) {
+                node.style.visible = visible;
+            }
+        }
+        result
+    }
+
     pub(super) fn push_undo_snapshot(&mut self) {
-        self.last_undo_snapshot_at = Some(Instant::now());
-        if let Ok(json) = self.session.save_state_json() {
+        if let Ok(json) = self.history_snapshot() {
+            self.last_undo_snapshot_at = Some(Instant::now());
+            self.redo_stack.clear();
             if self.undo_stack.last().is_some_and(|last| last == &json) {
                 return;
             }
@@ -2273,7 +2305,6 @@ impl ParaVizApp {
             if self.undo_stack.len() > 40 {
                 self.undo_stack.remove(0);
             }
-            self.redo_stack.clear();
         }
     }
 
@@ -2286,54 +2317,63 @@ impl ParaVizApp {
         self.push_undo_snapshot();
     }
 
-    fn restore_undo_state(&mut self, json: &str, status: &str) -> bool {
-        match ParaViz::load_state_json(json) {
-            Ok(restored) => {
-                self.session = restored;
-                self.pending_source = None;
-                self.pending_filter = None;
-                self.renaming_node = None;
-                self.picked_highlight = None;
-                self.last_pick = None;
-                if let Some(sel) = self.selected_node {
-                    if self.session.node(sel).is_err() {
-                        self.selected_node = self.session.nodes().last().map(|n| n.id);
-                    }
-                } else {
-                    self.selected_node = self.session.nodes().last().map(|n| n.id);
-                }
-                self.clear_stats_caches();
-                self.invalidate_viewport();
-                self.status_message = status.into();
-                true
-            }
-            Err(e) => {
-                self.error_message = Some(format!("Undo/Redo failed: {e}"));
-                false
-            }
+    fn restore_history(&mut self, json: &str) -> Result<String, SessionError> {
+        let restored = ParaViz::load_state_json(json)?;
+        let current = self.history_snapshot()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(job) = self.active_job.take() {
+            // The whole session is being replaced. Its temporary actor state goes with it.
+            job.cancel_flag.store(true, Ordering::Relaxed);
         }
+        self.session = restored;
+        self.pending_source = None;
+        self.pending_filter = None;
+        self.renaming_node = None;
+        self.picked_highlight = None;
+        self.last_pick = None;
+        self.last_undo_snapshot_at = None;
+        self.selected_node = self.selected_node
+            .filter(|id| self.session.node(*id).is_ok())
+            .or_else(|| self.session.nodes().last().map(|node| node.id));
+        self.clear_stats_caches();
+        self.reset_pane_overrides();
+        self.invalidate_viewport();
+        self.error_message = None;
+        Ok(current)
     }
 
     pub(super) fn undo(&mut self) {
-        let Some(prev_json) = self.undo_stack.pop() else {
+        let Some(json) = self.undo_stack.pop() else {
             self.status_message = "Nothing to undo".into();
             return;
         };
-        if let Ok(cur_json) = self.session.save_state_json() {
-            self.redo_stack.push(cur_json);
+        match self.restore_history(&json) {
+            Ok(current) => {
+                self.redo_stack.push(current);
+                self.status_message = "Undid last pipeline action".into();
+            }
+            Err(err) => {
+                self.undo_stack.push(json);
+                self.error_message = Some(format!("Undo failed: {err}"));
+            }
         }
-        self.restore_undo_state(&prev_json, "Undid last pipeline action");
     }
 
     pub(super) fn redo(&mut self) {
-        let Some(next_json) = self.redo_stack.pop() else {
+        let Some(json) = self.redo_stack.pop() else {
             self.status_message = "Nothing to redo".into();
             return;
         };
-        if let Ok(cur_json) = self.session.save_state_json() {
-            self.undo_stack.push(cur_json);
+        match self.restore_history(&json) {
+            Ok(current) => {
+                self.undo_stack.push(current);
+                self.status_message = "Redid pipeline action".into();
+            }
+            Err(err) => {
+                self.redo_stack.push(json);
+                self.error_message = Some(format!("Redo failed: {err}"));
+            }
         }
-        self.restore_undo_state(&next_json, "Redid pipeline action");
     }
 
     fn handle_modals(&mut self, ctx: &egui::Context) {

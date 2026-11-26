@@ -90,8 +90,16 @@ For every underlying `ActorStyle`, `SceneSettings`, `Camera`, `ScalarBarConfig`,
 | `render_rgba(w, h)` / `render_png(path, w, h)` | Render headless `Rgba8Unorm` pixels or PNG (supports `transparent_background`, `show_scalar_bar`, `ScalarBarConfig`, `show_time_annotation`, and `annotations`) |
 | `render_turntable_gif(...)` / `render_timeseries_gif(...)` | Render 360-degree turntable or time-series animated GIF89a files |
 | `export_dataset(id, path)` / `export_glb(id, path, use_cmap)` / `export_html(id, path, use_cmap)` | Export evaluated node to VTK/mesh/CSV/NIfTI/MHA, binary glTF 2.0, or interactive WebGL2 `.html` |
-| `save_state_json()` / `load_state_json(json)` | Save & restore full pipeline, styles, camera, and `SceneSettings` |
+| `save_state_json()` / `load_state_json(json)` | Save and restore configured pipelines, in-memory data, styles, camera, and `SceneSettings` |
 | `to_rust_trace()` | Emit reproducible Rust code for the current session |
+
+State JSON preserves all input links for `append_nodes`, `resample_with_dataset`, and
+`stream_tracer_with_custom_source`. Datasets added with `add_dataset` are present even
+before evaluation. Custom Rust sources and filters with no serializable configuration
+must be evaluated before saving and reload as static datasets. Floating-point arrays
+preserve `NaN` and infinities in JSON. Older releases cannot read these non-finite
+values or reconstruct the new multi-input state records.
+
 
 ---
 

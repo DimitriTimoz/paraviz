@@ -85,6 +85,8 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 | `Space` | Play / Pause time steps |
 | `Ctrl/Cmd + K` / `Ctrl+Space` | Open Quick Command & Filter Palette |
 | `Ctrl/Cmd + Z` / `Shift+Z` | Undo / Redo pipeline action |
+
+Undo and Redo apply to the current project. Restoring history discards any pending background result from the previous pipeline state.
 | `Ctrl/Cmd + C` / `V` | Copy / Paste filter in Pipeline Browser |
 | `Delete` / `Backspace` | Remove selected pipeline node |
 | `F1` / `?` | Open Keyboard & Mouse Shortcuts modal |

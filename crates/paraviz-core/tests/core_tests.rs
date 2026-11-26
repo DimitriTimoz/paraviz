@@ -118,3 +118,27 @@ fn unstructured_and_multiblock_stats() {
     assert_eq!(mb.num_points(), 4);
     assert_eq!(mb.num_cells(), 1);
 }
+
+#[test]
+fn rejected_input_change_preserves_pipeline() {
+    struct FirstInput;
+
+    impl MultiInputFilter for FirstInput {
+        fn name(&self) -> &str {
+            "FirstInput"
+        }
+
+        fn apply_multi(&self, inputs: &[&DataSet]) -> std::result::Result<DataSet, PipelineError> {
+            Ok(inputs[0].clone())
+        }
+    }
+
+    let mut graph = PipelineGraph::new();
+    let source = graph.add_source("Source", Box::new(ConstWaveSource { value: 2.0 }));
+    let join = graph.add_multi_filter("Join", vec![source], Box::new(FirstInput)).unwrap();
+    let downstream = graph.add_filter("Scale", join, Box::new(ScaleFilter { factor: 3.0 })).unwrap();
+    let result = graph.update_multi_filter(join, Box::new(FirstInput), Some(vec![downstream]));
+    assert!(matches!(result, Err(PipelineError::CycleDetected(id)) if id == join));
+    assert_eq!(graph.inputs(join), vec![source]);
+    assert!(graph.update(downstream, 0.0).is_ok());
+}

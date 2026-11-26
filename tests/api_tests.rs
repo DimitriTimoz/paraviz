@@ -161,3 +161,38 @@ fn multiblock_block_controls_time_annotation_and_preloaded_seed() {
     let rgba = pv.render_rgba(320, 240).unwrap();
     assert_eq!(rgba.len(), 320 * 240 * 4);
 }
+
+#[test]
+fn state_roundtrip_preserves_live_inputs_and_unevaluated_datasets() {
+    use paraviz::core::ArrayData;
+
+    let mut session = ParaViz::new();
+    let mut mesh = PolyData::new();
+    mesh.points.push([0.0, 0.0, 0.0]);
+    mesh.point_data.add_array(DataArray::new(
+        "temperature", 1, ArrayData::F64(vec![f64::NAN]),
+    ));
+    session.add_dataset("Unmeasured temperature", DataSet::PolyData(mesh));
+    let left = session.add_source_cfg("Left", SourceConfig::Cube(CubeSource::default())).unwrap();
+    let right = session.add_source_cfg("Right", SourceConfig::Cube(CubeSource::default())).unwrap();
+    session.append_nodes(vec![left, right]).unwrap();
+
+    let json = session.save_state_json().unwrap();
+    for json in [json.clone(), json.replace("\"NaN\"", "null")] {
+        let mut restored = ParaViz::load_state_json(&json).unwrap();
+        assert_eq!(restored.nodes().len(), 4);
+        let data_id = restored.nodes()[0].id;
+        let data = restored.evaluate(data_id).unwrap();
+        assert!(data.point_data().unwrap().get("temperature").unwrap().get_scalar(0).is_nan());
+
+        let right = restored.nodes()[2].id;
+        let append = restored.nodes()[3].id;
+        assert!(restored.evaluate(append).unwrap().bounds().max.x < 10.0);
+        restored.update_source_cfg(right, SourceConfig::Cube(CubeSource {
+            center: [10.0, 0.0, 0.0],
+            ..Default::default()
+        })).unwrap();
+        assert!(restored.node(append).unwrap().dataset().is_none());
+        assert!(restored.evaluate(append).unwrap().bounds().max.x > 10.0);
+    }
+}
