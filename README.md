@@ -57,6 +57,7 @@ Grab a standalone binary from [**GitHub Releases**](https://github.com/DimitriTi
 - **FEA & Structural Analysis**: Load Exodus II, Abaqus (`.inp`), Gmsh (`.msh`), and VTK meshes with crisp edge rendering, displacement warping, and multi-block patch inspection.
 - **Medical & Volumetric Imaging**: Explore NIfTI, NRRD, MetaImage, DICOM, and raw 3D volumes with real-time 3D raymarching, interactive opacity curves, and live volume clip planes.
 - **3D Meshes, LiDAR & Molecules**: Open STL, OBJ, PLY, OFF, glTF/GLB, X3D, LAS point clouds, and multi-frame XYZ/PDB molecular trajectories.
+- **Reopen and Share Analyses**: Save a project with relative dataset links or export a self-contained project with its time series. Probe a point over time and export each measurement, including missing samples, to CSV.
 - **Share Results in One Click**:
   - **Interactive HTML (`viewer.html`)** — send a self-contained 3D view that anyone can orbit in their browser
   - **Animated GIF Turntables** — 360° loops and time-series animations for slides & papers

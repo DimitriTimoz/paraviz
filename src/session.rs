@@ -1,5 +1,6 @@
 //! High-level stateful ParaView-style pipeline, scene, and rendering session API.
 
+use crate::embedded_source::EmbeddedSource;
 use crate::temporal_probe::{TemporalProbe, TemporalProbeRequest};
 use paraviz_core::{
     ColorMap, ColorMapPreset, DataSet, Filter, NodeId, PipelineError, PipelineGraph,
@@ -109,6 +110,7 @@ pub enum SourceConfig {
         reader: DatasetReader,
     },
     PvdSeries(PathBuf),
+    Embedded(EmbeddedSource),
 }
 
 impl SourceConfig {
@@ -129,6 +131,7 @@ impl SourceConfig {
             Self::Superquadric(_) => "Superquadric".into(),
             Self::Gyroid(_) => "Gyroid".into(),
             Self::PointCloud(_) => "PointCloud".into(),
+            Self::Embedded(_) => "Embedded Dataset".into(),
             Self::File(p) | Self::FileWithReader { path: p, .. } | Self::PvdSeries(p) => p
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -159,6 +162,10 @@ impl SourceConfig {
                 Box::new(VtkFileSource::with_reader(path, *reader))
             }
             Self::PvdSeries(p) => Box::new(PvdSeriesSource::new(p)?),
+            Self::Embedded(source) => {
+                source.validate()?;
+                Box::new(source.clone())
+            }
         };
         Ok(src)
     }
@@ -475,7 +482,7 @@ impl<'a> DisplayHandle<'a> {
 }
 
 /// Serializable configuration for the built-in filters with multiple live inputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MultiFilterConfig {
     AppendDatasets,
     ResampleWithDataset,
@@ -494,8 +501,14 @@ impl MultiFilterConfig {
     }
 }
 
+/// Base directory used by relative file references in a project saved to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ProjectPathBase {
+    ProjectDirectory,
+}
+
 /// Serializable snapshot of a [`ParaViz`] pipeline, styles, and camera.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineState {
     pub nodes: Vec<SerializedNode>,
     pub camera: Camera,
@@ -503,9 +516,23 @@ pub struct PipelineState {
     pub time: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_probe: Option<(u64, TemporalProbeRequest)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path_base: Option<ProjectPathBase>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl PipelineState {
+    pub(crate) fn validate_size(&self) -> Result<(), SessionError> {
+        const MAX_SESSION_NODES: usize = 10_000;
+        if self.nodes.len() > MAX_SESSION_NODES {
+            return Err(PipelineError::ExecutionFailed(format!(
+                "Session exceeds maximum node count of {MAX_SESSION_NODES}"
+            )).into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SerializedNode {
     pub id: u64,
     pub name: String,
@@ -518,6 +545,8 @@ pub struct SerializedNode {
     pub multi_filter: Option<MultiFilterConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_styled: Option<bool>,
     pub style: ActorStyle,
 }
 
@@ -1281,7 +1310,12 @@ impl ParaViz {
 
     /// Serializes the configurable pipeline nodes, custom in-memory datasets, styles, camera, and settings to JSON.
     pub fn save_state_json(&self) -> Result<String, SessionError> {
-        let state = PipelineState {
+        Ok(serde_json::to_string_pretty(&self.state_snapshot()?)?)
+    }
+
+    /// Captures project state without encoding it as JSON. Embedded frames remain shared.
+    pub fn state_snapshot(&self) -> Result<PipelineState, SessionError> {
+        Ok(PipelineState {
             nodes: self
                 .nodes
                 .iter()
@@ -1312,6 +1346,7 @@ impl ParaViz {
                         custom_dataset,
                         multi_filter: n.multi_filter_config.clone(),
                         inputs,
+                        auto_styled: Some(n.auto_styled),
                         style: n.style.clone(),
                     })
                 })
@@ -1320,22 +1355,24 @@ impl ParaViz {
             settings: self.settings.clone(),
             time: self.time,
             temporal_probe: self.temporal_probe.clone().map(|(id, request)| (id.0, request)),
-        };
-        Ok(serde_json::to_string_pretty(&state)?)
+            project_path_base: None,
+        })
     }
 
     /// Reconstructs a [`ParaViz`] session from a JSON state produced by [`Self::save_state_json`].
     pub fn load_state_json(json: &str) -> Result<Self, SessionError> {
-        const MAX_SESSION_NODES: usize = 10_000;
-        const MAX_PIPELINE_DEPTH: usize = 256;
+        let state = serde_json::from_str(json)?;
+        Self::from_state_snapshot(state)
+    }
 
-        let state: PipelineState = serde_json::from_str(json)?;
-        if state.nodes.len() > MAX_SESSION_NODES {
-            return Err(SessionError::Pipeline(
-                paraviz_core::PipelineError::ExecutionFailed(format!(
-                    "Session exceeds maximum node count of {MAX_SESSION_NODES}"
-                )),
-            ));
+    /// Restores a session from a state snapshot with its file paths already resolved.
+    pub fn from_state_snapshot(state: PipelineState) -> Result<Self, SessionError> {
+        const MAX_PIPELINE_DEPTH: usize = 256;
+        state.validate_size()?;
+        if state.project_path_base.is_some() {
+            return Err(IoError::InvalidData(
+                "This state has relative datasets. Open the project from its file location.".into()
+            ).into());
         }
         let mut pv = Self::new();
         pv.camera = state.camera;
@@ -1375,7 +1412,7 @@ impl ParaViz {
             };
             if let Ok(node) = pv.node_mut(new_id) {
                 node.style = sn.style;
-                node.auto_styled = true;
+                node.auto_styled = sn.auto_styled.unwrap_or(true);
             }
             id_map.insert(sn.id, new_id);
             depth_map.insert(sn.id, depth);

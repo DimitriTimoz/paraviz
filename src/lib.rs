@@ -56,10 +56,15 @@ pub use paraviz_render as render;
 pub use paraviz_sources as sources;
 
 pub mod demos;
+pub mod embedded_source;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod project;
 pub mod session;
 pub mod temporal_probe;
 
 pub use demos::DemoPreset;
+#[cfg(not(target_arch = "wasm32"))]
+pub use project::ProjectSaveMode;
 pub use session::{
     DisplayHandle, FilterConfig, InMemorySource, ParaViz, PipelineState, SessionError, SessionNode,
     SourceConfig,
@@ -101,6 +106,8 @@ pub mod prelude {
         RenderScene, Representation, ScalarBarConfig, SceneActor, SceneSettings,
         ViewportAnnotation, ViewportWidget, WebGpuRenderer,
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use crate::project::ProjectSaveMode;
     pub use crate::session::{FilterConfig, ParaViz, SessionError, SourceConfig};
     pub use crate::temporal_probe::{TemporalProbe, TemporalProbeRequest, TemporalProbeResult, TemporalSample};
     pub use crate::sources::{

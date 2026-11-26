@@ -57,6 +57,10 @@ Drag and drop any supported scientific dataset (`.vtk`, `.vtp`, `.vti`, `.vtu`, 
 4. **Information**: `Last 3D Pick` (`Actor`, `Pos`, `Block`, `Pt`, `Cell`, `Scalar`, `Reveal in Spreadsheet`, `Reveal Cell #`), Dataset type/counts/memory/bounds (respecting hidden MultiBlock patches), array table with `Compute Mean / StdDev`.
 5. **Scene**: `Viewport Background` (`ViewportBgPreset` + Top/Bottom RGB), `Camera & Navigation` (`Orthographic Projection`, `FOV` `15..=110` deg, `Ortho Scale`, `Turntable` + `Speed` `0.05..=2.5`, Position/Target, Bookmarks), `Render Quality & Overlays` (MSAA, EDL, Gizmo, BBox, Cube Axes Grid, Transparent Background, 3D Filter Widgets, `Scalar Color Bar`, `Time Annotation (Time:)` + custom `Time Label`), `Scalar Color Bar` layout (`Horizontal Orientation`, `Title`, `Labels` `2..=7`, `Font Scale` `0.6..=2.5`, `Reset Pos`, `Reset Size`), and `Annotations` (`+ Add Annotation`, visible toggle, text, RGBA color, `Size` `8..=48`, normalized `X`/`Y` `0..=1`).
 
+### Projects
+- **File → Save State JSON...** preserves dataset links. Move a project folder together with its datasets and their sidecar files to retain relative references. The desktop app prompts for a replacement when a directly referenced dataset has moved.
+- **File → Save Portable Project...** (desktop) includes the evaluated data for each external source and all its advertised time steps. The resulting JSON can be opened offline on desktop or in the browser. Use **Save State JSON...** for large simulations where the dataset should remain on disk separately.
+
 ### Bottom Drawer Tabs
 - **Spreadsheet**: Paged `Points` / `Cells` / `Field` table, column filter, click-to-highlight in 3D, `Export CSV`.
 - **Chart / Histogram**: Multi-series `XY Plot (ArcLength)` for `ProbeOverLine` / streamlines (`Markers`, `Log Y`, CSV export) and binned `Scalar Histogram`.

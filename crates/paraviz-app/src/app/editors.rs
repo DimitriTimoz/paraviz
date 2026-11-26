@@ -420,6 +420,9 @@ pub(super) fn edit_source_config(ui: &mut egui::Ui, cfg: &mut SourceConfig) -> b
                 changed = true;
             }
         }
+        SourceConfig::Embedded(_) => {
+            ui.label("Data is included in this project.");
+        }
         SourceConfig::PvdSeries(p) => {
             ui.label(format!("Path: {}", p.display()));
             ui.label("Active Reader: PVD Time-Series Reader");

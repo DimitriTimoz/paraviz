@@ -92,6 +92,9 @@ For every underlying `ActorStyle`, `SceneSettings`, `Camera`, `ScalarBarConfig`,
 | `render_turntable_gif(...)` / `render_timeseries_gif(...)` | Render 360-degree turntable or time-series animated GIF89a files |
 | `export_dataset(id, path)` / `export_glb(id, path, use_cmap)` / `export_html(id, path, use_cmap)` | Export evaluated node to VTK/mesh/CSV/NIfTI/MHA, binary glTF 2.0, or interactive WebGL2 `.html` |
 | `save_state_json()` / `load_state_json(json)` | Save and restore configured pipelines, in-memory data, styles, camera, and `SceneSettings` |
+| `save_project(path, mode)` / `load_project(path)` | Save or load a native disk project. Use `ProjectSaveMode::Referenced` for dataset links and `Embedded` for a self-contained file with every advertised time step. |
+| `load_project_with_relocation(path, locate)` | Resolve a missing dataset via a callback before restoring the project. |
+| `state_snapshot()` / `from_state_snapshot(state)` | Capture or restore an in-memory snapshot. Embedded datasets are shared by the snapshots. |
 | `to_rust_trace()` | Emit reproducible Rust code for the current session |
 
 State JSON preserves all input links for `append_nodes`, `resample_with_dataset`, and

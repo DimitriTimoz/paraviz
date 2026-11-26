@@ -17,6 +17,7 @@ use crate::updater::{
     current_version, spawn_check_updates, spawn_install_update, InstallKind, ReleaseUpdateInfo,
     UpdateEvent, UpdateStatus, RELEASES_PAGE_URL,
 };
+use paraviz::PipelineState;
 use paraviz::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -345,8 +346,8 @@ pub struct ParaVizApp {
     renaming_node: Option<(NodeId, String)>,
     copied_filter: Option<(String, FilterConfig)>,
     copied_filter_chain: Vec<(String, FilterConfig)>,
-    undo_stack: Vec<String>,
-    redo_stack: Vec<String>,
+    undo_stack: Vec<PipelineState>,
+    redo_stack: Vec<PipelineState>,
     last_undo_snapshot_at: Option<Instant>,
     workspace_profile: WorkspaceProfile,
     command_palette_open: bool,
@@ -893,6 +894,25 @@ impl ParaVizApp {
         }
     }
 
+    fn install_loaded_state(&mut self, mut session: ParaViz, status: String) {
+        self.error_message = session.update_visible().err().map(|error| error.to_string());
+        self.selected_node = session.temporal_probe.as_ref().map(|(id, _)| *id)
+            .or_else(|| session.nodes().last().map(|node| node.id));
+        self.session = session;
+        self.pending_source = None;
+        self.pending_filter = None;
+        self.renaming_node = None;
+        self.last_pick = None;
+        self.picked_highlight = None;
+        self.highlight_flash_until = None;
+        self.ruler_points.clear();
+        self.clear_stats_caches();
+        self.playing = false;
+        self.reset_pane_overrides_on_session_replace();
+        self.invalidate_viewport();
+        self.status_message = status;
+    }
+
     pub(super) fn load_bytes_from_web(&mut self, name: &str, bytes: &[u8]) {
         let lower = name.to_ascii_lowercase();
         if lower.ends_with(".json") {
@@ -900,24 +920,7 @@ impl ParaVizApp {
                 .map_err(|e| e.to_string())
                 .and_then(|s| ParaViz::load_state_json(s).map_err(|e| e.to_string()))
             {
-                Ok(mut pv) => {
-                    let _ = pv.update_visible();
-                    self.selected_node = pv.nodes().last().map(|n| n.id);
-                    self.session = pv;
-                    self.pending_source = None;
-                    self.pending_filter = None;
-                    self.renaming_node = None;
-                    self.last_pick = None;
-                    self.picked_highlight = None;
-                    self.highlight_flash_until = None;
-                    self.ruler_points.clear();
-                    self.clear_stats_caches();
-                    self.playing = false;
-                    self.error_message = None;
-                    self.reset_pane_overrides_on_session_replace();
-                    self.invalidate_viewport();
-                    self.status_message = format!("Loaded state: {name}");
-                }
+                Ok(session) => self.install_loaded_state(session, format!("Loaded state: {name}")),
                 Err(e) => {
                     self.error_message = Some(format!("Failed to load state {name}: {e}"));
                 }
@@ -949,31 +952,33 @@ impl ParaVizApp {
 
         if ext == "json" {
             #[cfg(not(target_arch = "wasm32"))]
-            self.cancel_active_job(false);
-            match std::fs::read_to_string(path).and_then(|s| {
-                ParaViz::load_state_json(&s).map_err(|e| std::io::Error::other(e.to_string()))
-            }) {
-                Ok(mut pv) => {
-                    let _ = pv.update_visible();
-                    self.selected_node = pv.nodes().last().map(|n| n.id);
-                    self.session = pv;
-                    self.pending_source = None;
-                    self.pending_filter = None;
-                    self.renaming_node = None;
-                    self.last_pick = None;
-                    self.picked_highlight = None;
-                    self.highlight_flash_until = None;
-                    self.ruler_points.clear();
-                    self.clear_stats_caches();
-                    self.playing = false;
-                    self.error_message = None;
-                    self.reset_pane_overrides_on_session_replace();
-                    self.invalidate_viewport();
-                    self.push_recent_file(path);
-                    self.status_message = format!("Loaded state: {}", path.display());
+            {
+                let project_dir = path.parent();
+                let loaded = ParaViz::load_project_with_relocation(path, |missing| {
+                    let mut dialog = rfd::FileDialog::new().set_title(format!(
+                        "Locate missing dataset {}", missing.display()
+                    ));
+                    if let Some(directory) = missing.parent().filter(|dir| dir.is_dir())
+                        .or(project_dir)
+                    {
+                        dialog = dialog.set_directory(directory);
+                    }
+                    dialog.pick_file()
+                });
+                match loaded {
+                    Ok(session) => {
+                        self.cancel_active_job(false);
+                        self.install_loaded_state(session, format!("Loaded state: {}", path.display()));
+                        self.push_recent_file(path);
+                    }
+                    Err(error) => self.error_message = Some(format!("Failed to load state: {error}")),
                 }
-                Err(e) => {
-                    self.error_message = Some(format!("Failed to load state: {e}"));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                match std::fs::read(path) {
+                    Ok(bytes) => self.load_bytes_from_web(&path.display().to_string(), &bytes),
+                    Err(error) => self.error_message = Some(format!("Failed to load state: {error}")),
                 }
             }
             return;
@@ -2277,7 +2282,7 @@ impl ParaVizApp {
 
 
     // Filter jobs temporarily hide actors while they evaluate. Save the intended visibility.
-    fn history_snapshot(&mut self) -> Result<String, SessionError> {
+    fn history_snapshot(&mut self) -> Result<PipelineState, SessionError> {
         #[cfg(not(target_arch = "wasm32"))]
         let original_visibility: Vec<_> = self.active_job.iter()
             .flat_map(|job| {
@@ -2289,7 +2294,7 @@ impl ParaVizApp {
                 Some((id, std::mem::replace(&mut node.style.visible, visible)))
             })
             .collect();
-        let result = self.session.save_state_json();
+        let result = self.session.state_snapshot();
         #[cfg(not(target_arch = "wasm32"))]
         for (id, visible) in original_visibility.into_iter().rev() {
             if let Ok(node) = self.session.node_mut(id) {
@@ -2300,13 +2305,13 @@ impl ParaVizApp {
     }
 
     pub(super) fn push_undo_snapshot(&mut self) {
-        if let Ok(json) = self.history_snapshot() {
+        if let Ok(snapshot) = self.history_snapshot() {
             self.last_undo_snapshot_at = Some(Instant::now());
             self.redo_stack.clear();
-            if self.undo_stack.last().is_some_and(|last| last == &json) {
+            if self.undo_stack.last().is_some_and(|last| last == &snapshot) {
                 return;
             }
-            self.undo_stack.push(json);
+            self.undo_stack.push(snapshot);
             if self.undo_stack.len() > 40 {
                 self.undo_stack.remove(0);
             }
@@ -2322,8 +2327,8 @@ impl ParaVizApp {
         self.push_undo_snapshot();
     }
 
-    fn restore_history(&mut self, json: &str) -> Result<String, SessionError> {
-        let restored = ParaViz::load_state_json(json)?;
+    fn restore_history(&mut self, snapshot: &PipelineState) -> Result<PipelineState, SessionError> {
+        let restored = ParaViz::from_state_snapshot(snapshot.clone())?;
         let current = self.history_snapshot()?;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(job) = self.active_job.take() {
@@ -2348,34 +2353,34 @@ impl ParaVizApp {
     }
 
     pub(super) fn undo(&mut self) {
-        let Some(json) = self.undo_stack.pop() else {
+        let Some(snapshot) = self.undo_stack.pop() else {
             self.status_message = "Nothing to undo".into();
             return;
         };
-        match self.restore_history(&json) {
+        match self.restore_history(&snapshot) {
             Ok(current) => {
                 self.redo_stack.push(current);
                 self.status_message = "Undid last pipeline action".into();
             }
             Err(err) => {
-                self.undo_stack.push(json);
+                self.undo_stack.push(snapshot);
                 self.error_message = Some(format!("Undo failed: {err}"));
             }
         }
     }
 
     pub(super) fn redo(&mut self) {
-        let Some(json) = self.redo_stack.pop() else {
+        let Some(snapshot) = self.redo_stack.pop() else {
             self.status_message = "Nothing to redo".into();
             return;
         };
-        match self.restore_history(&json) {
+        match self.restore_history(&snapshot) {
             Ok(current) => {
                 self.undo_stack.push(current);
                 self.status_message = "Redid pipeline action".into();
             }
             Err(err) => {
-                self.redo_stack.push(json);
+                self.redo_stack.push(snapshot);
                 self.error_message = Some(format!("Redo failed: {err}"));
             }
         }
@@ -2403,6 +2408,18 @@ impl ParaVizApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn save_project_file(&mut self, path: &Path, mode: ProjectSaveMode) {
+        match self.session.save_project(path, mode) {
+            Ok(()) => {
+                self.remember_export_dir(path);
+                self.error_message = None;
+                self.status_message = format!("Saved project to {}", path.display());
+            }
+            Err(error) => self.error_message = Some(format!("Project save failed: {error}")),
+        }
+    }
+
     pub(super) fn execute_modal_action(&mut self, action: ModalAction) {
         match action {
             ModalAction::None => {}
@@ -2415,17 +2432,12 @@ impl ParaVizApp {
                 iso_value,
             } => self.run_gpu_contour(node_id, &field_name, iso_value),
             ModalAction::LoadDemo(preset) => self.load_demo(preset),
-            ModalAction::SaveState(p) => match self.session.save_state_json() {
-                Ok(json) => match std::fs::write(&p, json) {
-                    Ok(()) => {
-                        self.remember_export_dir(&p);
-                        self.error_message = None;
-                        self.status_message = format!("Saved state -> {}", p.display());
-                    }
-                    Err(e) => self.error_message = Some(format!("Write failed: {e}")),
-                },
-                Err(e) => self.error_message = Some(format!("Serialize failed: {e}")),
-            },
+            ModalAction::SaveState(p) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.save_project_file(&p, ProjectSaveMode::Referenced);
+                #[cfg(target_arch = "wasm32")]
+                let _ = p;
+            }
             ModalAction::ExportDataset(p) => {
                 if let Some(id) = self.selected_node {
                     let ext = p
@@ -3015,27 +3027,9 @@ impl ParaVizApp {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn inspect_file_time_steps(path: &Path, reader: paraviz::io::DatasetReader) -> Vec<f64> {
-    match reader {
-        paraviz::io::DatasetReader::Xdmf => {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                paraviz::io::inspect_xdmf_time_steps(path).unwrap_or_default()
-            }))
-            .unwrap_or_default()
-        }
-        paraviz::io::DatasetReader::VtkHdf => {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                paraviz::io::inspect_vtkhdf_time_steps(path).unwrap_or_default()
-            }))
-            .unwrap_or_default()
-        }
-        paraviz::io::DatasetReader::Exodus => {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                paraviz::io::inspect_exodus_time_steps(path).unwrap_or_default()
-            }))
-            .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    }
+    paraviz::io::VtkFileSource::with_reader(path, reader)
+        .request_information()
+        .time_steps
 }
 
 
@@ -3054,6 +3048,69 @@ mod tests {
         pd.cell_data.add_array(DataArray::scalars_f64("ZoneID", vec![7.0]));
         pd.field_data.add_array(DataArray::scalars_f64("TimeValue", vec![42.5]));
         DataSet::PolyData(pd)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn undo_discards_a_pending_filter_result_and_redo_restores_visibility() {
+        let gpu = WebGpuRenderer::new_headless().expect("headless GPU");
+        let device = gpu.device().clone();
+        let renderer = egui_wgpu::Renderer::new(
+            &device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Default::default(),
+        );
+        let mut app = ParaVizApp::new_headless(
+            device,
+            gpu.queue().clone(),
+            Arc::new(egui::epaint::mutex::RwLock::new(renderer)),
+            &egui::Context::default(),
+        );
+        let source = app.session.add_dataset("Mesh", sample_dataset());
+        let original = FilterConfig::Transform(TransformFilter::default());
+        let filter = app.session.add_filter_cfg("Transform", source, original.clone()).unwrap();
+        app.session.show(filter);
+        app.push_undo_snapshot();
+
+        let changed = FilterConfig::Transform(TransformFilter {
+            translation: [1.0, 0.0, 0.0],
+            ..Default::default()
+        });
+        app.session.update_filter_cfg(filter, changed.clone()).unwrap();
+        app.session.hide(filter);
+        let (job_id, cancel_flag) = app.next_worker_job_id();
+        app.active_job = Some(ActiveWorkerJob {
+            id: job_id,
+            label: "Evaluating Transform".into(),
+            started_at: Instant::now(),
+            cancel_flag: cancel_flag.clone(),
+            cancel_node_to_remove: None,
+            restore_visibility: vec![(filter, true)],
+        });
+        app.worker_tx.send(WorkerCompletion {
+            job_id,
+            cancel_flag: cancel_flag.clone(),
+            payload: WorkerPayload::EvaluateNode {
+                node_id: filter,
+                label: "Transform".into(),
+                time: 0.0,
+                show_on_finish: false,
+                repr_override: None,
+                open_probe_chart: false,
+                result: Ok(sample_dataset()),
+            },
+        }).unwrap();
+
+        app.undo();
+        assert!(cancel_flag.load(Ordering::Relaxed));
+        app.poll_worker_jobs();
+        let node = app.session.node(filter).unwrap();
+        assert_eq!(node.filter_config.as_ref(), Some(&original));
+        assert!(node.dataset().is_none());
+        app.redo();
+        let node = app.session.node(filter).unwrap();
+        assert_eq!(node.filter_config.as_ref(), Some(&changed));
+        assert!(node.style.visible);
     }
 
     #[test]

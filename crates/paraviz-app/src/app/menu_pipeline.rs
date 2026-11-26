@@ -68,6 +68,17 @@ impl ParaVizApp {
                         Err(e) => self.error_message = Some(format!("Serialize failed: {e}")),
                     }
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if ui.button("Save Portable Project...").clicked() {
+                    ui.close();
+                    if let Some(path) = native_save_file(
+                        "Save Portable Project with Data",
+                        &self.default_export_path("paraviz_project.json"),
+                        &[("ParaViz Project JSON", &["json"])],
+                    ) {
+                        self.save_project_file(&path, ProjectSaveMode::Embedded);
+                    }
+                }
                 if ui.button("Load State JSON...").clicked() {
                     ui.close();
                     #[cfg(not(target_arch = "wasm32"))]

@@ -58,6 +58,7 @@ pub use gmsh::read_gmsh;
 pub use html_viewer::{encode_html_viewer, write_html_viewer};
 pub use image2d::{read_bmp, read_png, read_pnm};
 pub use las::read_las;
+pub use limits::resolve_safe_path;
 pub use medical_volume::{read_metaimage, read_nrrd, write_metaimage};
 pub use mesh::PlyFormat;
 pub use molecular::{

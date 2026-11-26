@@ -237,3 +237,66 @@ fn temporal_probe_samples_the_selected_pipeline_and_keeps_gaps() {
     assert_eq!(fields.get("Pressure_average").unwrap().get_scalar(0), 10.0);
     assert_eq!(fields.get("Pressure_stddev").unwrap().get_scalar(0), 20.0);
 }
+
+#[test]
+fn projects_survive_moves_relocation_and_offline_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original");
+    fs::create_dir_all(original.join("data")).unwrap();
+    let series = original.join("data").join("run.pvd");
+    let frames = [0.0, 1.0].map(|time| {
+        let mut grid = ImageData::new([2, 2, 2], [0.0; 3], [1.0; 3]);
+        grid.point_data.set_scalars(DataArray::scalars_f32("Pressure", vec![time as f32; 8]));
+        (time, DataSet::ImageData(grid))
+    });
+    write_pvd_series(&series, &frames).unwrap();
+
+    let mut session = ParaViz::new();
+    let source = session.open(&series).unwrap();
+    let join = session.append_nodes(vec![source]).unwrap();
+    let request = TemporalProbeRequest {
+        position: [0.5; 3],
+        field: "Pressure".into(),
+        component: 0,
+    };
+    session.temporal_probe = Some((source, request));
+    session.set_time(1.0);
+    session.show(join);
+
+    let referenced = original.join("project.json");
+    let portable = directory.path().join("portable.json");
+    session.save_project(&referenced, ProjectSaveMode::Referenced).unwrap();
+    session.save_project(&portable, ProjectSaveMode::Embedded).unwrap();
+    let before = fs::read_to_string(&referenced).unwrap();
+    assert!(before.contains("\"data/run.pvd\""));
+    assert!(ParaViz::load_state_json(&before).is_err());
+    let portable_contents = fs::read(&portable).unwrap();
+
+    let moved = directory.path().join("moved");
+    fs::rename(&original, &moved).unwrap();
+    let moved_project = moved.join("project.json");
+    let mut restored = ParaViz::load_project(&moved_project).unwrap();
+    assert_eq!(restored.time, 1.0);
+    assert_eq!(restored.all_time_steps(), vec![0.0, 1.0]);
+    assert!(restored.update_visible().is_ok());
+
+    let new_data_dir = directory.path().join("relocated_data");
+    fs::rename(moved.join("data"), &new_data_dir).unwrap();
+    assert!(ParaViz::load_project(&moved_project).is_err());
+    let restored = ParaViz::load_project_with_relocation(&moved_project, |missing| {
+        assert_eq!(missing, moved.join("data/run.pvd"));
+        Some(new_data_dir.join("run.pvd"))
+    }).unwrap();
+    assert_eq!(fs::read_to_string(&moved_project).unwrap(), before);
+    let (node, request) = restored.temporal_probe.clone().unwrap();
+    let expected = restored.prepare_temporal_probe(node, request).unwrap().run().unwrap();
+
+    fs::remove_dir_all(&new_data_dir).unwrap();
+    let offline = ParaViz::load_project(&portable).unwrap();
+    let (node, request) = offline.temporal_probe.clone().unwrap();
+    assert_eq!(offline.prepare_temporal_probe(node, request).unwrap().run().unwrap(), expected);
+    assert!(ParaViz::load_state_json(std::str::from_utf8(&portable_contents).unwrap()).is_ok());
+
+    assert!(session.save_project(&portable, ProjectSaveMode::Embedded).is_err());
+    assert_eq!(fs::read(&portable).unwrap(), portable_contents);
+}
