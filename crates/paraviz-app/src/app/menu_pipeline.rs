@@ -115,6 +115,21 @@ impl ParaVizApp {
                         self.execute_modal_action(ModalAction::ExportDataset(p));
                     }
                 }
+                let can_ab = self.selected_node.is_some() && self.session.nodes().len() >= 2;
+                if ui
+                    .add_enabled(can_ab, egui::Button::new("Export A/B Compare HTML..."))
+                    .on_hover_text(
+                        "One self-contained .html file with both datasets: shared linked camera, A/B wipe slider, common scalar legend. Side A = selected node.",
+                    )
+                    .clicked()
+                {
+                    let path = self.default_export_path("compare_ab.html");
+                    ui.close();
+                    self.modal = Some(AppModal::ExportAbHtml(ExportAbModalState {
+                        path,
+                        node_b: None,
+                    }));
+                }
                 if ui.button("Save Screenshot PNG...").clicked() {
                     let (w, h) = self.active_viewport_tex_size();
                     let path = self.default_export_path("screenshot.png");

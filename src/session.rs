@@ -19,7 +19,8 @@ use paraviz_filters::{
 };
 use paraviz_io::{
     read_dataset, read_raw_volume, write_animated_gif, write_dataset, write_glb,
-    write_html_viewer, DatasetReader, IoError, PvdSeriesSource, RawVolumeDescriptor, VtkFileSource,
+    write_html_viewer, write_html_viewer_ab, DatasetReader, IoError, PvdSeriesSource,
+    RawVolumeDescriptor, VtkFileSource,
 };
 use paraviz_render::{
     pick_scene, ActorStyle, Camera, CameraPreset, ColorBy, GpuContourEngine, PickResult,
@@ -1162,6 +1163,37 @@ impl ParaViz {
     ) -> Result<(), SessionError> {
         let (title, poly, cmap, scalar_name) = self.prepare_surface_export(id, use_node_colormap)?;
         write_html_viewer(path, &poly, &title, cmap.as_ref(), scalar_name.as_deref())?;
+        Ok(())
+    }
+
+    /// Exports an **A/B comparison** viewer: nodes `id_a` and `id_b` in a single
+    /// self-contained `.html` file with one shared (linked) camera, a wipe slider and
+    /// a common scalar color-bar legend. Both sides are colored over the union of their
+    /// scalar ranges; the scalar array is taken from node A's style (fallback: B's).
+    pub fn export_html_ab(
+        &mut self,
+        id_a: NodeId,
+        id_b: NodeId,
+        path: impl AsRef<Path>,
+        use_node_colormap: bool,
+    ) -> Result<(), SessionError> {
+        let (name_a, poly_a, cmap_a, scalar_a) =
+            self.prepare_surface_export(id_a, use_node_colormap)?;
+        let (name_b, poly_b, _cmap_b, scalar_b) =
+            self.prepare_surface_export(id_b, use_node_colormap)?;
+        let scalar_name = scalar_a.or(scalar_b);
+        let cmap = if use_node_colormap { cmap_a } else { None };
+        let title = format!("{name_a}  vs  {name_b}");
+        write_html_viewer_ab(
+            path,
+            &poly_a,
+            &name_a,
+            &poly_b,
+            &name_b,
+            &title,
+            cmap.as_ref(),
+            scalar_name.as_deref(),
+        )?;
         Ok(())
     }
 

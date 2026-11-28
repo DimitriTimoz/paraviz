@@ -50,7 +50,7 @@ Open **Demos** in the top menu (or **Help → Demo Gallery**) to generate one of
 ## 2. Studio Workspace Layout
 
 ### Top Menu Bar & Quick Toolbar
-- **File**: Open via **File Browser...** (includes explicit `DatasetReader` dropdown), **Open File by Path...**, **Import Raw 3D Volume (.raw)...**, **Recent Files**, **Save/Load State JSON...**, **Export Active Dataset...** (`.vtp`, `.vtu`, `.vti`, `.vtk`, `.stl`, `.obj`, `.ply`, `.csv`, `.glb`, interactive `.html`), **Save Screenshot PNG...**, and **Export Animation (GIF)...**.
+- **File**: Open via **File Browser...** (includes explicit `DatasetReader` dropdown), **Open File by Path...**, **Import Raw 3D Volume (.raw)...**, **Recent Files**, **Save/Load State JSON...**, **Export Active Dataset...** (`.vtp`, `.vtu`, `.vti`, `.vtk`, `.stl`, `.obj`, `.ply`, `.csv`, `.glb`, interactive `.html`), **Export A/B Compare HTML...** (one self-contained `.html`: two nodes, wipe slider, shared linked camera, common scalar legend), **Save Screenshot PNG...**, and **Export Animation (GIF)...**.
   - **Save State JSON...** keeps external dataset references. Datasets under the project folder use paths relative to the project, so you can move the folder with its data. When opening a project on desktop, select a replacement if a referenced dataset has moved. Save again to keep the new path.
   - **Save Portable Project...** includes the datasets and every advertised time step in one JSON file. Open it with **Load State JSON...** on desktop or in the browser. The file grows with the size of the dataset and the number of steps, so use referenced projects for large runs.
 - **Sources**: Create any of the 14 procedural geometric & analytical sources (see [Sources Reference](filters-and-sources.md#1-procedural-sources-paraviz-sources)).
@@ -171,7 +171,7 @@ For detailed API field behavior see [Rendering & Scene Parameters](rendering-and
 ### Workflow D: Split-View Multi-Modal Comparison & Exports
 1. Click **`1x2`** or **`2x2`** in the toolbar. Set `P1` to `3D View`, `P2` to `XY Chart` (showing a `ProbeOverLineFilter` profile), or keep two `3D View` panes with **Link Cameras** and per-pane `Nodes (N)` overrides.
 2. Drag the **Scalar Color Bar** to the desired corner, resize its bottom-right grip, enable **Time:** if exploring a time series, and add a title via **Scene → Annotations**.
-3. Export via **File → Save Screenshot PNG...** (up to 4K, optional transparent background + scalar bar + annotations), **Export Animation (GIF)...** (turntable or time-series GIF89a), **Export Active Dataset → `.glb`**, or **`.html`** (zero-dependency interactive WebGL2 viewer).
+3. Export via **File → Save Screenshot PNG...** (up to 4K, optional transparent background + scalar bar + annotations), **Export Animation (GIF)...** (turntable or time-series GIF89a), **Export Active Dataset → `.glb`**, **`.html`** (zero-dependency interactive WebGL2 viewer), or **Export A/B Compare HTML...** — a single self-contained `.html` with side A (selected node) and side B (picked in the dialog) behind a wipe slider, one shared linked camera, and a common scalar color-bar legend.
 
 ---
 

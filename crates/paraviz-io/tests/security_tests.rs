@@ -213,3 +213,75 @@ fn exodus_netcdf_rejects_huge_counts_and_truncated_data_without_oom() {
     bad_conn[begin_slots[2]..begin_slots[2] + 4].copy_from_slice(&conn_off.to_be_bytes());
     assert!(paraviz_io::exodus::read_exodus_bytes(&bad_conn).is_err());
 }
+
+#[test]
+fn html_viewer_ab_single_file_slider_common_legend_and_escaping() {
+    use paraviz_core::{ColorMap, ColorMapPreset, DataArray};
+    use paraviz_io::html_viewer::encode_html_viewer_ab;
+
+    let mk = |z: f32, s0: f32| {
+        let mut poly = PolyData::new();
+        poly.points = vec![
+            [0.0, 0.0, z],
+            [1.0, 0.0, z],
+            [0.0, 1.0, z],
+        ];
+        poly.polys = vec![vec![0, 1, 2]];
+        poly.point_data
+            .set_scalars(DataArray::scalars_f32("s", vec![s0, s0 + 1.0, s0 + 2.0]));
+        poly
+    };
+    let a = mk(0.0, 0.0);
+    let b = mk(0.5, 10.0);
+    let cmap = ColorMap::from_preset(ColorMapPreset::Viridis);
+
+    let html = encode_html_viewer_ab(
+        &a,
+        "A</script><script>alert(1)</script>",
+        &b,
+        "B & <b>",
+        "cmp <title>",
+        Some(&cmap),
+        Some("s"),
+    );
+
+    // exactly one canvas and one JSON payload: a single self-contained file
+    assert_eq!(html.matches("<canvas").count(), 1);
+    assert_eq!(
+        html.matches(r#"<script id="mesh-data" type="application/json">"#)
+            .count(),
+        1
+    );
+    // wipe slider + common legend widgets are present
+    assert!(html.contains(r#"id="abSlider""#), "A/B slider missing");
+    assert!(html.contains(r#"id="legendBar""#), "legend bar missing");
+    assert!(html.contains("uSplit"), "wipe uniform missing");
+    // both sides embedded, with a common legend over the union range [0, 12]
+    assert!(html.contains(r#""labelA":"A\u003c/script\u003e"#));
+    assert!(html.contains(r#""labelB":"B \u0026 \u003cb\u003e""#));
+    assert!(html.contains(r#""legend":{"array":"s","max":12.0,"min":0.0"#));
+    // HTML-escaped labels in the visible HUD
+    assert!(html.contains("A&lt;/script&gt;"));
+    assert!(html.contains("B &amp; &lt;b&gt;"));
+    // no raw script breakout anywhere in the payload
+    let json_start = html
+        .find(r#"<script id="mesh-data" type="application/json">"#)
+        .unwrap();
+    let json_end = html[json_start..].find("</script>").unwrap();
+    assert!(!html[json_start..json_start + json_end].contains("</script>"));
+}
+
+#[test]
+fn html_viewer_ab_without_colormap_has_no_legend_but_keeps_slider() {
+    use paraviz_io::html_viewer::encode_html_viewer_ab;
+
+    let mk = |z: f32| {
+        let mut poly = PolyData::new();
+        poly.points = vec![[0.0, 0.0, z], [1.0, 0.0, z], [0.0, 1.0, z]];
+        poly.polys = vec![vec![0, 1, 2]];
+        poly
+    };
+    let html = encode_html_viewer_ab(&mk(0.0), "a", &mk(1.0), "b", "t", None, None);
+    assert!(html.contains(r#"id="abSlider""#));
+    assert!(html.contains(r#""legend":null"#));
+}

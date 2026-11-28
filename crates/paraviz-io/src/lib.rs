@@ -55,7 +55,9 @@ pub use exodus::{inspect_exodus_time_steps, read_exodus, read_exodus_at_time};
 pub use gif::{encode_animated_gif_bytes, write_animated_gif};
 pub use gltf::{read_gltf, write_glb};
 pub use gmsh::read_gmsh;
-pub use html_viewer::{encode_html_viewer, write_html_viewer};
+pub use html_viewer::{
+    encode_html_viewer, encode_html_viewer_ab, write_html_viewer, write_html_viewer_ab,
+};
 pub use image2d::{read_bmp, read_png, read_pnm};
 pub use las::read_las;
 pub use limits::resolve_safe_path;

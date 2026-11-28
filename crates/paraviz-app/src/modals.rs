@@ -105,9 +105,18 @@ pub struct GifModalState {
     pub include_scalar_bar: bool,
 }
 
+/// State for the A/B comparison HTML export: side A is the selected node,
+/// side B is chosen from `node_b`.
+#[derive(Debug, Clone)]
+pub struct ExportAbModalState {
+    pub path: String,
+    pub node_b: Option<NodeId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExportSpreadsheetModalState {
     pub path: String,
+
     pub domain_label: String,
     pub col_filter: String,
     pub row_count: usize,
@@ -126,6 +135,7 @@ pub enum AppModal {
     SaveState(String),
     LoadState(String),
     ExportDataset(String),
+    ExportAbHtml(ExportAbModalState),
     ExportSpreadsheetCsv(ExportSpreadsheetModalState),
     SaveScreenshot(ScreenshotModalState),
     ExportGif(GifModalState),
@@ -139,6 +149,10 @@ pub enum ModalAction {
     LoadState(PathBuf),
     SaveState(PathBuf),
     ExportDataset(PathBuf),
+    ExportAbHtml {
+        path: PathBuf,
+        node_b: NodeId,
+    },
     ExportSpreadsheetCsv(PathBuf),
     SaveScreenshot {
         path: PathBuf,
@@ -251,6 +265,7 @@ pub fn draw_modal(
     export_glb_colors: &mut bool,
     viewport_size: (u32, u32),
     theme: UiTheme,
+    node_labels: &[(NodeId, String)],
 ) -> ModalAction {
     let Some(mut modal) = modal_slot.take() else {
         return ModalAction::None;
@@ -961,6 +976,67 @@ pub fn draw_modal(
                 let p = es.path.trim();
                 if !p.is_empty() {
                     return ModalAction::ExportSpreadsheetCsv(PathBuf::from(p));
+                }
+            } else if keep_open {
+                *modal_slot = Some(modal);
+            }
+            return ModalAction::None;
+        }
+
+        AppModal::ExportAbHtml(ab) => {
+            let mut confirm = false;
+            egui::Window::new("Export A/B Compare HTML")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    draw_save_destination_picker(
+                        ui,
+                        "Output HTML path:",
+                        &mut ab.path,
+                        "Export A/B Compare HTML",
+                        &[("Interactive HTML (A/B)", &["html"])],
+                    );
+                    ui.label("Side A: the currently selected pipeline node.");
+                    ui.horizontal(|ui| {
+                        ui.label("Side B:");
+                        let selected = ab
+                            .node_b
+                            .and_then(|id| node_labels.iter().find(|(nid, _)| *nid == id).map(|(_, n)| n.clone()))
+                            .unwrap_or_else(|| "— pick a node —".to_string());
+                        egui::ComboBox::from_id_salt("ab_node_b_combo")
+                            .selected_text(selected)
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                for (id, name) in node_labels {
+                                    ui.selectable_value(&mut ab.node_b, Some(*id), name);
+                                }
+                            });
+                    });
+                    ui.label(
+                        "One self-contained .html file: shared (linked) camera, A/B wipe slider, common scalar legend.",
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let can = !ab.path.trim().is_empty() && ab.node_b.is_some();
+                        if ui.add_enabled(can, egui::Button::new("Export A/B HTML")).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+
+            if confirm {
+                let p = ab.path.trim();
+                if !p.is_empty() {
+                    if let Some(node_b) = ab.node_b {
+                        return ModalAction::ExportAbHtml {
+                            path: PathBuf::from(p),
+                            node_b,
+                        };
+                    }
                 }
             } else if keep_open {
                 *modal_slot = Some(modal);

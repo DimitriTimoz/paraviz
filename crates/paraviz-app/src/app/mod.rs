@@ -1,8 +1,8 @@
 pub(crate) use crate::charts::{draw_chart_tab, draw_opacity_tf_editor, ChartMode, ChartState};
 pub(crate) use crate::cli::format_memory_bytes;
 pub(crate) use crate::modals::{
-    draw_modal, is_raw_volume_ext, native_save_file, AppModal, GifModalState, GpuContourModalState,
-    ModalAction, RawVolumeModalState, ScreenshotModalState,
+    draw_modal, is_raw_volume_ext, native_save_file, AppModal, ExportAbModalState, GifModalState,
+    GpuContourModalState, ModalAction, RawVolumeModalState, ScreenshotModalState,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use crate::modals::{native_pick_scientific_file, native_pick_state_file};
@@ -2388,12 +2388,19 @@ impl ParaVizApp {
 
     fn handle_modals(&mut self, ctx: &egui::Context) {
         let vp_size = self.active_viewport_tex_size();
+        let node_labels: Vec<(NodeId, String)> = self
+            .session
+            .nodes()
+            .iter()
+            .map(|n| (n.id, n.name.clone()))
+            .collect();
         let action = draw_modal(
             ctx,
             &mut self.modal,
             &mut self.export_glb_colors,
             vp_size,
             self.theme,
+            &node_labels,
         );
         self.execute_modal_action(action);
     }
@@ -2460,6 +2467,25 @@ impl ParaVizApp {
                         }
                         Err(e) => self.error_message = Some(format!("Export failed: {e}")),
                     }
+                }
+            }
+            ModalAction::ExportAbHtml { path: p, node_b } => {
+                if let Some(id_a) = self.selected_node {
+                    match self
+                        .session
+                        .export_html_ab(id_a, node_b, &p, self.export_glb_colors)
+                    {
+                        Ok(()) => {
+                            self.remember_export_dir(&p);
+                            self.error_message = None;
+                            self.status_message =
+                                format!("Exported A/B compare viewer -> {}", p.display());
+                        }
+                        Err(e) => self.error_message = Some(format!("Export failed: {e}")),
+                    }
+                } else {
+                    self.error_message =
+                        Some("Select a pipeline node first (side A of the A/B compare)".into());
                 }
             }
             ModalAction::ExportSpreadsheetCsv(p) => {
