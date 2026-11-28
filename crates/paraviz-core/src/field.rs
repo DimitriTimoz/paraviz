@@ -53,18 +53,21 @@ impl FieldData {
         self.add_array(array);
     }
 
-    /// Gets an array by name.
-    pub fn get(&self, name: &str) -> Option<&DataArray> {
+    /// Gets an array by name (accepts `&str`, `String`, `&String`, ...).
+    pub fn get(&self, name: impl AsRef<str>) -> Option<&DataArray> {
+        let name = name.as_ref();
         self.arrays.iter().find(|a| a.name == name)
     }
 
-    /// Gets a mutable reference to an array by name.
-    pub fn get_mut(&mut self, name: &str) -> Option<&mut DataArray> {
+    /// Gets a mutable reference to an array by name (accepts `&str`, `String`, ...).
+    pub fn get_mut(&mut self, name: impl AsRef<str>) -> Option<&mut DataArray> {
+        let name = name.as_ref();
         self.arrays.iter_mut().find(|a| a.name == name)
     }
 
     /// Removes an array by name, returning it if it existed.
-    pub fn remove(&mut self, name: &str) -> Option<DataArray> {
+    pub fn remove(&mut self, name: impl AsRef<str>) -> Option<DataArray> {
+        let name = name.as_ref();
         if let Some(pos) = self.arrays.iter().position(|a| a.name == name) {
             if self.active_scalars.as_deref() == Some(name) {
                 self.active_scalars = None;

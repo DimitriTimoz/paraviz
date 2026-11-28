@@ -15,7 +15,7 @@ use std::path::Path;
 pub fn write_html_viewer(
     path: impl AsRef<Path>,
     poly: &PolyData,
-    title: &str,
+    title: impl AsRef<str>,
     color_map: Option<&ColorMap>,
     scalar_array: Option<&str>,
 ) -> Result<()> {
@@ -30,13 +30,14 @@ pub fn write_html_viewer(
 /// Writes an **A/B comparison** viewer: two meshes in one self-contained `.html` file,
 /// one shared (linked) camera, a wipe slider to compare them, and a common scalar
 /// color-bar legend when a colormap + scalar array are provided.
+#[allow(clippy::too_many_arguments)]
 pub fn write_html_viewer_ab(
     path: impl AsRef<Path>,
     poly_a: &PolyData,
-    label_a: &str,
+    label_a: impl AsRef<str>,
     poly_b: &PolyData,
-    label_b: &str,
-    title: &str,
+    label_b: impl AsRef<str>,
+    title: impl AsRef<str>,
     color_map: Option<&ColorMap>,
     scalar_array: Option<&str>,
 ) -> Result<()> {
@@ -53,10 +54,11 @@ pub fn write_html_viewer_ab(
 /// Encodes a [`PolyData`] mesh into a self-contained interactive WebGL2 HTML document.
 pub fn encode_html_viewer(
     poly: &PolyData,
-    title: &str,
+    title: impl AsRef<str>,
     color_map: Option<&ColorMap>,
     scalar_array: Option<&str>,
 ) -> String {
+    let title = title.as_ref();
     let mut positions: Vec<f32> = Vec::with_capacity(poly.points.len() * 3);
     for p in &poly.points {
         positions.extend_from_slice(p);
@@ -422,13 +424,16 @@ fn mesh_payload(poly: &PolyData, colors: Vec<f32>, indices: &[u32]) -> serde_jso
 /// scalar color-bar legend. Both sides are colored over the union of their scalar ranges.
 pub fn encode_html_viewer_ab(
     poly_a: &PolyData,
-    label_a: &str,
+    label_a: impl AsRef<str>,
     poly_b: &PolyData,
-    label_b: &str,
-    title: &str,
+    label_b: impl AsRef<str>,
+    title: impl AsRef<str>,
     color_map: Option<&ColorMap>,
     scalar_array: Option<&str>,
 ) -> String {
+    let label_a = label_a.as_ref();
+    let label_b = label_b.as_ref();
+    let title = title.as_ref();
     let indices_a = collect_triangle_indices(poly_a);
     let indices_b = collect_triangle_indices(poly_b);
 

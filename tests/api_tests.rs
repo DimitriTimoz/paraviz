@@ -226,7 +226,7 @@ fn temporal_probe_samples_the_selected_pipeline_and_keeps_gaps() {
     assert_eq!(result.samples.iter().map(|step| step.value).collect::<Vec<_>>(), vec![Some(-10.0), None, Some(30.0)]);
     assert!(result.to_csv().contains("1,,missing,\"Pressure\",0,0.5,0.5,0.5"));
     session.temporal_probe = Some((node, result.request.clone()));
-    let restored = ParaViz::load_state_json(&session.save_state_json().unwrap()).unwrap();
+    let restored = ParaViz::load_state_json(session.save_state_json().unwrap()).unwrap();
     let (restored_node, request) = restored.temporal_probe.clone().unwrap();
     assert_eq!(restored.prepare_temporal_probe(restored_node, request).unwrap().run().unwrap(), result);
     assert_eq!(session.time, 2.0);
@@ -339,4 +339,37 @@ fn export_html_ab_single_file_with_slider_and_common_legend() {
     assert!(html.contains(r#""array":"RTData""#));
     assert!(html.contains(r#""a":{"#), "side A payload missing");
     assert!(html.contains(r#""b":{"#), "side B payload missing");
+}
+
+#[test]
+fn string_arguments_accept_str_string_and_ref() {
+    // The public API takes `impl Into<String>` / `impl AsRef<str>`, so &str,
+    // String and &String all work without manual conversion.
+    let mut pv = ParaViz::new();
+    let s = pv.add_source_cfg("Wavelet", SourceConfig::Wavelet(WaveletSource::with_extent(4))).unwrap();
+    let owned: String = "Iso".to_string();
+    let iso = pv
+        .add_filter_cfg(&owned, s, FilterConfig::Contour(ContourFilter::new(String::from("RTData"), vec![150.0])))
+        .unwrap();
+
+    // FieldData lookups accept all string flavors
+    let ds = pv.evaluate(iso).unwrap();
+    let pd = paraviz::filters::extract_surface(ds.as_ref()).unwrap();
+    let name_owned = "RTData".to_string();
+    assert!(pd.point_data.get("RTData").is_some());
+    assert!(pd.point_data.get(name_owned.clone()).is_some());
+    assert!(pd.point_data.get(&name_owned).is_some());
+
+    // from_name / from_slug / load_state_json accept String too
+    assert!(paraviz::io::DatasetReader::from_name(String::from("STL")).is_some());
+    assert!(paraviz::demos::DemoPreset::from_slug(&String::from("wavelet")).is_some());
+    let json = pv.save_state_json().unwrap();
+    let _ = ParaViz::load_state_json(json.clone()).unwrap();
+
+    // html viewer titles/labels accept String
+    let out = std::env::temp_dir().join("paraviz_str_api.html");
+    pv.export_html(iso, &out, false).unwrap();
+    let html = fs::read_to_string(&out).unwrap();
+    let _ = fs::remove_file(&out);
+    assert!(html.contains("Iso"));
 }

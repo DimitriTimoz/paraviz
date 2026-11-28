@@ -19,7 +19,8 @@ pub const MAX_XML_DEPTH: usize = 256;
 
 /// Resolves `rel_path` strictly inside `base_dir`, rejecting absolute paths, `..` traversal,
 /// and symlinks that escape `base_dir`.
-pub fn resolve_safe_path(base_dir: &Path, rel_path: &str) -> Result<PathBuf> {
+pub fn resolve_safe_path(base_dir: &Path, rel_path: impl AsRef<str>) -> Result<PathBuf> {
+    let rel_path = rel_path.as_ref();
     let trimmed = rel_path.trim();
     if trimmed.is_empty() || trimmed.contains('\0') {
         return Err(IoError::InvalidData(

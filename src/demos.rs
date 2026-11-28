@@ -51,8 +51,8 @@ impl DemoPreset {
         }
     }
 
-    pub fn from_slug(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
+    pub fn from_slug(s: impl AsRef<str>) -> Option<Self> {
+        match s.as_ref().to_ascii_lowercase().as_str() {
             "wavelet" | "wavelet_contour" => Some(Self::WaveletContour),
             "vortex" | "streamlines" => Some(Self::VortexStreamlines),
             "gyroid" => Some(Self::GyroidMinimalSurface),

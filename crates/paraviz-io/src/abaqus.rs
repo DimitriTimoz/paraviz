@@ -24,7 +24,8 @@ enum AbaqusSection {
 }
 
 /// Parses an Abaqus `.inp` string into a [`DataSet`].
-pub fn read_abaqus_str(text: &str) -> Result<DataSet> {
+pub fn read_abaqus_str(text: impl AsRef<str>) -> Result<DataSet> {
+    let text = text.as_ref();
     let mut node_map: HashMap<u64, u32> = HashMap::new();
     let mut elem_map: HashMap<u64, usize> = HashMap::new();
     let mut points: Vec<[f32; 3]> = Vec::new();

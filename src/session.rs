@@ -172,8 +172,8 @@ impl SourceConfig {
     }
 
     /// Deserializes a [`SourceConfig`] from JSON (used by saved states and Rust traces).
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+    pub fn from_json(json: impl AsRef<str>) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json.as_ref())
     }
 }
 
@@ -307,8 +307,8 @@ impl FilterConfig {
     }
 
     /// Deserializes a [`FilterConfig`] from JSON (used by saved states and Rust traces).
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+    pub fn from_json(json: impl AsRef<str>) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json.as_ref())
     }
 }
 
@@ -464,8 +464,8 @@ impl<'a> DisplayHandle<'a> {
     }
 
     /// Shows a previously hidden block inside a `MultiBlockDataSet`.
-    pub fn show_block(self, block: &str) -> Self {
-        self.node.style.hidden_blocks.remove(block);
+    pub fn show_block(self, block: impl AsRef<str>) -> Self {
+        self.node.style.hidden_blocks.remove(block.as_ref());
         self
     }
 
@@ -476,8 +476,8 @@ impl<'a> DisplayHandle<'a> {
     }
 
     /// Removes any per-block color override for `block`.
-    pub fn clear_block_color(self, block: &str) -> Self {
-        self.node.style.block_colors.remove(block);
+    pub fn clear_block_color(self, block: impl AsRef<str>) -> Self {
+        self.node.style.block_colors.remove(block.as_ref());
         self
     }
 }
@@ -1392,8 +1392,8 @@ impl ParaViz {
     }
 
     /// Reconstructs a [`ParaViz`] session from a JSON state produced by [`Self::save_state_json`].
-    pub fn load_state_json(json: &str) -> Result<Self, SessionError> {
-        let state = serde_json::from_str(json)?;
+    pub fn load_state_json(json: impl AsRef<str>) -> Result<Self, SessionError> {
+        let state = serde_json::from_str(json.as_ref())?;
         Self::from_state_snapshot(state)
     }
 

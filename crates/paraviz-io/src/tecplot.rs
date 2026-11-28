@@ -20,7 +20,8 @@ pub fn read_tecplot(path: impl AsRef<Path>) -> Result<DataSet> {
 }
 
 /// Parses a Tecplot ASCII string into a [`DataSet`].
-pub fn read_tecplot_str(text: &str) -> Result<DataSet> {
+pub fn read_tecplot_str(text: impl AsRef<str>) -> Result<DataSet> {
+    let text = text.as_ref();
     let mut variables: Vec<String> = Vec::new();
     let mut blocks: Vec<(String, DataSet)> = Vec::new();
 

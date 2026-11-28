@@ -1030,13 +1030,13 @@ pub fn draw_modal(
 
             if confirm {
                 let p = ab.path.trim();
-                if !p.is_empty() {
-                    if let Some(node_b) = ab.node_b {
-                        return ModalAction::ExportAbHtml {
-                            path: PathBuf::from(p),
-                            node_b,
-                        };
-                    }
+                if !p.is_empty()
+                    && let Some(node_b) = ab.node_b
+                {
+                    return ModalAction::ExportAbHtml {
+                        path: PathBuf::from(p),
+                        node_b,
+                    };
                 }
             } else if keep_open {
                 *modal_slot = Some(modal);

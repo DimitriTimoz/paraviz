@@ -326,7 +326,8 @@ pub fn read_obj(path: impl AsRef<Path>) -> Result<PolyData> {
 }
 
 /// Parses Wavefront `.obj` text into a [`PolyData`].
-pub fn read_obj_str(content: &str) -> Result<PolyData> {
+pub fn read_obj_str(content: impl AsRef<str>) -> Result<PolyData> {
+    let content = content.as_ref();
     let mut raw_positions: Vec<[f32; 3]> = Vec::new();
     let mut raw_texcoords: Vec<[f32; 2]> = Vec::new();
     let mut raw_normals: Vec<[f32; 3]> = Vec::new();

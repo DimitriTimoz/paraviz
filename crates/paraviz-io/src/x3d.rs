@@ -19,7 +19,8 @@ pub fn read_x3d(path: impl AsRef<Path>) -> Result<DataSet> {
 }
 
 /// Parses an X3D XML string into a [`DataSet`].
-pub fn read_x3d_str(xml: &str) -> Result<DataSet> {
+pub fn read_x3d_str(xml: impl AsRef<str>) -> Result<DataSet> {
+    let xml = xml.as_ref();
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 

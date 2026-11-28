@@ -17,7 +17,8 @@ pub fn read_csv(path: impl AsRef<Path>) -> Result<PolyData> {
 }
 
 /// Parses delimited CSV/TSV point-cloud text into a [`PolyData`].
-pub fn read_csv_str(content: &str) -> Result<PolyData> {
+pub fn read_csv_str(content: impl AsRef<str>) -> Result<PolyData> {
+    let content = content.as_ref();
     let mut lines = content
         .lines()
         .map(|l| l.trim_end_matches('\r'))

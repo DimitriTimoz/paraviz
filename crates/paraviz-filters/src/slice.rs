@@ -253,10 +253,10 @@ fn slice_structured(
     // Axis-aligned planes on structured grids take the exact grid-plane fast
     // path (matches vtkCutter on ImageData: a clean triangulated grid slice,
     // no interpolated cut points, no generated normals).
-    if !crinkle {
-        if let Some(pd) = axis_aligned_slice(dims, points, point_data, origin, normal) {
-            return pd;
-        }
+    if !crinkle
+        && let Some(pd) = axis_aligned_slice(dims, points, point_data, origin, normal)
+    {
+        return pd;
     }
     let dists = grid_signed_dists(points, origin, normal);
     let cx = nx - 1;

@@ -9,6 +9,8 @@ paraviz = { path = "." } # or version/git dependency
 
 Everything common is re-exported under `paraviz::prelude::*`.
 
+**String arguments are generic**: any API taking a name/label/title accepts `impl Into<String>` or `impl AsRef<str>`, so `&str`, `String` and `&String` all work without manual conversion (`add_source_cfg(label, ..)`, `ContourFilter::new(field, ..)`, `FieldData::get(name)`, `DatasetReader::from_name(name)`, `ParaViz::load_state_json(json)`, `write_html_viewer(.., title, ..)`, etc.). Paths take `impl AsRef<Path>`.
+
 ---
 
 ## 1. High-Level `ParaViz` Session API

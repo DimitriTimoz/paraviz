@@ -14,7 +14,8 @@ use std::path::Path;
 // ================================================================================================
 
 /// Returns `true` if `text` starts with a valid XYZ molecular header (`<int>\n<comment>\n<sym> <x> <y> <z>`).
-pub fn looks_like_xyz_molecular(text: &str) -> bool {
+pub fn looks_like_xyz_molecular(text: impl AsRef<str>) -> bool {
+    let text = text.as_ref();
     let mut lines = text.lines();
     let Some(first) = lines.next() else {
         return false;

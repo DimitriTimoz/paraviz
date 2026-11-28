@@ -239,8 +239,8 @@ impl DatasetReader {
     }
 
     /// Parses a reader name (case-insensitive) for CLI / API usage.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
+    pub fn from_name(name: impl AsRef<str>) -> Option<Self> {
+        match name.as_ref().trim().to_ascii_lowercase().as_str() {
             "auto" | "auto-detect" => Some(Self::Auto),
             "vtkhdf" | "vtk-hdf" | "vtk_hdf" => Some(Self::VtkHdf),
             "cgns" => Some(Self::Cgns),

@@ -66,6 +66,6 @@ fn session_load_rejects_excessive_pipeline_depth() {
         "settings": {},
         "time": 0.0
     });
-    let res = ParaViz::load_state_json(&json.to_string());
+    let res = ParaViz::load_state_json(json.to_string());
     assert!(res.is_err(), "excessively deep session pipeline must fail cleanly");
 }

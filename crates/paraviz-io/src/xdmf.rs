@@ -53,8 +53,8 @@ pub fn inspect_xdmf_time_steps(path: impl AsRef<Path>) -> Result<Vec<f64>> {
 }
 
 /// Reads an XDMF XML string using `base_dir` for external binary / XInclude references.
-pub fn read_xdmf_str(xml: &str, base_dir: &Path) -> Result<DataSet> {
-    read_xdmf_str_at_time(xml, base_dir, None)
+pub fn read_xdmf_str(xml: impl AsRef<str>, base_dir: &Path) -> Result<DataSet> {
+    read_xdmf_str_at_time(xml.as_ref(), base_dir, None)
 }
 
 fn read_xdmf_str_at_time(xml: &str, base_dir: &Path, target_time: Option<f64>) -> Result<DataSet> {

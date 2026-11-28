@@ -16,7 +16,8 @@ pub fn read_off(path: impl AsRef<Path>) -> Result<PolyData> {
 }
 
 /// Parses an ASCII Geomview OFF string into a [`PolyData`].
-pub fn read_off_str(text: &str) -> Result<PolyData> {
+pub fn read_off_str(text: impl AsRef<str>) -> Result<PolyData> {
+    let text = text.as_ref();
     let mut tokens = OffTokens::new(text);
 
     let first = tokens
