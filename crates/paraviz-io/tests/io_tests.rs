@@ -461,8 +461,10 @@ fn stl_ascii_and_binary_roundtrip() {
     let back_bin = read_stl(&bin_path).unwrap();
     assert_eq!(back_bin.points.len(), 4);
     assert_eq!(back_bin.polys.len(), 4);
-    assert!(back_bin.cell_data.active_normals_array().is_some());
-    assert!(back_bin.point_data.active_normals_array().is_some());
+    // vtkSTLReader exposes STLSolidLabeling cell data and no normals arrays
+    assert!(back_bin.cell_data.get("STLSolidLabeling").is_some());
+    assert!(back_bin.cell_data.active_normals_array().is_none());
+    assert!(back_bin.point_data.active_normals_array().is_none());
 
     let asc_path = dir.file("tet_asc.stl");
     write_stl_ascii(&asc_path, &poly).unwrap();
@@ -485,14 +487,10 @@ endsolid tri
     let zp = dir.file("zero_n.stl");
     fs::write(&zp, zero_norm_stl).unwrap();
     let ds = read_dataset(&zp).unwrap();
-    let n = ds
-        .as_poly_data()
-        .unwrap()
-        .cell_data
-        .active_normals_array()
-        .unwrap()
-        .get_vec3(0);
-    assert!((n[2] - 1.0).abs() < 1e-6);
+    let pd = ds.as_poly_data().unwrap();
+    // no normals arrays (vtkSTLReader parity); connectivity is what matters
+    assert_eq!(pd.polys.len(), 1);
+    assert!(pd.cell_data.get("STLSolidLabeling").is_some());
 }
 
 #[test]

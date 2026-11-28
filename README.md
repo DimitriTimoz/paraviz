@@ -60,6 +60,7 @@ Grab a standalone binary from [**GitHub Releases**](https://github.com/DimitriTi
 - **Reopen and Share Analyses**: Save a project with relative dataset links or export a self-contained project with its time series. Probe a point over time and export each measurement, including missing samples, to CSV.
 - **Share Results in One Click**:
   - **Interactive HTML (`viewer.html`)** — send a self-contained 3D view that anyone can orbit in their browser
+  - **A/B Compare HTML (`compare_ab.html`)** — one self-contained file with two datasets side by side behind a wipe slider, one shared (linked) camera, and a common scalar color-bar legend
   - **Animated GIF Turntables** — 360° loops and time-series animations for slides & papers
   - **Publication PNGs** — high-res renders with optional transparent background, color bar, and time badge
   - **Binary glTF (`.glb`)** — export colored meshes straight into Blender, web viewers, or presentations
@@ -114,6 +115,7 @@ paraviz render mesh.vtu -o spin.gif --turntable 36
 
 - [**Headless CLI & GUI Guide**](docs/gui-and-cli.md)
 - [**Rust API & Python Bindings (`paraviz-py`)**](docs/rust-api.md)
+- [**ParaView Python API compatibility (`paraview.simple` shim)**](docs/paraview-python-compat.md) — run existing ParaView Python scripts unmodified: `pip install paraviz` then `from paraview.simple import *`
 - [**Sources & Filters Reference**](docs/filters-and-sources.md)
 - [**Architecture & WebGPU Pipeline**](docs/architecture.md)
 

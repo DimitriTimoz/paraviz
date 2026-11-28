@@ -17,7 +17,7 @@ Welcome to the **ParaViz** documentation — a fast scientific visualization stu
 | **ParaView User** | [**Differences from Classic ParaView**](differences-from-paraview.md) | UX improvements, shortcut mapping (`1`/`2`/`3`, `R`, `F`, `F1`), and current scope |
 | **CLI Batch User** | [**Desktop Studio GUI & Headless CLI**](gui-and-cli.md) | `demo`, `render`, `info`, `convert`, `--filter`, `--transparent`, `--scalar-bar`, `--time-annotation`, `.gif` turntables |
 | **Rust API Developer** | [**Rust API Guide (& Python Bindings)**](rust-api.md) | `ParaViz` session API, `PipelineGraph`, `DataSet`, `WebGpuRenderer`, `GpuContourEngine`, and `to_rust_trace()` |
-| **Python User** | [**Rust API Guide (& Python Bindings)**](rust-api.md#5-python-bindings-paraviz-py) | Standalone PyO3 `paraviz-py` bindings (`paraviz.Session` modeled after `paraview.simple`) |
+| **Python User** | [**ParaView Python API compatibility**](paraview-python-compat.md) | Run existing `paraview.simple` scripts unmodified (`from paraview.simple import *`) via the `paraviz` wheel; also see [Rust API Guide §5](rust-api.md#5-python-bindings-paraviz-py) for the native `paraviz.Session` |
 | **Contributor** | [**Contributing Guide**](../CONTRIBUTING.md) & [**Architecture**](architecture.md) | Workspace crate breakdown, pipeline DAG, WGSL shaders, and test commands |
 
 ---
@@ -37,6 +37,7 @@ Welcome to the **ParaViz** documentation — a fast scientific visualization stu
 ### Developer & Architecture Docs
 - [**Architecture & Rendering Pipeline**](architecture.md) — Workspace crate structure, demand-driven `PipelineGraph`, WebGPU render passes, single-pass `SurfaceWithEdges`, `R32Float` IGN volume raymarching, EDL, and GPU Compute Marching Cubes.
 - [**Rust API Guide (& Python Bindings)**](rust-api.md) — Using `ParaViz`, `DisplayHandle`, `PipelineGraph` & `DataSet`, `open_preloaded` / `seed_evaluated`, JSON state persistence, Rust Trace, and `paraviz-py`.
+- [**ParaView Python API compatibility (`paraview.simple` shim)**](paraview-python-compat.md) — the bundled `paraview` package in the `paraviz` wheel: reader/source/filter proxy classes, `Show`/`ColorBy`/`Render`/`SaveScreenshot`, LUTs, animation scene, and the list of supported/ignored properties.
 
 ---
 

@@ -37,7 +37,8 @@ fn wavelet_and_vector_field_sources() {
     let arr1 = img1.point_data.get("RTData").unwrap();
     let (mn, mx) = arr0.range(Some(0));
     assert!(mx > mn + 50.0);
-    assert_ne!(arr0.get_scalar(0), arr1.get_scalar(0));
+    // vtkRTAnalyticSource is time-invariant (verified against ParaView 6.0.1)
+    assert_eq!(arr0.get_scalar(0), arr1.get_scalar(0));
 
     for kind in [
         VectorFieldKind::SwirlingVortex,

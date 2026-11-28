@@ -70,8 +70,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
         match ev {
             Event::Start(e) => {
                 match e.name().as_ref() {
-                    "VTKFile" => {
-                        for attr in e.attributes() {
+                    "VTKFile" => {                        for attr in e.attributes() {
                             let attr = attr?;
                             let val = attr.normalized_value(XmlVersion::Implicit1_0)?;
                             match attr.key.as_ref() {
@@ -102,6 +101,56 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
                                 _ => {}
                             }
                         }
+                    }
+                    kind @ ("PolyData" | "UnstructuredGrid" | "ImageData" | "RectilinearGrid" | "StructuredGrid")
+                        if file_type == "vtkMultiBlockDataSet" || file_type == "MultiBlockDataSet" =>
+                    {
+                        // Inline dataset inside a <Block>: capture the subtree and parse it recursively.
+                        let start = e.clone().into_owned();
+                        let name: String = start.name().as_ref().to_string();
+                        let mut depth = 1i32;
+                        let mut inner: Vec<u8> = Vec::new();
+                        {
+                            let mut w = quick_xml::Writer::new(&mut inner);
+                            w.write_event(Event::Start(start.clone()))?;
+                            loop {
+                                let ev = reader.read_event()?;
+                                match &ev {
+                                    Event::Start(s) if s.name().as_ref() == name.as_str() => {
+                                        depth += 1;
+                                    }
+                                    Event::End(en) if en.name().as_ref() == name.as_str() => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                w.write_event(ev.into_owned())?;
+                            }
+                            w.write_event(Event::End(quick_xml::events::BytesEnd::new(
+                                name.as_str(),
+                            )))?;
+                        }
+                        let mut wrapped = Vec::with_capacity(inner.len() + 128);
+                        wrapped.extend_from_slice(
+                            format!(
+                                "<VTKFile type=\"{}\" version=\"0.1\" byte_order=\"LittleEndian\">",
+                                std::str::from_utf8(name.as_bytes()).unwrap_or(kind)
+                            )
+                            .as_bytes(),
+                        );
+                        wrapped.extend_from_slice(&inner);
+                        wrapped.extend_from_slice(b"</VTKFile>");
+                        let ds = read_vtk_xml_bytes(&wrapped, base_dir)?;
+                        let label = block_name_stack
+                            .iter()
+                            .rev()
+                            .find_map(|o| o.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| format!("block_{}", multiblock.blocks.len()));
+                        multiblock.add_block(label, ds);
                     }
                     "ImageData" | "PImageData" => {
                         let meta = parse_image_meta(&e)?;
@@ -436,7 +485,7 @@ pub fn read_vtk_xml_bytes(bytes: &[u8], base_dir: &Path) -> Result<DataSet> {
             apply_active_attrs(&mut ugrid.cell_data, active_cell_attrs);
             Ok(DataSet::UnstructuredGrid(ugrid))
         }
-        "vtkMultiBlockDataSet" => Ok(DataSet::MultiBlock(multiblock)),
+        "vtkMultiBlockDataSet" | "MultiBlockDataSet" => Ok(DataSet::MultiBlock(multiblock)),
         "Collection" => {
             pvd_entries.sort_by(|a, b| a.0.total_cmp(&b.0));
             let mut mb = MultiBlockDataSet::new();
@@ -969,7 +1018,7 @@ fn handle_dataset_ref(
     };
     let resolved = crate::limits::resolve_safe_path(base_dir, &rel_file)?;
 
-    if file_type == "vtkMultiBlockDataSet" {
+    if file_type == "vtkMultiBlockDataSet" || file_type == "MultiBlockDataSet" {
         if !resolved.exists() {
             return Err(IoError::MissingFile(resolved));
         }

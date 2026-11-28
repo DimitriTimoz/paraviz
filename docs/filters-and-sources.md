@@ -30,16 +30,16 @@ All 14 sources implement `paraviz_core::Source` and serialize cleanly in `Source
 ### Geometric Sources (`PolyData`)
 
 #### `SphereSource` (`SourceConfig::Sphere`)
-Generates a UV-parameterized 3D sphere (`PolyData`) with analytical outward normals and normalized `[0, 1]` Y-axis elevation scalars.
+Generates a UV-parameterized 3D sphere (`PolyData`, poles on ±Z as single points, all cells triangles — matching `vtkSphereSource`) with analytical outward point `Normals`.
 
 | Parameter | Type | Default | Constraints / Notes |
 | --- | --- | --- | --- |
 | `center` | `[f32; 3]` | `[0.0, 0.0, 0.0]` | World-space center `(x, y, z)` |
 | `radius` | `f32` | `0.5` | Sphere radius in world units |
-| `theta_resolution` | `usize` | `24` | Longitudinal slices around Y/polar axis (clamped `>= 3`) |
-| `phi_resolution` | `usize` | `24` | Latitudinal rings from pole to pole (clamped `>= 2`) |
+| `theta_resolution` | `usize` | `8` | Longitudinal slices around the polar axis (clamped `>= 3`) |
+| `phi_resolution` | `usize` | `8` | Latitudinal rings from pole to pole (clamped `>= 3`) |
 
-- **Output**: `PolyData` triangles + `Normals` (3-comp `point_data`) + `Elevation` (1-comp `point_data` mapped `[0..1]`).
+- **Output**: `PolyData` (`2 * theta * (phi - 2)` triangles, `2 + theta * (phi - 2)` points) + `Normals` (3-comp `point_data`).
 
 ---
 
@@ -64,10 +64,10 @@ Generates a 3D cone oriented along `direction` around `center`.
 | `direction` | `[f32; 3]` | `[1.0, 0.0, 0.0]` | Axis vector pointing toward the apex (normalized; fallback `+X`) |
 | `height` | `f32` | `1.0` | Total cone height from base to apex |
 | `radius` | `f32` | `0.5` | Base circle radius |
-| `resolution` | `usize` | `32` | Base polygon facet count (clamped `>= 3`) |
-| `capping` | `bool` | `true` | Closes the circular base with fan triangles when `true` |
+| `resolution` | `usize` | `6` | Base polygon facet count (clamped `>= 3`) |
+| `capping` | `bool` | `true` | Closes the circular base with a single n-gon when `true` |
 
-- **Output**: `PolyData` + `Normals` + `AxisCoord` (`x` world coordinate scalar in `point_data`).
+- **Output**: `PolyData` (`resolution` side triangles + optional base n-gon; `resolution + 1` points, matching `vtkConeSource`), no data arrays.
 
 ---
 
@@ -79,10 +79,10 @@ Generates a Y-axis-aligned cylinder centered at `center`.
 | `center` | `[f32; 3]` | `[0.0, 0.0, 0.0]` | Center `(x, y, z)` |
 | `height` | `f32` | `1.0` | Cylinder height along the Y axis |
 | `radius` | `f32` | `0.5` | Cylinder radius in X-Z plane |
-| `resolution` | `usize` | `32` | Circumferential segments (clamped `>= 3`) |
-| `capping` | `bool` | `true` | Closes top and bottom disks when `true` |
+| `resolution` | `usize` | `6` | Circumferential segments (clamped `>= 3`) |
+| `capping` | `bool` | `true` | Closes top and bottom disks with single n-gons when `true` |
 
-- **Output**: `PolyData` + `Normals` + `Elevation` (`y` coordinate scalar in `point_data`).
+- **Output**: `PolyData` (`resolution` side quads + optional cap n-gons; `4 * resolution` points, matching `vtkCylinderSource`) + `Normals` (3-comp) + `TCoords` (2-comp `point_data`).
 
 ---
 
@@ -94,10 +94,10 @@ Generates a subdivided parallelogram spanned by `point1 - origin` and `point2 - 
 | `origin` | `[f32; 3]` | `[-0.5, -0.5, 0.0]` | Corner `(0, 0)` of the plane |
 | `point1` | `[f32; 3]` | `[0.5, -0.5, 0.0]` | Corner `(1, 0)` defining the U axis |
 | `point2` | `[f32; 3]` | `[-0.5, 0.5, 0.0]` | Corner `(0, 1)` defining the V axis |
-| `x_resolution` | `usize` | `10` | Grid subdivisions along U (clamped `>= 1`) |
-| `y_resolution` | `usize` | `10` | Grid subdivisions along V (clamped `>= 1`) |
+| `x_resolution` | `usize` | `1` | Grid subdivisions along U (clamped `>= 1`) |
+| `y_resolution` | `usize` | `1` | Grid subdivisions along V (clamped `>= 1`) |
 
-- **Output**: `PolyData` (`2 * nx * ny` triangles) + constant `Normals` + `RadialDist` (`sqrt(u^2 + v^2)` in `point_data`).
+- **Output**: `PolyData` (`nx * ny` quads, matching `vtkPlaneSource`) + constant point `Normals` + 2-component `TextureCoordinates` (`(u, v)` in `point_data`).
 
 ---
 
@@ -108,9 +108,9 @@ Generates a single subdivided polyline segment between `point1` and `point2`.
 | --- | --- | --- | --- |
 | `point1` | `[f32; 3]` | `[-0.5, 0.0, 0.0]` | Segment start point |
 | `point2` | `[f32; 3]` | `[0.5, 0.0, 0.0]` | Segment end point |
-| `resolution` | `usize` | `16` | Number of segments (`resolution + 1` points; clamped `>= 1`) |
+| `resolution` | `usize` | `6` | Number of segments (`resolution + 1` points; clamped `>= 1`) |
 
-- **Output**: `PolyData` (`lines`) + `ArcLength` (`[0.0 .. 1.0]` scalar in `point_data`).
+- **Output**: `PolyData` (`lines`) + `Texture Coordinates` (2-comp `(t, 0)` in `point_data`, matching `vtkLineSource`).
 
 ---
 
@@ -121,11 +121,11 @@ Generates a unit-length 3D arrow along `+X` from `(0, 0, 0)` to `(1, 0, 0)` (sha
 | --- | --- | --- | --- |
 | `tip_length` | `f32` | `0.35` | Fraction of unit length occupied by tip (`shaft_len = max(1.0 - tip_length, 0.05)`) |
 | `tip_radius` | `f32` | `0.10` | Cone base radius of the arrowhead |
-| `tip_resolution` | `usize` | `12` | Circumferential tip segments (clamped `>= 4`) |
-| `shaft_radius` | `f32` | `0.035` | Cylindrical shaft radius |
-| `shaft_resolution` | `usize` | `12` | Circumferential shaft segments (clamped `>= 4`) |
+| `tip_resolution` | `usize` | `6` | Circumferential tip segments (clamped `>= 4`) |
+| `shaft_radius` | `f32` | `0.03` | Cylindrical shaft radius |
+| `shaft_resolution` | `usize` | `6` | Circumferential shaft segments (clamped `>= 4`) |
 
-- **Output**: `PolyData` triangles + computed `Normals`.
+- **Output**: `PolyData` triangles, no data arrays (matching `vtkArrowSource`).
 
 ---
 
@@ -134,12 +134,12 @@ Generates an annular or filled disk in the XY plane (`z = 0`) centered at the or
 
 | Parameter | Type | Default | Constraints / Notes |
 | --- | --- | --- | --- |
-| `inner_radius` | `f32` | `0.25` | Inner hole radius (clamped `>= 0.0`; `0.0` produces a solid disk center ring) |
-| `outer_radius` | `f32` | `0.75` | Outer disk radius (clamped `>= inner_radius + 1e-4`) |
-| `radial_resolution` | `usize` | `4` | Concentric ring subdivisions (clamped `>= 1`) |
-| `circum_resolution` | `usize` | `32` | Angular segments around the disk (clamped `>= 3`) |
+| `inner_radius` | `f32` | `0.5` | Inner hole radius (clamped `>= 0.0`) |
+| `outer_radius` | `f32` | `1.0` | Outer disk radius (clamped `>= inner_radius + 1e-4`) |
+| `radial_resolution` | `usize` | `8` | Concentric ring subdivisions (clamped `>= 1`) |
+| `circum_resolution` | `usize` | `8` | Angular segments around the disk (clamped `>= 3`) |
 
-- **Output**: `PolyData` + `+Z` `Normals` + `Radius` (`point_data` scalar `r`).
+- **Output**: `PolyData` (`radial * circum` quads; `(radial + 1) * circum` points, matching `vtkDiskSource`), no data arrays.
 
 ---
 

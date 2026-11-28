@@ -4,7 +4,18 @@ build-backend = "maturin"
 
 [project]
 name = "paraviz"
-version = "0.1.0"
-description = "ParaView rewritten in Rust + WebGPU — Python bindings"
+version = "0.2.6"
+description = "ParaViz — ParaView rewritten in Rust + WebGPU. Includes a paraview.simple-compatible Python API (import paraview.simple)."
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
+dependencies = ["numpy>=1.22"]
+keywords = ["visualization", "paraview", "vtk", "wgpu", "webgpu", "scientific"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "paraviz._paraviz"

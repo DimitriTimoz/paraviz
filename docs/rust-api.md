@@ -91,6 +91,7 @@ For every underlying `ActorStyle`, `SceneSettings`, `Camera`, `ScalarBarConfig`,
 | `render_rgba(w, h)` / `render_png(path, w, h)` | Render headless `Rgba8Unorm` pixels or PNG (supports `transparent_background`, `show_scalar_bar`, `ScalarBarConfig`, `show_time_annotation`, and `annotations`) |
 | `render_turntable_gif(...)` / `render_timeseries_gif(...)` | Render 360-degree turntable or time-series animated GIF89a files |
 | `export_dataset(id, path)` / `export_glb(id, path, use_cmap)` / `export_html(id, path, use_cmap)` | Export evaluated node to VTK/mesh/CSV/NIfTI/MHA, binary glTF 2.0, or interactive WebGL2 `.html` |
+| `export_html_ab(id_a, id_b, path, use_cmap)` | Export an **A/B compare** viewer: both nodes in one self-contained `.html` with a shared camera, a wipe slider, and a common scalar legend |
 | `save_state_json()` / `load_state_json(json)` | Save and restore configured pipelines, in-memory data, styles, camera, and `SceneSettings` |
 | `save_project(path, mode)` / `load_project(path)` | Save or load a native disk project. Use `ProjectSaveMode::Referenced` for dataset links and `Embedded` for a self-contained file with every advertised time step. |
 | `load_project_with_relocation(path, locate)` | Resolve a missing dataset via a callback before restoring the project. |
@@ -214,22 +215,35 @@ See the runnable examples in [`examples/`](../examples):
 
 ## 5. Python Bindings (`paraviz-py`)
 
-A standalone PyO3 extension crate lives in [`crates/paraviz-py/`](../crates/paraviz-py), exposing `paraviz.Session` with a workflow modeled after `paraview.simple`:
+A standalone PyO3 extension crate lives in [`crates/paraviz-py/`](../crates/paraviz-py). The
+wheel ships two things:
 
-```python
-import paraviz
+1. **`paraviz.Session`** — the native PyO3 API (typed helpers plus a generic JSON config
+   surface: `add_source_cfg_json`, `set_filter_cfg_json`, `style_json`, `data_info_json`, ...):
 
-s = paraviz.Session()
-wav = s.wavelet("Wavelet")
-iso = s.contour("Contour", wav, "RTData", [120.0, 175.0])
-s.hide(wav)
-s.show(iso, repr="edges", colormap="viridis", color_by="RTData")
-s.reset_camera()
-s.render_png("wavelet.png", 1280, 720)
-print(s.to_rust_trace())
-```
+   ```python
+   import paraviz
+
+   s = paraviz.Session()
+   wav = s.wavelet("Wavelet")
+   iso = s.contour("Contour", wav, "RTData", [120.0, 175.0])
+   s.hide(wav)
+   s.show(iso, repr="edges", colormap="viridis", color_by="RTData")
+   s.reset_camera()
+   s.render_png("wavelet.png", 1280, 720)
+   print(s.to_rust_trace())
+   ```
+
+2. **A bundled `paraview` package** — a `paraview.simple`-compatible shim, so existing ParaView
+   Python scripts run unmodified (`from paraview.simple import *`). See
+   [ParaView Python API compatibility](paraview-python-compat.md).
 
 Build and install locally with `maturin` inside `crates/paraviz-py`:
 ```bash
 cd crates/paraviz-py && maturin develop --release
+```
+
+Run the compatibility test suite:
+```bash
+cd crates/paraviz-py && python -m pytest tests/ -q
 ```

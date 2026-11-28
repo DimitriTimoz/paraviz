@@ -73,7 +73,8 @@ fn time_stepping_and_io_export() {
     let ds1 = pv.evaluate(wav).unwrap();
     let s0 = ds0.point_data().unwrap().get("RTData").unwrap().get_scalar(0);
     let s1 = ds1.point_data().unwrap().get("RTData").unwrap().get_scalar(0);
-    assert_ne!(s0, s1);
+    // vtkRTAnalyticSource is time-invariant (verified against ParaView 6.0.1)
+    assert_eq!(s0, s1);
 
     let out_vti = std::env::temp_dir().join("paraviz_api_export.vti");
     pv.export_dataset(wav, &out_vti).unwrap();
@@ -299,4 +300,43 @@ fn projects_survive_moves_relocation_and_offline_reopen() {
 
     assert!(session.save_project(&portable, ProjectSaveMode::Embedded).is_err());
     assert_eq!(fs::read(&portable).unwrap(), portable_contents);
+}
+
+#[test]
+fn export_html_ab_single_file_with_slider_and_common_legend() {
+    let mut pv = ParaViz::new();
+    let wav = pv
+        .add_source_cfg("Wavelet", SourceConfig::Wavelet(WaveletSource::with_extent(6)))
+        .unwrap();
+    let iso_a = pv
+        .add_filter_cfg(
+            "IsoA",
+            wav,
+            FilterConfig::Contour(ContourFilter::new("RTData", vec![120.0])),
+        )
+        .unwrap();
+    let iso_b = pv
+        .add_filter_cfg(
+            "IsoB",
+            wav,
+            FilterConfig::Contour(ContourFilter::new("RTData", vec![200.0])),
+        )
+        .unwrap();
+    pv.show(iso_a).color_by_point("RTData");
+    pv.show(iso_b).color_by_point("RTData");
+
+    let out = std::env::temp_dir().join("paraviz_ab_test.html");
+    pv.export_html_ab(iso_a, iso_b, &out, true).unwrap();
+    let html = fs::read_to_string(&out).unwrap();
+    let _ = fs::remove_file(&out);
+
+    assert_eq!(html.matches("<canvas").count(), 1, "single canvas/file");
+    assert!(html.contains(r#"id="abSlider""#), "A/B wipe slider missing");
+    assert!(html.contains(r#"id="legendBar""#), "common legend missing");
+    assert!(html.contains(r#""labelA":"IsoA""#));
+    assert!(html.contains(r#""labelB":"IsoB""#));
+    // common legend over the union of both RTData ranges
+    assert!(html.contains(r#""array":"RTData""#));
+    assert!(html.contains(r#""a":{"#), "side A payload missing");
+    assert!(html.contains(r#""b":{"#), "side B payload missing");
 }

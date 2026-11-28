@@ -147,7 +147,6 @@ struct StlMeshBuilder {
     points: Vec<[f32; 3]>,
     point_map: HashMap<[u32; 3], u32>,
     polys: Vec<Vec<u32>>,
-    face_normals: Vec<[f32; 3]>,
 }
 
 impl StlMeshBuilder {
@@ -156,7 +155,6 @@ impl StlMeshBuilder {
             points: Vec::with_capacity(tris / 2 + 4),
             point_map: HashMap::with_capacity(tris / 2 + 4),
             polys: Vec::with_capacity(tris),
-            face_normals: Vec::with_capacity(tris),
         }
     }
 
@@ -172,27 +170,11 @@ impl StlMeshBuilder {
         }
     }
 
-    fn push_triangle(&mut self, normal: [f32; 3], v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) {
+    fn push_triangle(&mut self, _normal: [f32; 3], v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) {
         let i0 = self.intern(v0);
         let i1 = self.intern(v1);
         let i2 = self.intern(v2);
         self.polys.push(vec![i0, i1, i2]);
-
-        let n = Vec3::from_array(normal);
-        let final_normal = if n.length_squared() > 1e-16 && n.is_finite() {
-            n.normalize().to_array()
-        } else {
-            let p0 = Vec3::from_array(v0);
-            let p1 = Vec3::from_array(v1);
-            let p2 = Vec3::from_array(v2);
-            let computed = (p1 - p0).cross(p2 - p0);
-            if computed.length_squared() > 1e-20 {
-                computed.normalize().to_array()
-            } else {
-                [0.0, 0.0, 1.0]
-            }
-        };
-        self.face_normals.push(final_normal);
     }
 
     fn finish(self) -> PolyData {
@@ -201,9 +183,13 @@ impl StlMeshBuilder {
             polys: self.polys,
             ..Default::default()
         };
-        poly.cell_data
-            .set_normals(DataArray::vectors_f32("Normals", self.face_normals));
-        poly.compute_normals();
+        // vtkSTLReader exposes a per-cell solid id, not normals arrays.
+        let ncells = poly.polys.len();
+        poly.cell_data.add_array(DataArray::new(
+            "STLSolidLabeling",
+            1,
+            ArrayData::I32(vec![0; ncells]),
+        ));
         poly
     }
 }

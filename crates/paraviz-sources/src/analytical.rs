@@ -54,7 +54,7 @@ impl WaveletSource {
         }
     }
 
-    pub fn build(&self, time: f64) -> ImageData {
+    pub fn build(&self, _time: f64) -> ImageData {
         let [x0, x1, y0, y1, z0, z1] = self.whole_extent;
         let nx = (x1 - x0 + 1).max(1) as usize;
         let ny = (y1 - y0 + 1).max(1) as usize;
@@ -67,7 +67,6 @@ impl WaveletSource {
         let scale_y = if ny > 1 { 1.0 / (ny - 1) as f64 } else { 1.0 };
         let scale_z = if nz > 1 { 1.0 / (nz - 1) as f64 } else { 1.0 };
         let temp2 = 1.0 / (2.0 * self.std_dev * self.std_dev);
-        let phase = time * 2.0 * std::f64::consts::PI;
 
         let total = nx * ny * nz;
         let values: Vec<f32> = (0..total)
@@ -87,10 +86,11 @@ impl WaveletSource {
                 let dz = (z - self.center[2]) * scale_z;
                 let r2 = dx * dx + dy * dy + dz * dz;
 
+                // matches vtkRTAnalyticSource (verified against ParaView 6.0.1)
                 let gauss = self.maximum * (-r2 * temp2).exp();
-                let sx = self.x_mag * (self.x_freq * dx + phase).sin();
-                let cy = self.y_mag * (self.y_freq * dy).cos();
-                let sz = self.z_mag * (self.z_freq * dz).sin();
+                let sx = self.x_mag * (-self.x_freq * dx).sin();
+                let cy = self.y_mag * (-self.y_freq * dy).sin();
+                let sz = self.z_mag * (self.z_freq * dz).cos();
                 (gauss + sx + cy + sz) as f32
             })
             .collect();
@@ -411,8 +411,8 @@ impl Default for PointCloudSource {
     fn default() -> Self {
         Self {
             center: [0.0, 0.0, 0.0],
-            radius: 1.0,
-            num_points: 1000,
+            radius: 0.0,
+            num_points: 1,
             volumetric: true,
         }
     }
@@ -424,7 +424,6 @@ impl PointCloudSource {
         let golden_angle = PI * (3.0 - 5.0_f32.sqrt());
         let mut points = Vec::with_capacity(n);
         let mut verts = Vec::with_capacity(n);
-        let mut radial = Vec::with_capacity(n);
 
         for i in 0..n {
             let t = (i as f32 + 0.5) / n as f32;
@@ -437,17 +436,13 @@ impl PointCloudSource {
             let pz = self.center[2] + r_xy * theta.sin() * shell;
             points.push([px, py, pz]);
             verts.push(i as u32);
-            radial.push(shell);
         }
 
-        let mut pd = PolyData {
+        PolyData {
             points,
             verts,
             ..Default::default()
-        };
-        pd.point_data
-            .set_scalars(DataArray::scalars_f32("Radius", radial));
-        pd
+        }
     }
 }
 

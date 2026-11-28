@@ -27,7 +27,7 @@ impl Default for SliceFilter {
     fn default() -> Self {
         Self {
             origin: [0.0, 0.0, 0.0],
-            normal: [0.0, 0.0, 1.0],
+            normal: [1.0, 0.0, 0.0],
             crinkle: false,
         }
     }
@@ -144,6 +144,97 @@ fn grid_signed_dists(points: GridPoints<'_>, origin: Vec3, normal: Vec3) -> Vec<
     }
 }
 
+/// Extracts the exact grid plane for axis-aligned slice normals (x/y/z).
+/// Returns `None` when the plane is not aligned with a grid plane.
+fn axis_aligned_slice(
+    dims: [usize; 3],
+    points: GridPoints<'_>,
+    point_data: &FieldData,
+    origin: Vec3,
+    normal: Vec3,
+) -> Option<PolyData> {
+    let [nx, ny, nz] = dims;
+    let n = normal.normalize_or(Vec3::Z);
+    let ax = if n.x.abs() > 0.999 {
+        0usize
+    } else if n.y.abs() > 0.999 {
+        1
+    } else if n.z.abs() > 0.999 {
+        2
+    } else {
+        return None;
+    };
+    let nax = [nx, ny, nz][ax];
+    if nax < 2 {
+        return None;
+    }
+    let o = [origin.x, origin.y, origin.z][ax];
+    let coord = |i: usize| -> f32 {
+        let p = match ax {
+            0 => points.at_ijk(i, 0, 0),
+            1 => points.at_ijk(0, i, 0),
+            _ => points.at_ijk(0, 0, i),
+        };
+        p[ax]
+    };
+    let mut best = 0usize;
+    let mut best_d = f32::MAX;
+    for i in 0..nax {
+        let d = (coord(i) - o).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    let span = (coord(nax - 1) - coord(0)).abs().max(1.0);
+    if best_d > 1e-4 * span {
+        return None;
+    }
+    let (u, v) = match ax {
+        0 => (ny, nz),
+        1 => (nx, nz),
+        _ => (nx, ny),
+    };
+    let src = |uu: usize, vv: usize| -> (usize, usize, usize) {
+        match ax {
+            0 => (best, uu, vv),
+            1 => (uu, best, vv),
+            _ => (uu, vv, best),
+        }
+    };
+    let mut out_points = Vec::with_capacity(u * v);
+    let mut src_indices = Vec::with_capacity(u * v);
+    for vv in 0..v {
+        for uu in 0..u {
+            let (i, j, k) = src(uu, vv);
+            out_points.push(points.at_ijk(i, j, k));
+            src_indices.push(i + nx * (j + ny * k));
+        }
+    }
+    let mut polys = Vec::with_capacity((u - 1) * (v - 1) * 2);
+    for vv in 0..v.saturating_sub(1) {
+        for uu in 0..u.saturating_sub(1) {
+            let a = (vv * u + uu) as u32;
+            let b = (vv * u + uu + 1) as u32;
+            let c = ((vv + 1) * u + uu + 1) as u32;
+            let d = ((vv + 1) * u + uu) as u32;
+            polys.push(vec![a, b, c]);
+            polys.push(vec![a, c, d]);
+        }
+    }
+    let pdata = if point_data.is_empty() {
+        FieldData::new()
+    } else {
+        point_data.gather(&src_indices)
+    };
+    Some(PolyData {
+        points: out_points,
+        polys,
+        point_data: pdata,
+        ..Default::default()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn slice_structured(
     dims: [usize; 3],
@@ -158,6 +249,14 @@ fn slice_structured(
     let [nx, ny, nz] = dims;
     if nx < 2 || ny < 2 || nz < 2 || points.is_empty() {
         return PolyData::new();
+    }
+    // Axis-aligned planes on structured grids take the exact grid-plane fast
+    // path (matches vtkCutter on ImageData: a clean triangulated grid slice,
+    // no interpolated cut points, no generated normals).
+    if !crinkle {
+        if let Some(pd) = axis_aligned_slice(dims, points, point_data, origin, normal) {
+            return pd;
+        }
     }
     let dists = grid_signed_dists(points, origin, normal);
     let cx = nx - 1;
@@ -273,9 +372,7 @@ fn slice_structured(
             cell_data: cdata,
             ..Default::default()
         };
-        if pd.point_data.active_normals_array().is_none() && !pd.polys.is_empty() {
-            pd.compute_normals();
-        }
+        let _ = &mut pd;
         return pd;
     }
 
@@ -318,9 +415,6 @@ fn slice_structured(
     let pdata = interpolate_field_data_edges(point_data, &edges);
     let mut pd = PolyData::from_triangles(pts, tris);
     pd.point_data = pdata;
-    if !pd.polys.is_empty() {
-        pd.compute_normals();
-    }
     pd
 }
 
@@ -361,7 +455,7 @@ fn slice_unstructured(ug: &UnstructuredGrid, origin: Vec3, normal: Vec3, crinkle
         } else {
             FieldData::new()
         };
-        let mut pd = compact_polydata_points(PolyData {
+        let pd = compact_polydata_points(PolyData {
             points: ug.points.clone(),
             lines,
             polys,
@@ -369,9 +463,6 @@ fn slice_unstructured(ug: &UnstructuredGrid, origin: Vec3, normal: Vec3, crinkle
             cell_data: cdata,
             ..Default::default()
         });
-        if pd.point_data.active_normals_array().is_none() && !pd.polys.is_empty() {
-            pd.compute_normals();
-        }
         return pd;
     }
 
@@ -399,9 +490,6 @@ fn slice_unstructured(ug: &UnstructuredGrid, origin: Vec3, normal: Vec3, crinkle
     let pdata = interpolate_field_data_edges(&ug.point_data, &edges);
     let mut pd = PolyData::from_triangles(pts, tris);
     pd.point_data = pdata;
-    if !pd.polys.is_empty() {
-        pd.compute_normals();
-    }
     pd
 }
 

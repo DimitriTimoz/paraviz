@@ -2,7 +2,7 @@
 //! `CylinderSource`, `PlaneSource`, `LineSource`, `ArrowSource`).
 
 use glam::{Quat, Vec3};
-use paraviz_core::{DataArray, DataSet, PipelineError, PolyData, Source};
+use paraviz_core::{ArrayData, DataArray, DataSet, PipelineError, PolyData, Source};
 use serde::{Deserialize, Serialize};
 use std::f32::consts::{PI, TAU};
 
@@ -20,8 +20,8 @@ impl Default for SphereSource {
         Self {
             center: [0.0, 0.0, 0.0],
             radius: 0.5,
-            theta_resolution: 32,
-            phi_resolution: 20,
+            theta_resolution: 8,
+            phi_resolution: 8,
         }
     }
 }
@@ -31,41 +31,54 @@ impl SphereSource {
         let n_theta = self.theta_resolution.max(3);
         let n_phi = self.phi_resolution.max(3);
         let c = Vec3::from_array(self.center);
+        let r = self.radius;
 
-        let mut points = Vec::new();
-        let mut normals = Vec::new();
-        let mut elevation = Vec::new();
-        let mut polys = Vec::new();
+        // vtkSphereSource layout: single points at the +Z/-Z poles, then
+        // (phi_resolution - 2) rings of theta_resolution points (no seam
+        // duplicate), all cells triangles.
+        let mut points: Vec<[f32; 3]> = Vec::new();
+        let mut normals: Vec<[f32; 3]> = Vec::new();
+        points.push((c + Vec3::new(0.0, 0.0, r)).to_array());
+        normals.push([0.0, 0.0, 1.0]);
+        points.push((c + Vec3::new(0.0, 0.0, -r)).to_array());
+        normals.push([0.0, 0.0, -1.0]);
+        let pole_top = 0u32;
+        let pole_bot = 1u32;
 
-        for j in 0..=n_phi {
-            let v = j as f32 / n_phi as f32;
-            let phi = v * PI;
-            let sin_phi = phi.sin();
-            let cos_phi = phi.cos();
-            for i in 0..=n_theta {
-                let u = i as f32 / n_theta as f32;
-                let theta = u * TAU;
-                let n = Vec3::new(sin_phi * theta.cos(), cos_phi, sin_phi * theta.sin());
-                let p = c + n * self.radius;
-                points.push(p.to_array());
+        let n_rings = n_phi.saturating_sub(2);
+        let ring_start = points.len() as u32;
+        for j in 1..=n_rings {
+            let phi = PI * j as f32 / (n_phi - 1) as f32;
+            let (sin_phi, cos_phi) = phi.sin_cos();
+            for i in 0..n_theta {
+                let theta = TAU * i as f32 / n_theta as f32;
+                let n = Vec3::new(sin_phi * theta.cos(), sin_phi * theta.sin(), cos_phi);
+                points.push((c + n * r).to_array());
                 normals.push(n.to_array());
-                elevation.push(p.y);
             }
         }
+        let ring = |j: usize| ring_start + (j - 1) as u32 * n_theta as u32;
 
-        let row = n_theta + 1;
-        for j in 0..n_phi {
+        let mut polys: Vec<Vec<u32>> = Vec::with_capacity(2 * n_theta * n_rings.max(1));
+        for i in 0..n_theta {
+            let i1 = (i + 1) % n_theta;
+            polys.push(vec![pole_top, ring(1) + i as u32, ring(1) + i1 as u32]);
+        }
+        for j in 1..n_rings {
             for i in 0..n_theta {
-                let a = (j * row + i) as u32;
-                let b = (j * row + i + 1) as u32;
-                let c_idx = ((j + 1) * row + i + 1) as u32;
-                let d = ((j + 1) * row + i) as u32;
-                if j > 0 {
-                    polys.push(vec![a, b, c_idx]);
-                }
-                if j < n_phi - 1 {
-                    polys.push(vec![a, c_idx, d]);
-                }
+                let i1 = (i + 1) % n_theta;
+                let a = ring(j) + i as u32;
+                let b = ring(j) + i1 as u32;
+                let cc = ring(j + 1) + i1 as u32;
+                let d = ring(j + 1) + i as u32;
+                polys.push(vec![a, b, cc]);
+                polys.push(vec![a, cc, d]);
+            }
+        }
+        if n_rings >= 1 {
+            for i in 0..n_theta {
+                let i1 = (i + 1) % n_theta;
+                polys.push(vec![ring(n_rings) + i as u32, ring(n_rings) + i1 as u32, pole_bot]);
             }
         }
 
@@ -76,8 +89,6 @@ impl SphereSource {
         };
         pd.point_data
             .set_normals(DataArray::vectors_f32("Normals", normals));
-        pd.point_data
-            .set_scalars(DataArray::scalars_f32("Elevation", elevation));
         pd
     }
 }
@@ -181,7 +192,7 @@ impl Default for ConeSource {
             direction: [1.0, 0.0, 0.0],
             height: 1.0,
             radius: 0.5,
-            resolution: 32,
+            resolution: 6,
             capping: true,
         }
     }
@@ -195,7 +206,6 @@ impl ConeSource {
         let center = Vec3::from_array(self.center);
 
         let apex = center + rot * Vec3::new(self.height * 0.5, 0.0, 0.0);
-        let base_center = center + rot * Vec3::new(-self.height * 0.5, 0.0, 0.0);
 
         let mut points = Vec::new();
         let mut polys = Vec::new();
@@ -216,25 +226,15 @@ impl ConeSource {
         }
 
         if self.capping {
-            let cap_center_idx = points.len() as u32;
-            points.push(base_center.to_array());
-            for i in 0..res {
-                let b0 = 1 + i as u32;
-                let b1 = 1 + ((i + 1) % res) as u32;
-                polys.push(vec![cap_center_idx, b1, b0]);
-            }
+            // base cap as a single n-gon (shares the base ring, no center point)
+            polys.push((1..=res as u32).collect());
         }
 
-        let mut pd = PolyData {
+        PolyData {
             points,
             polys,
             ..Default::default()
-        };
-        pd.compute_normals();
-        let elev: Vec<f32> = pd.points.iter().map(|p| p[0]).collect();
-        pd.point_data
-            .set_scalars(DataArray::scalars_f32("AxisCoord", elev));
-        pd
+        }
     }
 }
 
@@ -264,7 +264,7 @@ impl Default for CylinderSource {
             center: [0.0, 0.0, 0.0],
             height: 1.0,
             radius: 0.5,
-            resolution: 32,
+            resolution: 6,
             capping: true,
         }
     }
@@ -277,14 +277,24 @@ impl CylinderSource {
         let hy = self.height * 0.5;
 
         let mut points = Vec::new();
+        let mut normals = Vec::new();
+        let mut tcoords = Vec::new();
         let mut polys = Vec::new();
 
+        // side wall: bottom + top ring (interleaved), side quads
         for i in 0..res {
             let ang = (i as f32 / res as f32) * TAU;
             let x = self.radius * ang.cos();
             let z = self.radius * ang.sin();
             points.push((c + Vec3::new(x, -hy, z)).to_array());
             points.push((c + Vec3::new(x, hy, z)).to_array());
+            normals.push([ang.cos(), 0.0, ang.sin()]);
+            normals.push([ang.cos(), 0.0, ang.sin()]);
+            let u = (2.0 * i as f32 / res as f32 - 1.0).abs(); // matches vtkCylinderSource TCoords
+            tcoords.push(u);
+            tcoords.push(0.0);
+            tcoords.push(u);
+            tcoords.push(1.0);
         }
 
         for i in 0..res {
@@ -293,24 +303,34 @@ impl CylinderSource {
             let t0 = (2 * i + 1) as u32;
             let b1 = (2 * next) as u32;
             let t1 = (2 * next + 1) as u32;
-            polys.push(vec![b0, b1, t1]);
-            polys.push(vec![b0, t1, t0]);
+            polys.push(vec![b0, b1, t1, t0]);
         }
 
         if self.capping {
-            let bot_c = points.len() as u32;
-            points.push((c + Vec3::new(0.0, -hy, 0.0)).to_array());
-            let top_c = points.len() as u32;
-            points.push((c + Vec3::new(0.0, hy, 0.0)).to_array());
+            // caps duplicate the ring points and are single n-gons; their
+            // TCoords are the (x, z) coordinates (vtkCylinderSource behavior)
+            let bot_ring = points.len() as u32;
             for i in 0..res {
-                let next = (i + 1) % res;
-                let b0 = (2 * i) as u32;
-                let t0 = (2 * i + 1) as u32;
-                let b1 = (2 * next) as u32;
-                let t1 = (2 * next + 1) as u32;
-                polys.push(vec![bot_c, b1, b0]);
-                polys.push(vec![top_c, t0, t1]);
+                let ang = (i as f32 / res as f32) * TAU;
+                let x = self.radius * ang.cos();
+                let z = self.radius * ang.sin();
+                points.push((c + Vec3::new(x, -hy, z)).to_array());
+                normals.push([0.0, -1.0, 0.0]);
+                tcoords.push(x);
+                tcoords.push(z);
             }
+            let top_ring = points.len() as u32;
+            for i in 0..res {
+                let ang = (i as f32 / res as f32) * TAU;
+                let x = self.radius * ang.cos();
+                let z = self.radius * ang.sin();
+                points.push((c + Vec3::new(x, hy, z)).to_array());
+                normals.push([0.0, 1.0, 0.0]);
+                tcoords.push(x);
+                tcoords.push(z);
+            }
+            polys.push((bot_ring..bot_ring + res as u32).rev().collect());
+            polys.push((top_ring..top_ring + res as u32).collect());
         }
 
         let mut pd = PolyData {
@@ -318,10 +338,10 @@ impl CylinderSource {
             polys,
             ..Default::default()
         };
-        pd.compute_normals();
-        let elev: Vec<f32> = pd.points.iter().map(|p| p[1]).collect();
         pd.point_data
-            .set_scalars(DataArray::scalars_f32("Elevation", elev));
+            .set_normals(DataArray::vectors_f32("Normals", normals));
+        pd.point_data
+            .add_array(DataArray::new("TCoords", 2, ArrayData::F32(tcoords)));
         pd
     }
 }
@@ -352,8 +372,8 @@ impl Default for PlaneSource {
             origin: [-0.5, -0.5, 0.0],
             point1: [0.5, -0.5, 0.0],
             point2: [-0.5, 0.5, 0.0],
-            x_resolution: 10,
-            y_resolution: 10,
+            x_resolution: 1,
+            y_resolution: 1,
         }
     }
 }
@@ -369,8 +389,8 @@ impl PlaneSource {
 
         let mut points = Vec::with_capacity((nx + 1) * (ny + 1));
         let mut normals = Vec::with_capacity((nx + 1) * (ny + 1));
-        let mut u_coord = Vec::with_capacity((nx + 1) * (ny + 1));
-        let mut polys = Vec::with_capacity(nx * ny * 2);
+        let mut tex = Vec::with_capacity((nx + 1) * (ny + 1));
+        let mut polys = Vec::with_capacity(nx * ny);
 
         for j in 0..=ny {
             let v = j as f32 / ny as f32;
@@ -379,7 +399,8 @@ impl PlaneSource {
                 let p = o + u_vec * u + v_vec * v;
                 points.push(p.to_array());
                 normals.push(normal);
-                u_coord.push((u * u + v * v).sqrt());
+                tex.push(u);
+                tex.push(v);
             }
         }
 
@@ -390,8 +411,7 @@ impl PlaneSource {
                 let b = (j * row + i + 1) as u32;
                 let c = ((j + 1) * row + i + 1) as u32;
                 let d = ((j + 1) * row + i) as u32;
-                polys.push(vec![a, b, c]);
-                polys.push(vec![a, c, d]);
+                polys.push(vec![a, b, c, d]);
             }
         }
 
@@ -403,7 +423,7 @@ impl PlaneSource {
         pd.point_data
             .set_normals(DataArray::vectors_f32("Normals", normals));
         pd.point_data
-            .set_scalars(DataArray::scalars_f32("RadialDist", u_coord));
+            .add_array(DataArray::new("TextureCoordinates", 2, ArrayData::F32(tex)));
         pd
     }
 }
@@ -431,7 +451,7 @@ impl Default for LineSource {
         Self {
             point1: [-0.5, 0.0, 0.0],
             point2: [0.5, 0.0, 0.0],
-            resolution: 16,
+            resolution: 6,
         }
     }
 }
@@ -443,20 +463,24 @@ impl LineSource {
         let p2 = Vec3::from_array(self.point2);
         let mut points = Vec::with_capacity(n + 1);
         let mut line = Vec::with_capacity(n + 1);
-        let mut arc = Vec::with_capacity(n + 1);
+        let mut tcoords = Vec::with_capacity((n + 1) * 2);
         for i in 0..=n {
             let t = i as f32 / n as f32;
             points.push(p1.lerp(p2, t).to_array());
             line.push(i as u32);
-            arc.push(t);
+            tcoords.push(t);
+            tcoords.push(0.0);
         }
         let mut pd = PolyData {
             points,
             lines: vec![line],
             ..Default::default()
         };
-        pd.point_data
-            .set_scalars(DataArray::scalars_f32("ArcLength", arc));
+        pd.point_data.add_array(DataArray::new(
+            "Texture Coordinates",
+            2,
+            ArrayData::F32(tcoords),
+        ));
         pd
     }
 }
@@ -487,9 +511,9 @@ impl Default for ArrowSource {
         Self {
             tip_length: 0.35,
             tip_radius: 0.10,
-            tip_resolution: 12,
-            shaft_radius: 0.035,
-            shaft_resolution: 12,
+            tip_resolution: 6,
+            shaft_radius: 0.03,
+            shaft_resolution: 6,
         }
     }
 }
@@ -547,7 +571,7 @@ impl ArrowSource {
             polys,
             ..Default::default()
         };
-        pd.compute_normals();
+        let _ = &mut pd;
         pd
     }
 }
@@ -574,10 +598,10 @@ pub struct DiskSource {
 impl Default for DiskSource {
     fn default() -> Self {
         Self {
-            inner_radius: 0.25,
-            outer_radius: 0.75,
-            radial_resolution: 4,
-            circum_resolution: 32,
+            inner_radius: 0.5,
+            outer_radius: 1.0,
+            radial_resolution: 8,
+            circum_resolution: 8,
         }
     }
 }
@@ -590,9 +614,7 @@ impl DiskSource {
         let r1 = self.outer_radius.max(r0 + 1e-4);
 
         let mut points = Vec::with_capacity((nr + 1) * nc);
-        let mut normals = Vec::with_capacity((nr + 1) * nc);
-        let mut radial = Vec::with_capacity((nr + 1) * nc);
-        let mut polys = Vec::with_capacity(nr * nc * 2);
+        let mut polys = Vec::with_capacity(nr * nc);
 
         for ir in 0..=nr {
             let t = ir as f32 / nr as f32;
@@ -600,8 +622,6 @@ impl DiskSource {
             for ic in 0..nc {
                 let ang = (ic as f32 / nc as f32) * TAU;
                 points.push([r * ang.cos(), r * ang.sin(), 0.0]);
-                normals.push([0.0, 0.0, 1.0]);
-                radial.push(r);
             }
         }
 
@@ -612,21 +632,15 @@ impl DiskSource {
                 let b = (ir * nc + next) as u32;
                 let c = ((ir + 1) * nc + next) as u32;
                 let d = ((ir + 1) * nc + ic) as u32;
-                polys.push(vec![a, b, c]);
-                polys.push(vec![a, c, d]);
+                polys.push(vec![a, b, c, d]);
             }
         }
 
-        let mut pd = PolyData {
+        PolyData {
             points,
             polys,
             ..Default::default()
-        };
-        pd.point_data
-            .set_normals(DataArray::vectors_f32("Normals", normals));
-        pd.point_data
-            .set_scalars(DataArray::scalars_f32("Radius", radial));
-        pd
+        }
     }
 }
 

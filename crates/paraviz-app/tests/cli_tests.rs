@@ -91,7 +91,7 @@ fn cli_info_convert_and_render_roundtrip() {
     assert!(info_out.contains("Type: Polygonal Mesh (PolyData)"));
     assert!(info_out.contains("Points:"));
     assert!(info_out.contains("Cells:"));
-    assert!(info_out.contains("Elevation"));
+    assert!(info_out.contains("Normals"));
 
     // 2. paraviz convert
     let convert = Command::new(paraviz_bin())
